@@ -180,10 +180,10 @@ def build_messenger_router(
         prior = await cur.fetchone()
         if prior is None:
             return None
-        if not hmac.compare_digest(str(prior["request_hash"]), request_hash):
+        if not hmac.compare_digest(str(prior[0]), request_hash):
             raise HTTPException(status_code=409, detail="Idempotency-Key уже использован для другого запроса")
         try:
-            return json.loads(prior["response_json"])
+            return json.loads(prior[1])
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=500, detail="Не удалось восстановить предыдущий результат") from exc
 
