@@ -714,6 +714,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Каталог подарков", "wgadm:gifts")],
         [("📦 Инвентарь", "wgadm:inventory"), ("🧾 Операции", "wgadm:transactions")],
         [("🎟 История подарков", "wgadm:gifthistory")],
+        [("📡 Каналы", "wgadm:channels")],
         [("🔐 Журнал действий", "wgadm:logs")],
     ])
 
@@ -741,6 +742,59 @@ async def admin_account_card(telegram_id: int) -> tuple[str, InlineKeyboardMarku
         [(ban_label, f"wgadm:ban:{telegram_id}")],
         [("⬅️ В меню", "wgadm:home")],
     ])
+
+async def admin_gift_card(gift_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT g.id,g.name,g.price_grams,g.supply,g.created_at,
+                      (SELECT COUNT(*) FROM user_gifts ug WHERE ug.gift_id=g.id) AS issued
+               FROM gift_catalog g WHERE g.id=?""",
+            (gift_id,),
+        )
+        row = await cur.fetchone()
+    if not row:
+        return None
+    status = "доступен" if row["supply"] > 0 else "скрыт / нет остатка"
+    body = (
+        f"Подарок #{row['id']}\n\nНазвание: {row['name']}\n"
+        f"Цена: {row['price_grams']} Gram\nОстаток: {row['supply']}\n"
+        f"Выдано экземпляров: {row['issued']}\nСтатус: {status}"
+    )
+    return body, admin_keyboard([
+        [("Изменить цену", f"wgadm:giftprice:{gift_id}"), ("Изменить остаток", f"wgadm:giftsupply:{gift_id}")],
+        [("Скрыть из каталога", f"wgadm:gifthide:{gift_id}")],
+        [("⬅️ К каталогу", "wgadm:gifts")],
+    ])
+
+
+async def admin_channel_card(channel_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT ch.id,ch.username,ch.title,ch.owner_telegram_id,
+                      a.username AS owner_username,a.display_name AS owner_name,
+                      (SELECT COUNT(*) FROM channel_messages cm WHERE cm.channel_id=ch.id) AS posts,
+                      (SELECT COUNT(*) FROM channel_admins ca WHERE ca.channel_id=ch.id) AS admins
+               FROM channels ch
+               LEFT JOIN accounts a ON a.telegram_id=ch.owner_telegram_id
+               WHERE ch.id=?""",
+            (channel_id,),
+        )
+        row = await cur.fetchone()
+    if not row:
+        return None
+    body = (
+        f"Канал #{row['id']}\n\nНазвание: {row['title']}\n"
+        f"Username: @{row['username']}\nВладелец: TG {row['owner_telegram_id']} "
+        f"(@{row['owner_username'] or '—'})\nПубликаций: {row['posts']}\n"
+        f"Администраторов: {row['admins']}"
+    )
+    return body, admin_keyboard([
+        [("Удалить канал", f"wgadm:channeldeleteask:{channel_id}")],
+        [("⬅️ К списку каналов", "wgadm:channels")],
+    ])
+
 
 @router.message(Command("admin"))
 async def admin_handler(message: Message) -> None:
@@ -787,14 +841,102 @@ async def admin_callback(callback: CallbackQuery) -> None:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT id,name,price_grams,supply FROM gift_catalog ORDER BY id DESC LIMIT 30")
             rows = await cur.fetchall()
-        body = "Каталог подарков\n\n" + ("\n".join(
-            f"#{r['id']} · {r['name']} · {r['price_grams']} Gram · остаток {r['supply']}" for r in rows
-        ) if rows else "Каталог пуст.")
-        await callback.message.answer(body, reply_markup=admin_keyboard([
-            [("➕ Добавить подарок", "wgadm:giftadd")], [("⬅️ В меню", "wgadm:home")]]))
+        body = "Каталог подарков. Выберите запись для изменения:"
+        keyboard_rows = [[(f"#{r['id']} · {r['name']} · {r['price_grams']} Gram · остаток {r['supply']}",
+                           f"wgadm:gift:{r['id']}")] for r in rows]
+        if not rows:
+            body += "\n\nКаталог пуст."
+        keyboard_rows.extend([[("➕ Добавить подарок", "wgadm:giftadd")],
+                              [("⬅️ В меню", "wgadm:home")]])
+        await callback.message.answer(body, reply_markup=admin_keyboard(keyboard_rows))
+    elif action == "gift" and len(parts) == 3:
+        try:
+            gift_id = int(parts[2])
+        except ValueError:
+            return
+        card = await admin_gift_card(gift_id)
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+        else:
+            await callback.message.answer("Подарок не найден.")
+    elif action == "giftprice" and len(parts) == 3:
+        gift_id = int(parts[2])
+        ADMIN_INPUT[ADMIN_ID] = ("edit_gift_price", gift_id)
+        await callback.message.answer("Введите новую цену в Gram (0–1000000000).")
+    elif action == "giftsupply" and len(parts) == 3:
+        gift_id = int(parts[2])
+        ADMIN_INPUT[ADMIN_ID] = ("edit_gift_supply", gift_id)
+        await callback.message.answer("Введите новый остаток (0–1000000). Значение 0 скрывает подарок из пользовательского каталога.")
+    elif action == "gifthide" and len(parts) == 3:
+        gift_id = int(parts[2])
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute("UPDATE gift_catalog SET supply=0 WHERE id=?", (gift_id,))
+            await db.commit()
+        if cur.rowcount:
+            await admin_log("gift_hide", str(gift_id), "supply=0")
+            await callback.message.answer("Подарок скрыт из пользовательского каталога.")
+        else:
+            await callback.message.answer("Подарок не найден.")
     elif action == "giftadd":
         ADMIN_INPUT[ADMIN_ID] = ("gift_name", {})
         await callback.message.answer("Введите название подарка (до 80 символов).")
+    elif action == "channels":
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT ch.id,ch.title,ch.username,ch.owner_telegram_id,
+                          (SELECT COUNT(*) FROM channel_messages cm WHERE cm.channel_id=ch.id) AS posts
+                   FROM channels ch ORDER BY ch.id DESC LIMIT 30"""
+            )
+            rows = await cur.fetchall()
+        body = "Каналы WaysGram. Выберите канал для просмотра и модерации:"
+        keyboard_rows = [[(f"#{r['id']} · {r['title']} · @{r['username']} · {r['posts']} постов",
+                           f"wgadm:channel:{r['id']}")] for r in rows]
+        if not rows:
+            body += "\n\nКаналов пока нет."
+        keyboard_rows.append([("⬅️ В меню", "wgadm:home")])
+        await callback.message.answer(body, reply_markup=admin_keyboard(keyboard_rows))
+    elif action == "channel" and len(parts) == 3:
+        try:
+            channel_id = int(parts[2])
+        except ValueError:
+            return
+        card = await admin_channel_card(channel_id)
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+        else:
+            await callback.message.answer("Канал не найден.")
+    elif action == "channeldeleteask" and len(parts) == 3:
+        channel_id = int(parts[2])
+        await callback.message.answer(
+            f"Удалить канал #{channel_id} вместе со всеми публикациями и администраторами?",
+            reply_markup=admin_keyboard([
+                [("Подтвердить удаление", f"wgadm:channeldelete:{channel_id}")],
+                [("Отмена", f"wgadm:channel:{channel_id}")],
+            ]),
+        )
+    elif action == "channeldelete" and len(parts) == 3:
+        channel_id = int(parts[2])
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute("SELECT title,username FROM channels WHERE id=?", (channel_id,))
+            channel = await cur.fetchone()
+            if not channel:
+                await db.rollback()
+                await callback.message.answer("Канал уже удалён или не найден.")
+                return
+            await db.execute("DELETE FROM channel_messages WHERE channel_id=?", (channel_id,))
+            await db.execute("DELETE FROM channel_admins WHERE channel_id=?", (channel_id,))
+            await db.execute("DELETE FROM channels WHERE id=?", (channel_id,))
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, "channel_delete", str(channel_id), f"{channel[0]} @{channel[1]}", int(time.time())),
+            )
+            await db.commit()
+        await callback.message.answer(
+            f"Канал #{channel_id} удалён.",
+            reply_markup=admin_keyboard([[("К списку каналов", "wgadm:channels")]]),
+        )
     elif action == "inventory":
         async with aiosqlite.connect(DATABASE_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -1002,6 +1144,33 @@ async def admin_text_input(message: Message) -> None:
         ADMIN_INPUT.pop(ADMIN_ID, None)
         await message.answer(f"Подарок {serial} передан аккаунту {target_id}.")
 
+    elif kind in ("edit_gift_price", "edit_gift_supply"):
+        try:
+            number = int(value)
+        except ValueError:
+            await message.answer("Введите целое число.")
+            return
+        max_value = 1_000_000_000 if kind == "edit_gift_price" else 1_000_000
+        if not 0 <= number <= max_value:
+            await message.answer(f"Допустимый диапазон: 0–{max_value}.")
+            return
+        gift_id = int(payload)
+        column = "price_grams" if kind == "edit_gift_price" else "supply"
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute(
+                f"UPDATE gift_catalog SET {column}=? WHERE id=?",
+                (number, gift_id),
+            )
+            await db.commit()
+        if cur.rowcount == 0:
+            ADMIN_INPUT.pop(ADMIN_ID, None)
+            await message.answer("Подарок не найден.")
+            return
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        await admin_log("gift_update_price" if kind == "edit_gift_price" else "gift_update_supply",
+                        str(gift_id), f"{column}={number}")
+        card = await admin_gift_card(gift_id)
+        await message.answer(card[0], reply_markup=card[1]) if card else await message.answer("Подарок обновлён.")
     elif kind == "gift_name":
         if not value or len(value) > 80:
             await message.answer("Название должно содержать 1–80 символов.")
