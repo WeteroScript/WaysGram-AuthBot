@@ -140,13 +140,27 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
             sender = {"Authorization": "Bearer sender-session"}
             recipient = {"Authorization": "Bearer recipient-session"}
 
+            dm_headers = {**sender, "Idempotency-Key": "direct-message-order-0001"}
             sent = await client.post(
                 "/api/messages",
-                headers=sender,
+                headers=dm_headers,
+                json={"recipient_id": 82002, "body": "test message"},
+            )
+            replay = await client.post(
+                "/api/messages",
+                headers=dm_headers,
                 json={"recipient_id": 82002, "body": "test message"},
             )
             assert sent.status_code == 201
             assert sent.json()["sender_id"] == 82001
+            assert replay.json()["id"] == sent.json()["id"]
+
+            changed_replay = await client.post(
+                "/api/messages",
+                headers=dm_headers,
+                json={"recipient_id": 82002, "body": "different body"},
+            )
+            assert changed_replay.status_code == 409
 
             history = await client.get(
                 "/api/messages?with=82002",
@@ -167,12 +181,19 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
             assert created.status_code == 201
             channel_id = created.json()["id"]
 
+            channel_headers = {**sender, "Idempotency-Key": "channel-post-order-0001"}
             post = await client.post(
                 f"/api/channels/{channel_id}/messages",
-                headers=sender,
+                headers=channel_headers,
+                json={"body": "first post"},
+            )
+            post_replay = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=channel_headers,
                 json={"body": "first post"},
             )
             assert post.status_code == 201
+            assert post_replay.json()["id"] == post.json()["id"]
 
             forbidden = await client.post(
                 f"/api/channels/{channel_id}/messages",
@@ -229,12 +250,20 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
             assert wallet.json()["grams"] == 50
 
             serial = first.json()["gift"]["serial_number"]
+            transfer_headers = {**buyer, "Idempotency-Key": "gift-transfer-order-0001"}
+            transfer_body = {"serial_number": serial, "recipient": "receiver"}
             transferred = await client.post(
                 "/api/gifts/transfer",
-                headers=buyer,
-                json={"serial_number": serial, "recipient": "receiver"},
+                headers=transfer_headers,
+                json=transfer_body,
+            )
+            transfer_replay = await client.post(
+                "/api/gifts/transfer",
+                headers=transfer_headers,
+                json=transfer_body,
             )
             assert transferred.status_code == 200
+            assert transfer_replay.json() == transferred.json()
             assert transferred.json()["to_user_id"] == 83002
 
             buyer_inventory = await client.get("/api/me/gifts", headers=buyer)
@@ -245,7 +274,10 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
             with sqlite3.connect(path) as db:
                 supply = db.execute("SELECT supply FROM gift_catalog WHERE id=1").fetchone()[0]
                 transaction_count = db.execute("SELECT COUNT(*) FROM economy_transactions WHERE reason='gift_purchase:1'").fetchone()[0]
+                gift_history_count = db.execute("SELECT COUNT(*) FROM gift_transactions WHERE serial_number=?", (serial,)).fetchone()[0]
+                dm_count = db.execute("SELECT COUNT(*) FROM messages WHERE sender_telegram_id=82001").fetchone()[0] if False else 0
             assert supply == 0
             assert transaction_count == 1
+            assert gift_history_count == 2
 
     run(scenario())
