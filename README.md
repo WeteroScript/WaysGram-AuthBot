@@ -50,10 +50,10 @@ Open the bot using Telegram account ID `8888957702` and send `/admin`. The panel
 
 Current sections:
 - **Statistics:** account count, blocked accounts, issued virtual numbers, active OTP codes, gift catalog/inventory counts, and total Stars/Gram balances.
-- **Accounts:** search by Telegram ID or virtual `+1` identifier; inspect account status and balances; block/unblock an account.
+- **Accounts:** search by Telegram ID, virtual `+1` identifier, username, or display name; inspect account status and balances; block/unblock an account.
 - **Balances:** administrator-only Stars and Gram crediting, with a transaction record and audit log.
 - **Gift catalog:** create a gift with a name, Gram price, and available supply.
-- **Gift inventory:** inspect issued gifts and their serial numbers; issue a catalog gift to an account.
+- **Gift inventory:** inspect issued gifts and their serial numbers; issue a catalog gift to an account; transfer a gift between accounts from the account card; view gift grant/transfer history.
 - **Transactions and audit log:** inspect recent balance changes and administrator actions.
 
 Admin actions are restricted to `ADMIN_ID`. Account suspensions are enforced by the bot's number-resolution and OTP-verification API. Balance credits are internal WaysGram ledger entries; this release does not implement cash-out or external payment processing.
