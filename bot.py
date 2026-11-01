@@ -26,6 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
+from messenger_api import build_messenger_router, init_messenger_storage
 
 # All secrets are read only from hosting environment variables.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -675,6 +676,16 @@ async def account_is_banned(telegram_id: int) -> bool:
         return bool(row and row[0])
 
 
+app.include_router(
+    build_messenger_router(
+        DATABASE_PATH,
+        store,
+        lambda: bot,
+        account_is_banned,
+    )
+)
+
+
 async def ensure_account(telegram_id: int, number: str, username: str = "", display_name: str = "") -> None:
     now = int(time.time())
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -1137,6 +1148,7 @@ async def main() -> None:
     store.configure_otp_encryption(OTP_FERNET_KEY)
     await store.init()
     await init_admin_storage()
+    await init_messenger_storage(DATABASE_PATH)
     bot = Bot(token=BOT_TOKEN)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
