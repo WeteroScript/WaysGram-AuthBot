@@ -24,7 +24,7 @@ GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
 
 async def init_messenger_storage(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path()) as db:
+    async with aiosqlite.connect(database_path) as db:
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS api_sessions (
