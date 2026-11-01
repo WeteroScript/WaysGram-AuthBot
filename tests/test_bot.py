@@ -29,6 +29,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> bot_module.Store:
     instance = bot_module.Store(tmp_path / "waysgram.sqlite3")
     instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
     asyncio.run(instance.init())
+    asyncio.run(bot_module.init_admin_storage())
     monkeypatch.setattr(bot_module, "store", instance)
     return instance
 
@@ -220,3 +221,15 @@ def test_settings_keyboard_contains_arrow_back_button() -> None:
     ]
     assert len(arrow_buttons) == 1
     assert arrow_buttons[0].callback_data == "nav:menu"
+
+
+def test_admin_account_storage_and_suspension(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bot_module, "DATABASE_PATH", tmp_path / "admin.sqlite3")
+    run(bot_module.init_admin_storage())
+    run(bot_module.ensure_account(707, "+11234567890"))
+    assert run(bot_module.account_is_banned(707)) is False
+
+    with sqlite3.connect(bot_module.DATABASE_PATH) as conn:
+        conn.execute("UPDATE accounts SET is_banned=1 WHERE telegram_id=707")
+
+    assert run(bot_module.account_is_banned(707)) is True
