@@ -27,6 +27,7 @@ class FakeBot:
 @pytest.fixture
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> bot_module.Store:
     instance = bot_module.Store(tmp_path / "waysgram.sqlite3")
+    monkeypatch.setattr(bot_module, "DATABASE_PATH", instance.path)
     instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
     asyncio.run(instance.init())
     asyncio.run(bot_module.init_admin_storage())
