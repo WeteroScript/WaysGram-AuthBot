@@ -1,0 +1,22 @@
+services:
+  waysgram-authbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: waysgram-authbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/waysgram_authbot.sqlite3
+      INTERNAL_API_HOST: 0.0.0.0
+      INTERNAL_API_PORT: "8081"
+      PORT: "8081"
+    ports:
+      - "8081:8081"
+    volumes:
+      - waysgram_data:/data
+    init: true
+
+volumes:
+  waysgram_data:
