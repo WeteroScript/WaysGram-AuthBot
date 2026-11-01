@@ -6,7 +6,7 @@ Python Telegram bot for the WaysGram-owned account system. It provides Russian/E
 
 The bot automatically generates a unique internal identifier in the format +1 followed by ten digits and saves it in its own SQLite database. These are **virtual WaysGram identifiers**, not carrier-issued phone numbers: they cannot receive calls or SMS and are intended only for logging in to WaysGram.
 
-The bot creates six-digit one-time WaysGram codes itself. When the WaysGram backend asks for a code, the bot creates a short-lived code, sends it to the Telegram account linked to that virtual number, and lets the user retrieve it using Get code. The backend verifies the code through the bot's private API.
+The bot creates six-digit one-time WaysGram codes itself. When the WaysGram backend asks for a code, the bot creates a short-lived code, encrypts it in SQLite, and sends a notification that the code is ready. The user retrieves the code by tapping Get code in the bot. The backend verifies the code through the bot's private API.
 
 The bot does not read SMS, request Telegram login codes, or forward authentication codes belonging to Telegram or another service.
 
@@ -18,7 +18,7 @@ Python 3.11+:
 2. Set BOT_TOKEN and the other environment variables in the hosting platform.
 3. Deploy as a web service using the included Procfile: web: python bot.py
 
-BOT_TOKEN is read only from the environment. Do not commit .env or put the bot token into source code. The bot uses long polling and starts its internal API in the same process. It binds to INTERNAL_API_PORT, then the hosting platform PORT, then 8081. Deploy as a web service (or an equivalent process that exposes this API), not as a worker-only service, so the WaysGram backend can reach it. Use persistent disk storage for DATABASE_PATH; ephemeral hosting storage can be lost on restart/redeploy.
+BOT_TOKEN is read only from the environment. Do not commit .env or put the bot token into source code. Generate `OTP_FERNET_KEY` using `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, then store it as a hosting secret. Keep this key unchanged across restarts and redeployments. The bot uses long polling and starts its internal API in the same process. It binds to INTERNAL_API_PORT, then the hosting platform PORT, then 8081. Deploy as a web service (or an equivalent process that exposes this API), not as a worker-only service, so the WaysGram backend can reach it. Use persistent disk storage for DATABASE_PATH; ephemeral hosting storage can be lost on restart/redeploy.
 
 ## Environment
 
