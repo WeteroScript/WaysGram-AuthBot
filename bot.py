@@ -33,8 +33,6 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/waysgram_authbot.sqlite3")
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "0.0.0.0")
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8081"))
-PHONE_PROVIDER_URL = os.getenv("PHONE_PROVIDER_URL", "").rstrip("/")
-PHONE_PROVIDER_TOKEN = os.getenv("PHONE_PROVIDER_TOKEN", "").strip()
 
 PHONE_RE = re.compile(r"^\+1\d{10}$")
 OTP_RE = re.compile(r"^\d{6}$")
@@ -56,7 +54,7 @@ TEXT: dict[str, dict[str, str]] = {
         "get_code": "Получить код",
         "settings": "Настройки",
         "number_exists": "Ваш номер WaysGram: {number}",
-        "provider_missing": "Автоматическая выдача номеров пока не подключена. Нужен API провайдера, который выделяет реальные номера +1.",
+        "provider_missing": "Не удалось создать виртуальный номер. Повторите попытку позже.",
         "number_error": "Не удалось получить номер от провайдера. Попробуйте позже или обратитесь к администратору.",
         "number_ready": "Ваш номер WaysGram: {number}",
         "need_number": "Сначала получите номер WaysGram.",
@@ -66,7 +64,7 @@ TEXT: dict[str, dict[str, str]] = {
         "admin_denied": "Доступ запрещён.",
         "admin_title": "Панель администратора WaysGram",
         "admin_stats": "Пользователей: {users}\nВыдано номеров: {numbers}\nАктивных кодов: {codes}",
-        "admin_provider": "Провайдер номеров: {status}\nВнутренний API: {api}",
+        "admin_provider": "Генерация номеров: {status}\nВнутренний API: {api}",
         "admin_recent_empty": "Пользователей пока нет.",
         "admin_recent": "Последние пользователи (Telegram ID):\n{items}",
         "code_push": "Для вашего аккаунта WaysGram поступил код входа: {code}\nСрок действия: {minutes} мин.",
@@ -80,7 +78,7 @@ TEXT: dict[str, dict[str, str]] = {
         "get_code": "Get code",
         "settings": "Settings",
         "number_exists": "Your WaysGram number: {number}",
-        "provider_missing": "Automatic number provisioning is not connected yet. A provider API that allocates real +1 numbers is required.",
+        "provider_missing": "Could not create a virtual number. Please try again later.",
         "number_error": "The provider could not allocate a number. Try again later or contact the administrator.",
         "number_ready": "Your WaysGram number: {number}",
         "need_number": "Get a WaysGram number first.",
@@ -90,7 +88,7 @@ TEXT: dict[str, dict[str, str]] = {
         "admin_denied": "Access denied.",
         "admin_title": "WaysGram admin panel",
         "admin_stats": "Users: {users}\nAllocated numbers: {numbers}\nActive codes: {codes}",
-        "admin_provider": "Number provider: {status}\nInternal API: {api}",
+        "admin_provider": "Number generation: {status}\nInternal API: {api}",
         "admin_recent_empty": "There are no users yet.",
         "admin_recent": "Recent users (Telegram IDs):\n{items}",
         "code_push": "A WaysGram login code was issued for your account: {code}\nExpires in {minutes} min.",
@@ -132,6 +130,7 @@ class Store:
                     number TEXT NOT NULL,
                     code TEXT NOT NULL,
                     expires_at INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_auth_codes_number_expiry
@@ -143,6 +142,12 @@ class Store:
             if "verified" not in columns:
                 await db.execute(
                     "ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
+                )
+            cur = await db.execute("PRAGMA table_info(auth_codes)")
+            code_columns = {str(row[1]) for row in await cur.fetchall()}
+            if "attempts" not in code_columns:
+                await db.execute(
+                    "ALTER TABLE auth_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
                 )
             await db.commit()
 
@@ -190,13 +195,35 @@ class Store:
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
-    async def save_number(self, telegram_id: int, number: str, provider_ref: str) -> None:
+    async def allocate_number(self, telegram_id: int) -> str:
+        # These are internal WaysGram login identifiers, not PSTN/SMS phone lines.
         async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "INSERT INTO numbers(telegram_id, number, provider_ref, created_at) VALUES(?, ?, ?, ?)",
-                (telegram_id, number, provider_ref, int(time.time())),
+            cur = await db.execute(
+                "SELECT number FROM numbers WHERE telegram_id=?", (telegram_id,)
             )
-            await db.commit()
+            existing = await cur.fetchone()
+            if existing:
+                return str(existing[0])
+
+        for _ in range(100):
+            number = "+1" + f"{secrets.randbelow(10_000_000_000):010d}"
+            try:
+                async with aiosqlite.connect(self.path) as db:
+                    await db.execute(
+                        "INSERT INTO numbers(telegram_id, number, provider_ref, created_at) VALUES(?, ?, ?, ?)",
+                        (telegram_id, number, "internal", int(time.time())),
+                    )
+                    await db.commit()
+                return number
+            except aiosqlite.IntegrityError:
+                async with aiosqlite.connect(self.path) as db:
+                    cur = await db.execute(
+                        "SELECT number FROM numbers WHERE telegram_id=?", (telegram_id,)
+                    )
+                    existing = await cur.fetchone()
+                    if existing:
+                        return str(existing[0])
+        raise RuntimeError("Could not allocate a unique internal number")
 
     async def resolve_number(self, number: str) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.path) as db:
@@ -210,15 +237,23 @@ class Store:
             row = await cur.fetchone()
             return dict(row) if row else None
 
-    async def save_code(self, number: str, code: str, expires_in: int) -> None:
+    async def save_code(self, number: str, code: str, expires_in: int) -> bool:
         now = int(time.time())
         async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT created_at FROM auth_codes WHERE number=? ORDER BY id DESC LIMIT 1",
+                (number,),
+            )
+            previous = await cur.fetchone()
+            if previous and now - int(previous[0]) < 30:
+                return False
             await db.execute("DELETE FROM auth_codes WHERE number=?", (number,))
             await db.execute(
-                "INSERT INTO auth_codes(number, code, expires_at, created_at) VALUES(?, ?, ?, ?)",
+                "INSERT INTO auth_codes(number, code, expires_at, created_at, attempts) VALUES(?, ?, ?, ?, 0)",
                 (number, code, now + expires_in, now),
             )
             await db.commit()
+            return True
 
     async def latest_code(self, number: str) -> tuple[str, int] | None:
         now = int(time.time())
@@ -232,6 +267,36 @@ class Store:
             if not row:
                 return None
             return str(row[0]), int(row[1]) - now
+
+    async def verify_code(self, number: str, code: str) -> bool:
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT id, code, expires_at, attempts FROM auth_codes WHERE number=? ORDER BY id DESC LIMIT 1",
+                (number,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return False
+            row_id, saved_code, expires_at, attempts = row
+            if int(expires_at) <= now or int(attempts) >= 5:
+                await db.execute("DELETE FROM auth_codes WHERE id=?", (row_id,))
+                await db.commit()
+                return False
+            if secrets.compare_digest(str(saved_code), code):
+                await db.execute("DELETE FROM auth_codes WHERE id=?", (row_id,))
+                await db.commit()
+                return True
+            next_attempts = int(attempts) + 1
+            if next_attempts >= 5:
+                await db.execute("DELETE FROM auth_codes WHERE id=?", (row_id,))
+            else:
+                await db.execute(
+                    "UPDATE auth_codes SET attempts=? WHERE id=?",
+                    (next_attempts, row_id),
+                )
+            await db.commit()
+            return False
 
     async def stats(self) -> tuple[int, int, int]:
         now = int(time.time())
@@ -254,35 +319,7 @@ class Store:
             return [int(row[0]) for row in await cur.fetchall()]
 
 
-class ProviderNotConfigured(RuntimeError):
-    pass
-
-
-class PhoneNumberProvider:
-    """Generic adapter contract; substitute a provider-specific adapter when selected."""
-
-    async def reserve(self, telegram_id: int) -> tuple[str, str]:
-        if not PHONE_PROVIDER_URL or not PHONE_PROVIDER_TOKEN:
-            raise ProviderNotConfigured
-        url = f"{PHONE_PROVIDER_URL}/v1/numbers/reserve"
-        headers = {"Authorization": f"Bearer {PHONE_PROVIDER_TOKEN}"}
-        payload = {
-            "country_code": "US",
-            "customer_reference": f"waysgram:{telegram_id}",
-        }
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-        number = str(data.get("number", ""))
-        provider_ref = str(data.get("id", ""))
-        if not PHONE_RE.fullmatch(number) or not provider_ref:
-            raise ValueError("Provider response has an invalid number or id")
-        return number, provider_ref
-
-
 store = Store(DATABASE_PATH)
-provider = PhoneNumberProvider()
 bot: Bot | None = None
 router = Router()
 app = FastAPI(title="WaysGram AuthBot internal API", docs_url=None, redoc_url=None)
@@ -394,18 +431,10 @@ async def get_number_handler(message: Message) -> None:
         return
     lock = USER_LOCKS.setdefault(message.from_user.id, asyncio.Lock())
     async with lock:
-        existing = await store.get_number(message.from_user.id)
-        if existing:
-            await message.answer(tr(lang, "number_exists", number=existing))
-            return
         try:
-            number, provider_ref = await provider.reserve(message.from_user.id)
-            await store.save_number(message.from_user.id, number, provider_ref)
-        except ProviderNotConfigured:
-            await message.answer(tr(lang, "provider_missing"))
-            return
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            log.warning("Number allocation failed (%s)", type(exc).__name__)
+            number = await store.allocate_number(message.from_user.id)
+        except Exception as exc:
+            log.warning("Internal number allocation failed (%s)", type(exc).__name__)
             await message.answer(tr(lang, "number_error"))
             return
         await message.answer(tr(lang, "number_ready", number=number))
@@ -477,11 +506,9 @@ async def admin_callback(callback: CallbackQuery) -> None:
         users, numbers, codes = await store.stats()
         response = tr(lang, "admin_stats", users=users, numbers=numbers, codes=codes)
     elif action == "provider":
-        provider_configured = bool(PHONE_PROVIDER_URL and PHONE_PROVIDER_TOKEN)
-        api_configured = bool(INTERNAL_API_TOKEN)
-        provider_status = ("настроен" if provider_configured else "не настроен") if lang == "ru" else ("configured" if provider_configured else "not configured")
-        api_status = ("настроен" if api_configured else "не настроен") if lang == "ru" else ("configured" if api_configured else "not configured")
-        response = tr(lang, "admin_provider", status=provider_status, api=api_status)
+        number_status = "активна" if lang == "ru" else "active"
+        api_status = ("настроен" if INTERNAL_API_TOKEN else "не настроен") if lang == "ru" else ("configured" if INTERNAL_API_TOKEN else "not configured")
+        response = tr(lang, "admin_provider", status=number_status, api=api_status)
     elif action == "recent":
         items = await store.recent_users()
         response = tr(lang, "admin_recent", items="\n".join(map(str, items))) if items else tr(lang, "admin_recent_empty")
@@ -495,10 +522,13 @@ class NumberResolveRequest(BaseModel):
     number: str = Field(min_length=12, max_length=12)
 
 
-class AuthCodeDeliveryRequest(BaseModel):
+class AuthCodeRequest(BaseModel):
+    number: str = Field(min_length=12, max_length=12)
+
+
+class CodeVerifyRequest(BaseModel):
     number: str = Field(min_length=12, max_length=12)
     code: str = Field(pattern=r"^\d{6}$")
-    expires_in: int = Field(default=300, ge=30, le=600)
 
 
 def verify_internal_token(value: str | None) -> None:
@@ -527,31 +557,46 @@ async def resolve_number(
     return {"assigned": True, "telegram_user_id": owner["telegram_id"]}
 
 
-@app.post("/internal/v1/auth-code")
-async def deliver_auth_code(
-    payload: AuthCodeDeliveryRequest,
+@app.post("/internal/v1/auth-code/request")
+async def request_auth_code(
+    payload: AuthCodeRequest,
     x_internal_token: str | None = Header(default=None),
 ) -> dict[str, str]:
     verify_internal_token(x_internal_token)
-    if not PHONE_RE.fullmatch(payload.number) or not OTP_RE.fullmatch(payload.code):
-        raise HTTPException(status_code=422, detail="Invalid number or code format")
+    if not PHONE_RE.fullmatch(payload.number):
+        raise HTTPException(status_code=422, detail="Invalid internal number format")
     owner = await store.resolve_number(payload.number)
     if not owner:
         raise HTTPException(status_code=404, detail="Number is not assigned")
-    await store.save_code(payload.number, payload.code, payload.expires_in)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    if not await store.save_code(payload.number, code, 300):
+        raise HTTPException(status_code=429, detail="Code request is rate limited")
     if bot is None:
         raise HTTPException(status_code=503, detail="Bot is not ready")
     lang = str(owner.get("language") or "en")
-    minutes = max(1, (payload.expires_in + 59) // 60)
     try:
         await bot.send_message(
             chat_id=int(owner["chat_id"]),
-            text=tr(lang, "code_push", code=payload.code, minutes=minutes),
+            text=tr(lang, "code_push", code=code, minutes=5),
         )
     except Exception as exc:
         log.warning("Could not deliver WaysGram code (%s)", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Could not deliver bot message") from exc
     return {"status": "delivered"}
+
+
+@app.post("/internal/v1/auth-code/verify")
+async def verify_auth_code(
+    payload: CodeVerifyRequest,
+    x_internal_token: str | None = Header(default=None),
+) -> dict[str, bool]:
+    verify_internal_token(x_internal_token)
+    if not PHONE_RE.fullmatch(payload.number):
+        raise HTTPException(status_code=422, detail="Invalid internal number format")
+    owner = await store.resolve_number(payload.number)
+    if not owner:
+        return {"valid": False}
+    return {"valid": await store.verify_code(payload.number, payload.code)}
 
 
 async def main() -> None:
@@ -565,8 +610,6 @@ async def main() -> None:
 
     if not INTERNAL_API_TOKEN:
         log.warning("INTERNAL_API_TOKEN is not set; backend API endpoints will reject requests")
-    if not PHONE_PROVIDER_URL or not PHONE_PROVIDER_TOKEN:
-        log.warning("Phone provider is not configured; automatic +1 number allocation is disabled")
 
     config = uvicorn.Config(
         app,
