@@ -32,7 +32,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8888957702"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/waysgram_authbot.sqlite3"))
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "0.0.0.0")
-INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT", "8081"))
+INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT") or os.getenv("PORT") or "8081")
 
 PHONE_RE = re.compile(r"^\+1\d{10}$")
 OTP_RE = re.compile(r"^\d{6}$")
