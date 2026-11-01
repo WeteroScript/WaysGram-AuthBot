@@ -156,6 +156,53 @@ def build_messenger_router(
             raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
         return user
 
+    def idempotency_descriptor(path: str, body: dict[str, Any], key: str | None):
+        value = (key or "").strip()
+        if not value:
+            return None
+        if len(value) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]{16,128}", value):
+            raise HTTPException(status_code=400, detail="Некорректный Idempotency-Key")
+        canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256((path + "\\n" + canonical).encode("utf-8")).hexdigest()
+        return value, digest
+
+    async def idempotency_lookup(
+        db: Any, telegram_id: int, scope: str, descriptor: Any, now: int
+    ) -> dict[str, Any] | None:
+        if descriptor is None:
+            return None
+        key, request_hash = descriptor
+        cur = await db.execute(
+            """SELECT request_hash,response_json FROM api_idempotency_records
+               WHERE telegram_id=? AND scope=? AND idempotency_key=? AND created_at>=?""",
+            (telegram_id, scope, key, now - 7 * 86400),
+        )
+        prior = await cur.fetchone()
+        if prior is None:
+            return None
+        if not hmac.compare_digest(str(prior["request_hash"]), request_hash):
+            raise HTTPException(status_code=409, detail="Idempotency-Key уже использован для другого запроса")
+        try:
+            return json.loads(prior["response_json"])
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=500, detail="Не удалось восстановить предыдущий результат") from exc
+
+    async def idempotency_store(
+        db: Any, telegram_id: int, scope: str, descriptor: Any,
+        response: dict[str, Any], now: int
+    ) -> None:
+        if descriptor is None:
+            return
+        key, request_hash = descriptor
+        await db.execute("DELETE FROM api_idempotency_records WHERE created_at<?", (now - 7 * 86400,))
+        await db.execute(
+            """INSERT INTO api_idempotency_records
+               (telegram_id,scope,idempotency_key,request_hash,response_json,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (telegram_id, scope, key, request_hash,
+             json.dumps(response, ensure_ascii=False, separators=(",", ":")), now),
+        )
+
     async def channel_row(channel_id: int) -> dict[str, Any]:
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
@@ -595,6 +642,7 @@ def build_messenger_router(
     async def transfer_gift(
         payload: dict[str, Any],
         authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
@@ -603,9 +651,14 @@ def build_messenger_router(
         if not GIFT_SERIAL_RE.fullmatch(serial) or not recipient_key or len(recipient_key) > 64:
             raise HTTPException(status_code=400, detail="Проверьте серийный номер и получателя")
         now = int(time.time())
+        descriptor = idempotency_descriptor("/api/gifts/transfer", payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, "/api/gifts/transfer", descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
             if recipient_key.isdigit():
                 cur = await db.execute(
                     "SELECT telegram_id,username,is_banned FROM accounts WHERE telegram_id=?",
@@ -649,8 +702,10 @@ def build_messenger_router(
                    VALUES('transfer',?,?,?,?,?)""",
                 (serial, str(gift["gift_name"]), uid, target_id, now),
             )
+            result = {"status": "transferred", "serial_number": serial, "to_user_id": target_id}
+            await idempotency_store(db, uid, "/api/gifts/transfer", descriptor, result, now)
             await db.commit()
-        return {"status": "transferred", "serial_number": serial, "to_user_id": target_id}
+        return result
 
     @router.get("/api/channels")
     async def list_channels(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -735,6 +790,7 @@ def build_messenger_router(
         channel_id: int,
         payload: dict[str, Any],
         authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
@@ -742,12 +798,20 @@ def build_messenger_router(
         if not await can_manage_channel(channel_id, uid):
             raise HTTPException(status_code=403, detail="Публиковать в канале может только владелец или администратор")
         now = int(time.time())
+        scope = f"/api/channels/{channel_id}/messages"
+        descriptor = idempotency_descriptor(scope, payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
             cur = await db.execute(
                 "SELECT COUNT(*) FROM channel_messages WHERE author_telegram_id=? AND created_at>?",
                 (uid, now - 60),
             )
             if int((await cur.fetchone())[0]) >= CHANNEL_POSTS_PER_MINUTE:
+                await db.rollback()
                 raise HTTPException(status_code=429, detail="Превышен лимит публикаций")
             cur = await db.execute(
                 """INSERT INTO channel_messages(channel_id,author_telegram_id,body,created_at)
@@ -755,8 +819,10 @@ def build_messenger_router(
                 (channel_id, uid, body, now),
             )
             message_id = int(cur.lastrowid)
+            result = {"id": message_id, "channel_id": channel_id, "author_id": uid, "body": body, "created_at": now}
+            await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
-        return {"id": message_id, "channel_id": channel_id, "author_id": uid, "body": body, "created_at": now}
+        return result
 
     @router.post("/api/channels/{channel_id}/admins", status_code=201)
     async def add_channel_admin(
@@ -864,6 +930,7 @@ def build_messenger_router(
     async def send_message(
         payload: dict[str, Any],
         authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
@@ -875,8 +942,13 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="Укажите корректного получателя")
         body = _message_body(payload.get("body", ""))
         now = int(time.time())
+        descriptor = idempotency_descriptor("/api/messages", payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, "/api/messages", descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
             cur = await db.execute(
                 "SELECT is_banned FROM accounts WHERE telegram_id=?",
                 (recipient_id,),
@@ -901,14 +973,16 @@ def build_messenger_router(
                 (uid, recipient_id, body, now),
             )
             message_id = int(cur.lastrowid)
+            result = {
+                "id": message_id,
+                "sender_id": uid,
+                "recipient_id": recipient_id,
+                "body": body,
+                "created_at": now,
+            }
+            await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
             await db.commit()
-        return {
-            "id": message_id,
-            "sender_id": uid,
-            "recipient_id": recipient_id,
-            "body": body,
-            "created_at": now,
-        }
+        return result
 
     @router.get("/api/conversations")
     async def list_conversations(authorization: str | None = Header(default=None)) -> dict[str, Any]:
