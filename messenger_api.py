@@ -410,6 +410,7 @@ def build_messenger_router(
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", username):
                 raise HTTPException(status_code=400, detail="Username: 1–32 символа, латиница, цифры и _, первый символ — буква")
         async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
             if "username" in payload:
                 cur = await db.execute(
                     "SELECT 1 FROM accounts WHERE username=? COLLATE NOCASE AND telegram_id<>?",
@@ -470,11 +471,14 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT id,event_type,serial_number,gift_name,from_telegram_id,
-                          to_telegram_id,created_at
-                   FROM gift_transactions
-                   WHERE from_telegram_id=? OR to_telegram_id=?
-                   ORDER BY id DESC LIMIT 100""",
+                """SELECT gt.id,gt.event_type,gt.serial_number,gt.gift_name,
+                          gt.from_telegram_id,sender.username AS from_username,
+                          gt.to_telegram_id,recipient.username AS to_username,gt.created_at
+                   FROM gift_transactions gt
+                   LEFT JOIN accounts sender ON sender.telegram_id=gt.from_telegram_id
+                   JOIN accounts recipient ON recipient.telegram_id=gt.to_telegram_id
+                   WHERE gt.from_telegram_id=? OR gt.to_telegram_id=?
+                   ORDER BY gt.id DESC LIMIT 100""",
                 (uid, uid),
             )
             rows = await cur.fetchall()
