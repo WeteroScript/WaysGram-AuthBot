@@ -1011,6 +1011,8 @@ async def request_auth_code(
         raise HTTPException(status_code=404, detail="Number is not assigned")
     if not owner.get("verified"):
         raise HTTPException(status_code=403, detail="Bot verification is required")
+    if await account_is_banned(int(owner["telegram_id"])):
+        raise HTTPException(status_code=403, detail="WaysGram account is suspended")
     code = f"{secrets.randbelow(1_000_000):06d}"
     if not await store.save_code(payload.number, code, 300):
         raise HTTPException(status_code=429, detail="Code request is rate limited")
