@@ -284,15 +284,17 @@ def build_messenger_router(
             if phone_count >= 5 or ip_count >= 15:
                 await db.rollback()
                 raise HTTPException(status_code=429, detail="Превышен часовой лимит запросов кода")
-            await db.execute(
-                "INSERT INTO api_login_request_log(phone,ip,created_at) VALUES(?,?,?)",
-                (phone, ip, now),
-            )
             await db.commit()
 
         code = f"{secrets.randbelow(1_000_000):06d}"
         if not await auth_store.save_code(phone, code, 300):
             raise HTTPException(status_code=429, detail="Повторный запрос кода доступен через 30 секунд")
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute(
+                "INSERT INTO api_login_request_log(phone,ip,created_at) VALUES(?,?,?)",
+                (phone, ip, now),
+            )
+            await db.commit()
         try:
             language = str(owner.get("language") or "en")
             text = (
@@ -391,19 +393,33 @@ def build_messenger_router(
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
-        display_name = payload.get("display_name", user["display_name"])
-        if not isinstance(display_name, str) or len(display_name.strip()) > 128:
-            raise HTTPException(status_code=400, detail="Имя должно содержать не более 128 символов")
-        username = payload.get("username", user["username"])
-        if not isinstance(username, str):
-            raise HTTPException(status_code=400, detail="Некорректный username")
-        username = username.strip().lstrip("@").lower()
-        if username and not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", username):
-            raise HTTPException(status_code=400, detail="Username: латиница, цифры и _, первый символ — буква")
+        if not payload or not ({"username", "display_name"} & payload.keys()):
+            raise HTTPException(status_code=400, detail="Нет полей для изменения")
+        username = user["username"]
+        display_name = user["display_name"]
+        if "display_name" in payload:
+            display_name = payload["display_name"]
+            if not isinstance(display_name, str) or len(display_name.strip()) > 60:
+                raise HTTPException(status_code=400, detail="Имя профиля должно содержать не более 60 символов")
+            display_name = display_name.strip()
+        if "username" in payload:
+            username = payload["username"]
+            if not isinstance(username, str):
+                raise HTTPException(status_code=400, detail="Некорректный username")
+            username = username.strip().lstrip("@").lower()
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", username):
+                raise HTTPException(status_code=400, detail="Username: 1–32 символа, латиница, цифры и _, первый символ — буква")
         async with aiosqlite.connect(db_path()) as db:
+            if "username" in payload:
+                cur = await db.execute(
+                    "SELECT 1 FROM accounts WHERE username=? COLLATE NOCASE AND telegram_id<>?",
+                    (username, int(user["telegram_id"])),
+                )
+                if await cur.fetchone():
+                    raise HTTPException(status_code=409, detail="Username уже занят")
             await db.execute(
                 "UPDATE accounts SET username=?,display_name=?,updated_at=? WHERE telegram_id=?",
-                (username, display_name.strip(), int(time.time()), int(user["telegram_id"])),
+                (username, display_name, int(time.time()), int(user["telegram_id"])),
             )
             await db.commit()
             db.row_factory = aiosqlite.Row
@@ -702,7 +718,14 @@ def build_messenger_router(
                    VALUES('transfer',?,?,?,?,?)""",
                 (serial, str(gift["gift_name"]), uid, target_id, now),
             )
-            result = {"status": "transferred", "serial_number": serial, "to_user_id": target_id}
+            result = {
+                "status": "transferred",
+                "serial_number": serial,
+                "gift_name": str(gift["gift_name"]),
+                "from_user_id": uid,
+                "to_user_id": target_id,
+                "to_username": str(recipient["username"] or ""),
+            }
             await idempotency_store(db, uid, "/api/gifts/transfer", descriptor, result, now)
             await db.commit()
         return result
@@ -819,7 +842,7 @@ def build_messenger_router(
                 (channel_id, uid, body, now),
             )
             message_id = int(cur.lastrowid)
-            result = {"id": message_id, "channel_id": channel_id, "author_id": uid, "body": body, "created_at": now}
+            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
         return result
@@ -983,6 +1006,7 @@ def build_messenger_router(
             message_id = int(cur.lastrowid)
             result = {
                 "id": message_id,
+                "status": "sent",
                 "sender_id": uid,
                 "recipient_id": recipient_id,
                 "body": body,
