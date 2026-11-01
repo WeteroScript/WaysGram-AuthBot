@@ -167,6 +167,7 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
                 headers=sender,
             )
             assert history.status_code == 200
+            assert len(history.json()["messages"]) == 1
             assert history.json()["messages"][0]["body"] == "test message"
 
             conversations = await client.get("/api/conversations", headers=sender)
@@ -207,6 +208,7 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
                 headers=recipient,
             )
             assert channel_history.status_code == 200
+            assert len(channel_history.json()["messages"]) == 1
             assert channel_history.json()["messages"][0]["body"] == "first post"
 
     run(scenario())
@@ -275,7 +277,6 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
                 supply = db.execute("SELECT supply FROM gift_catalog WHERE id=1").fetchone()[0]
                 transaction_count = db.execute("SELECT COUNT(*) FROM economy_transactions WHERE reason='gift_purchase:1'").fetchone()[0]
                 gift_history_count = db.execute("SELECT COUNT(*) FROM gift_transactions WHERE serial_number=?", (serial,)).fetchone()[0]
-                dm_count = db.execute("SELECT COUNT(*) FROM messages WHERE sender_telegram_id=82001").fetchone()[0] if False else 0
             assert supply == 0
             assert transaction_count == 1
             assert gift_history_count == 2
