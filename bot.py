@@ -71,7 +71,7 @@ TEXT: dict[str, dict[str, str]] = {
         "admin_recent": "Последние пользователи (Telegram ID):\n{items}",
         "code_push": "Код WaysGram готов. Нажмите «Получить код» в меню бота.",
         "admin_numbers_empty": "Выданных номеров пока нет.",
-        "admin_numbers": "Выданные виртуальные номера:\\n{items}",
+        "admin_numbers": "Выданные виртуальные номера:\n{items}",
     },
     "en": {
         "choose_language": "Choose your language:",
@@ -627,7 +627,7 @@ async def admin_callback(callback: CallbackQuery) -> None:
     elif action == "numbers":
         rows = await store.number_inventory()
         if rows:
-            items = "\\n".join(
+            items = "\n".join(
                 f"{number} — TG {telegram_id} — {'verified' if verified else 'not verified'}"
                 for number, telegram_id, verified in rows
             )
