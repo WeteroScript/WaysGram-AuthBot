@@ -123,7 +123,8 @@ class Store:
                     telegram_id INTEGER NOT NULL UNIQUE REFERENCES users(telegram_id),
                     number TEXT NOT NULL UNIQUE,
                     provider_ref TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    last_code_requested_at INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS auth_codes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,6 +149,12 @@ class Store:
             if "attempts" not in code_columns:
                 await db.execute(
                     "ALTER TABLE auth_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            cur = await db.execute("PRAGMA table_info(numbers)")
+            number_columns = {str(row[1]) for row in await cur.fetchall()}
+            if "last_code_requested_at" not in number_columns:
+                await db.execute(
+                    "ALTER TABLE numbers ADD COLUMN last_code_requested_at INTEGER NOT NULL DEFAULT 0"
                 )
             await db.commit()
 
@@ -240,13 +247,22 @@ class Store:
     async def save_code(self, number: str, code: str, expires_in: int) -> bool:
         now = int(time.time())
         async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                "SELECT created_at FROM auth_codes WHERE number=? ORDER BY id DESC LIMIT 1",
+                "SELECT last_code_requested_at FROM numbers WHERE number=?",
                 (number,),
             )
-            previous = await cur.fetchone()
-            if previous and now - int(previous[0]) < 30:
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
                 return False
+            if now - int(row[0]) < 30:
+                await db.rollback()
+                return False
+            await db.execute(
+                "UPDATE numbers SET last_code_requested_at=? WHERE number=?",
+                (now, number),
+            )
             await db.execute("DELETE FROM auth_codes WHERE number=?", (number,))
             await db.execute(
                 "INSERT INTO auth_codes(number, code, expires_at, created_at, attempts) VALUES(?, ?, ?, ?, 0)",
@@ -483,9 +499,9 @@ async def admin_handler(message: Message) -> None:
     admin_user = await store.get_user(message.from_user.id)
     lang = str(admin_user.get("language") if admin_user else "ru")
     labels = (
-        ("Статистика", "Статус провайдера", "Последние пользователи")
+        ("Статистика", "Статус сервиса", "Последние пользователи")
         if lang == "ru"
-        else ("Statistics", "Provider status", "Recent users")
+        else ("Statistics", "Service status", "Recent users")
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=labels[0], callback_data="adm:stats")],
