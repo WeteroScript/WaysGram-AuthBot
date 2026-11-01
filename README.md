@@ -16,9 +16,9 @@ Python 3.11+:
 
 1. Install dependencies: pip install -r requirements.txt
 2. Set BOT_TOKEN and the other environment variables in the hosting platform.
-3. Start the worker: python bot.py
+3. Deploy as a web service using the included Procfile: web: python bot.py
 
-BOT_TOKEN is read only from the environment. Do not commit .env or put the bot token into source code. The bot uses long polling and starts an internal API on 0.0.0.0:8081 by default. Use persistent disk storage for DATABASE_PATH; ephemeral hosting storage can be lost on restart/redeploy.
+BOT_TOKEN is read only from the environment. Do not commit .env or put the bot token into source code. The bot uses long polling and starts its internal API in the same process. It binds to INTERNAL_API_PORT, then the hosting platform PORT, then 8081. Deploy as a web service (or an equivalent process that exposes this API), not as a worker-only service, so the WaysGram backend can reach it. Use persistent disk storage for DATABASE_PATH; ephemeral hosting storage can be lost on restart/redeploy.
 
 ## Environment
 
