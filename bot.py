@@ -1024,7 +1024,7 @@ async def admin_callback(callback: CallbackQuery) -> None:
                 await db.rollback()
                 await callback.message.answer("Не удалось выдать подарок: проверьте аккаунт и остаток.")
                 return
-            serial = "WG-" + secrets.token_hex(4).upper()
+            serial = "WG-" + secrets.token_hex(6).upper()
             await db.execute("UPDATE gift_catalog SET supply=supply-1 WHERE id=? AND supply>0", (gift_id,))
             await db.execute("INSERT INTO user_gifts(serial_number,gift_id,gift_name,owner_telegram_id,acquired_at) VALUES(?,?,?,?,?)",
                 (serial,gift_id,gift[0],user_id,now))
