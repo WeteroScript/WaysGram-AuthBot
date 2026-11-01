@@ -225,10 +225,19 @@ def test_settings_keyboard_contains_arrow_back_button() -> None:
 
 
 def test_admin_account_storage_and_suspension(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bot_module, "DATABASE_PATH", tmp_path / "admin.sqlite3")
+    path = tmp_path / "admin.sqlite3"
+    monkeypatch.setattr(bot_module, "DATABASE_PATH", path)
+    instance = bot_module.Store(path)
+    instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
+    run(instance.init())
+    run(instance.upsert_user(707, 707))
+    run(instance.set_verified(707, True))
+    number = run(instance.allocate_number(707))
     run(bot_module.init_admin_storage())
-    run(bot_module.ensure_account(707, "+11234567890"))
     assert run(bot_module.account_is_banned(707)) is False
+    with sqlite3.connect(path) as conn:
+        saved = conn.execute("SELECT virtual_number FROM accounts WHERE telegram_id=707").fetchone()
+    assert saved == (number,)
 
     with sqlite3.connect(bot_module.DATABASE_PATH) as conn:
         conn.execute("UPDATE accounts SET is_banned=1 WHERE telegram_id=707")
