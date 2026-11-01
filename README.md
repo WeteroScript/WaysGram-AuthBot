@@ -15,7 +15,7 @@ The bot does not read SMS, request Telegram login codes, or forward authenticati
 Python 3.11+:
 
 1. Install dependencies: pip install -r requirements.txt
-2. Set BOT_TOKEN and the other environment variables in the hosting platform.
+2. Set BOT_TOKEN, INTERNAL_API_TOKEN, and OTP_FERNET_KEY as hosting environment variables. OTP_FERNET_KEY is required; the process intentionally stops at startup if it is missing.
 3. Deploy as a web service using the included Procfile: web: python bot.py
 
 BOT_TOKEN is read only from the environment. Do not commit .env or put the bot token into source code. Generate `OTP_FERNET_KEY` using `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, then store it as a hosting secret. Keep this key unchanged across restarts and redeployments. The bot uses long polling and starts its internal API in the same process. It binds to INTERNAL_API_PORT, then the hosting platform PORT, then 8081. Deploy as a web service (or an equivalent process that exposes this API), not as a worker-only service, so the WaysGram backend can reach it. Use persistent disk storage for DATABASE_PATH; ephemeral hosting storage can be lost on restart/redeploy.
@@ -28,6 +28,7 @@ BOT_TOKEN is read only from the environment. Do not commit .env or put the bot t
 | ADMIN_ID | Admin Telegram ID; defaults to 8888957702 |
 | DATABASE_PATH | SQLite path; defaults to data/waysgram_authbot.sqlite3 |
 | INTERNAL_API_TOKEN | Secret used to authenticate WaysGram backend calls |
+| OTP_FERNET_KEY | Required persistent Fernet key used to encrypt OTP codes; generate it with the command above and keep it unchanged |
 | INTERNAL_API_HOST | API bind host; defaults to 0.0.0.0 |
 | INTERNAL_API_PORT | API bind port; defaults to 8081 |
 | LOG_LEVEL | Logging level; defaults to INFO |
