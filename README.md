@@ -1,59 +1,106 @@
 # WaysGram AuthBot
 
-Python Telegram bot for the WaysGram-owned account system. It provides Russian/English selection, emoji CAPTCHA, the user menu, an in-bot admin panel, virtual +1 login IDs, and a private HTTP API for WaysGram authentication.
+Единый сервер WaysGram и Telegram-бот авторизации. Процесс запускает Telegram-бота и HTTP API на одном приложении FastAPI; аккаунты, виртуальные номера, сессии, сообщения, балансы и подарки используют одну SQLite-базу.
 
-## Virtual +1 numbers
+## Виртуальные номера и вход
 
-The bot automatically generates a unique internal identifier in the format +1 followed by ten digits and saves it in its own SQLite database. These are **virtual WaysGram identifiers**, not carrier-issued phone numbers: they cannot receive calls or SMS and are intended only for logging in to WaysGram.
+Бот выдаёт уникальный внутренний идентификатор формата `+1` и десять цифр. Это **виртуальный идентификатор WaysGram**, а не номер мобильного оператора: он не принимает звонки или SMS и используется только для входа в WaysGram.
 
-The bot creates six-digit one-time WaysGram codes itself. When the WaysGram backend asks for a code, the bot creates a short-lived code, encrypts it in SQLite, and sends a notification that the code is ready. The user retrieves the code by tapping Get code in the bot. The backend verifies the code through the bot's private API.
+Бот самостоятельно создаёт шестизначный одноразовый код. При входе через приложение пользователь запрашивает код, получает уведомление от AuthWaysGram_bot и открывает кнопку «Получить код». Код хранится в базе в зашифрованном виде, имеет ограниченный срок действия и лимит попыток. После успешной проверки API выдаёт сессию приложения. В базе сохраняется только SHA-256 хеш токена сессии; срок сессии — 30 дней.
 
-The bot does not read SMS, request Telegram login codes, or forward authentication codes belonging to Telegram or another service. In Settings, the `->` button returns to the main menu.
+Бот не читает SMS, не запрашивает коды входа Telegram и не пересылает коды авторизации сторонних сервисов.
 
-## Run
+## Запуск
 
-Python 3.11+:
+Требуется Python 3.11+.
 
-1. Install dependencies: pip install -r requirements.txt
-2. Set BOT_TOKEN, INTERNAL_API_TOKEN, and OTP_FERNET_KEY as hosting environment variables. OTP_FERNET_KEY is required; the process intentionally stops at startup if it is missing.
-3. Deploy as a web service using the included Procfile: web: python bot.py
+1. Установить зависимости: `pip install -r requirements.txt`.
+2. Задать `BOT_TOKEN`, `INTERNAL_API_TOKEN` и `OTP_FERNET_KEY` в переменных окружения хостинга.
+3. Запустить сервис командой из Procfile: `web: python bot.py`.
 
-BOT_TOKEN is read only from the environment. Do not commit .env or put the bot token into source code. Generate `OTP_FERNET_KEY` using `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`, then store it as a hosting secret. Keep this key unchanged across restarts and redeployments. The bot uses long polling and starts its internal API in the same process. It binds to INTERNAL_API_PORT, then the hosting platform PORT, then 8081. Deploy as a web service (or an equivalent process that exposes this API), not as a worker-only service, so the WaysGram backend can reach it. Use persistent disk storage for DATABASE_PATH; ephemeral hosting storage can be lost on restart/redeploy.
+`BOT_TOKEN` не хранится в исходниках. Создать `OTP_FERNET_KEY` можно командой:
 
-## Environment
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
-| Variable | Purpose |
+Сгенерированный ключ нужно сохранить в секретах хостинга и не менять между перезапусками: он нужен для расшифровки ранее сохранённых кодов. Сервис использует long polling Telegram и одновременно поднимает HTTP API. API слушает `INTERNAL_API_PORT`, затем `PORT`, по умолчанию — 8081. Для продакшена необходим постоянный диск для `DATABASE_PATH`; временное файловое хранилище может потерять базу при перезапуске.
+
+## Переменные окружения
+
+| Переменная | Назначение |
 |---|---|
-| BOT_TOKEN | Required Telegram bot token |
-| ADMIN_ID | Admin Telegram ID; defaults to 8888957702 |
-| DATABASE_PATH | SQLite path; defaults to data/waysgram_authbot.sqlite3 |
-| INTERNAL_API_TOKEN | Secret used to authenticate WaysGram backend calls |
-| OTP_FERNET_KEY | Required persistent Fernet key used to encrypt OTP codes; generate it with the command above and keep it unchanged |
-| INTERNAL_API_HOST | API bind host; defaults to 0.0.0.0 |
-| INTERNAL_API_PORT | API bind port; defaults to 8081 |
-| LOG_LEVEL | Logging level; defaults to INFO |
+| `BOT_TOKEN` | Обязательный токен Telegram-бота |
+| `ADMIN_ID` | Telegram ID администратора; по умолчанию 8888957702 |
+| `DATABASE_PATH` | Путь к SQLite; по умолчанию `data/waysgram_authbot.sqlite3` |
+| `INTERNAL_API_TOKEN` | Секрет для внутренних серверных маршрутов |
+| `OTP_FERNET_KEY` | Постоянный ключ шифрования одноразовых кодов |
+| `INTERNAL_API_HOST` | Адрес привязки API; по умолчанию `0.0.0.0` |
+| `INTERNAL_API_PORT` | Порт API; по умолчанию используется `PORT`, затем 8081 |
+| `LOG_LEVEL` | Уровень логирования; по умолчанию `INFO` |
 
-## Internal API
+## API приложения WaysGram
 
-All endpoints except /health require the X-Internal-Token header.
+Клиентские маршруты используют Bearer-сессию. Для получения сессии пользователь должен иметь виртуальный номер и пройти CAPTCHA в AuthWaysGram_bot. Все идентификаторы пользователей в API — это реальные Telegram ID соответствующих аккаунтов WaysGram; отдельная таблица пользователей для второго backend не создаётся.
 
-- GET /health — health check.
-- POST /internal/v1/number/resolve — JSON {"number":"+1XXXXXXXXXX"}; confirms that the virtual number is assigned and returns the linked Telegram user ID.
-- POST /internal/v1/auth-code/request — JSON {"number":"+1XXXXXXXXXX"}; creates a six-digit code valid for five minutes, encrypts it in SQLite, and notifies the linked bot user. The actual code is revealed only after the user taps “Get code”. Requests are rate-limited.
-- POST /internal/v1/auth-code/verify — JSON {"number":"+1XXXXXXXXXX","code":"123456"}; checks the code, limits attempts, and consumes the code after successful verification.
+### Авторизация и профиль
 
-The Android/API integration currently uses this service for virtual-number resolution and OTP verification. The AuthBot SQLite database also stores WaysGram account balances, gift catalog entries, gift inventory, and administrator audit records. Keep `DATABASE_PATH` on persistent storage. The migration of all messaging and account-session APIs into this service is a separate implementation stage; the current OTP endpoints do not yet provide chat or message transport.
+- `POST /api/auth/request-code` — JSON `{"phone":"+1XXXXXXXXXX"}`; запросить код. Уведомление приходит через AuthWaysGram_bot, код пользователь забирает в боте.
+- `POST /api/auth/verify-code` — JSON `{"phone":"+1XXXXXXXXXX","code":"123456"}`; проверить код и получить `token`.
+- `POST /api/auth/refresh` — продлить действующую сессию.
+- `POST /api/auth/logout` — завершить текущую сессию.
+- `GET /api/me` и `PATCH /api/me` — получить или обновить username и отображаемое имя.
+- `GET /api/users?q=...` и `GET /api/users/{telegram_id}` — поиск и просмотр публичного профиля.
 
-## Admin panel
+### Переписка и каналы
 
-Open the bot using Telegram account ID `8888957702` and send `/admin`. The panel is entirely inside Telegram; there is no web or Android admin interface.
+- `GET /api/conversations` — список диалогов с последним сообщением.
+- `GET /api/messages?with={telegram_id}&after_id={message_id}` — история личной переписки или новые сообщения после указанного ID.
+- `POST /api/messages` — JSON `{"recipient_id":123,"body":"Текст"}`; отправить личное сообщение.
+- `GET /api/channels`, `GET /api/channels/{id}` — список и карточка канала.
+- `POST /api/channels` — создать канал; JSON содержит `username` и `title`.
+- `GET /api/channels/{id}/messages?after_id=...` — получить публикации.
+- `POST /api/channels/{id}/messages` — опубликовать сообщение; доступ владельцу или администратору канала.
+- `POST /api/channels/{id}/admins` и `DELETE /api/channels/{id}/admins/{telegram_id}` — управление администраторами канала его владельцем.
+- `DELETE /api/channels/{id}` — удалить собственный канал.
 
-Current sections:
-- **Statistics:** account count, blocked accounts, issued virtual numbers, active OTP codes, gift catalog/inventory counts, and total Stars/Gram balances.
-- **Accounts:** search by Telegram ID, virtual `+1` identifier, username, or display name; inspect account status and balances; block/unblock an account.
-- **Balances:** administrator-only Stars and Gram crediting, with a transaction record and audit log.
-- **Gift catalog:** create a gift with a name, Gram price, and available supply.
-- **Gift inventory:** inspect issued gifts and their serial numbers; issue a catalog gift to an account; transfer a gift between accounts from the account card; view gift grant/transfer history.
-- **Transactions and audit log:** inspect recent balance changes and administrator actions.
+Лимит текста сообщения — 4000 символов. Ограничение отправки: 30 личных сообщений в минуту и 20 публикаций канала в минуту. Истории поддерживают инкрементальное чтение через `after_id`.
 
-Admin actions are restricted to `ADMIN_ID`. Account suspensions are enforced by the bot's number-resolution and OTP-verification API. Balance credits are internal WaysGram ledger entries; this release does not implement cash-out or external payment processing.
+### Баланс и подарки
+
+- `GET /api/me/wallet`, `GET /api/me/wallet/transactions` — балансы и история операций.
+- `GET /api/gifts` — каталог доступных подарков.
+- `GET /api/me/gifts`, `GET /api/me/gifts/transactions` — инвентарь и история передач.
+- `POST /api/gifts/{id}/purchase` — покупка за Gram. Для защиты от повторного списания поддерживается заголовок `Idempotency-Key` длиной 16–128 символов.
+- `POST /api/gifts/transfer` — передача принадлежащего пользователю подарка по серийному номеру и Telegram ID или username получателя.
+
+Покупка атомарно уменьшает баланс и остаток каталога, создаёт экземпляр с уникальным серийным номером `WG-...` и записывает операцию. Повтор того же запроса с тем же ключом идемпотентности возвращает прежний результат. Stars и Gram — внутренние единицы учёта; внешняя оплата и вывод средств этим API не реализованы.
+
+### Внутренние маршруты AuthBot
+
+Маршруты ниже предназначены для доверенных внутренних интеграций и требуют заголовок `X-Internal-Token`:
+
+- `POST /internal/v1/number/resolve` — проверить назначение виртуального номера.
+- `POST /internal/v1/auth-code/request` — создать и доставить одноразовый код через Telegram-бота.
+- `POST /internal/v1/auth-code/verify` — проверить и погасить код.
+
+`GET /health` — проверка работоспособности. Клиентские маршруты `/api/...` используют пользовательские Bearer-сессии, а не внутренний секрет.
+
+## Админ-панель
+
+Админ-панель доступна только внутри Telegram: аккаунт с ID `8888957702` отправляет боту команду `/admin`. Web-панели и Android-админки нет.
+
+В панели доступны:
+
+- **Статистика:** пользователи, блокировки, номера, активные коды, каталог и инвентари подарков, суммарные Stars и Gram.
+- **Аккаунты:** поиск по Telegram ID, виртуальному номеру, username и отображаемому имени; карточка, блокировка и разблокировка.
+- **Баланс:** начисление Stars и Gram с записью в журнал операций.
+- **Каталог:** добавление подарков, цена в Gram и лимит экземпляров.
+- **Инвентарь:** выдача и передача подарков, серийные номера и история операций.
+- **Журнал:** последние операции с балансами и действия администратора.
+
+Все административные действия ограничены `ADMIN_ID`. Блокировка аккаунта проверяется при авторизации, разрешении номера и операциях приложения.
+
+## Текущие ограничения
+
+Текущая серверная часть предоставляет HTTP API для авторизации, профилей, личных сообщений, текстовых каналов, балансов и подарков. Передача файлов/медиа, WebSocket/push-синхронизация, звонки и полноценное управление контактами пока не входят в этот слой. Клиент должен получать новые сообщения через инкрементальные HTTP-запросы.
