@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -243,3 +244,79 @@ def test_admin_account_storage_and_suspension(tmp_path: Path, monkeypatch: pytes
         conn.execute("UPDATE accounts SET is_banned=1 WHERE telegram_id=707")
 
     assert run(bot_module.account_is_banned(707)) is True
+
+
+class FakeAdminMessage:
+    def __init__(self, text: str = "") -> None:
+        self.from_user = SimpleNamespace(id=bot_module.ADMIN_ID)
+        self.text = text
+        self.responses: list[tuple[str, object]] = []
+
+    async def answer(self, text: str, reply_markup=None) -> None:
+        self.responses.append((text, reply_markup))
+
+
+class FakeAdminCallback:
+    def __init__(self, data: str) -> None:
+        self.from_user = SimpleNamespace(id=bot_module.ADMIN_ID)
+        self.data = data
+        self.message = FakeAdminMessage()
+        self.answered = False
+
+    async def answer(self, *args, **kwargs) -> None:
+        self.answered = True
+
+
+def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "admin_actions.sqlite3"
+    monkeypatch.setattr(bot_module, "DATABASE_PATH", path)
+    instance = bot_module.Store(path)
+    instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
+    run(instance.init())
+    run(bot_module.init_admin_storage())
+    run(instance.upsert_user(bot_module.ADMIN_ID, bot_module.ADMIN_ID))
+    run(instance.set_verified(bot_module.ADMIN_ID, True))
+    number = run(instance.allocate_number(bot_module.ADMIN_ID))
+    run(bot_module.ensure_account(bot_module.ADMIN_ID, number, "admin", "Admin"))
+
+    now = int(time.time())
+    with sqlite3.connect(path) as conn:
+        cur = conn.execute(
+            "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Test Gift',5,2,?)",
+            (now,),
+        )
+        gift_id = int(cur.lastrowid)
+        cur = conn.execute(
+            "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES('moderated','Moderated',?,?)",
+            (bot_module.ADMIN_ID, now),
+        )
+        channel_id = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO channel_admins(channel_id,telegram_id,created_at) VALUES(?,?,?)",
+            (channel_id, bot_module.ADMIN_ID, now),
+        )
+        conn.execute(
+            "INSERT INTO channel_messages(channel_id,author_telegram_id,body,created_at) VALUES(?,?,?,?)",
+            (channel_id, bot_module.ADMIN_ID, "old post", now),
+        )
+
+    bot_module.ADMIN_INPUT[bot_module.ADMIN_ID] = ("edit_gift_supply", gift_id)
+    edit_message = FakeAdminMessage("9")
+    run(bot_module.admin_text_input(edit_message))
+    assert edit_message.responses
+    with sqlite3.connect(path) as conn:
+        supply = conn.execute("SELECT supply FROM gift_catalog WHERE id=?", (gift_id,)).fetchone()[0]
+    assert supply == 9
+
+    callback = FakeAdminCallback(f"wgadm:channeldelete:{channel_id}")
+    run(bot_module.admin_callback(callback))
+    assert callback.answered
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT 1 FROM channels WHERE id=?", (channel_id,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM channel_messages WHERE channel_id=?", (channel_id,)).fetchone() is None
+        assert conn.execute("SELECT 1 FROM channel_admins WHERE channel_id=?", (channel_id,)).fetchone() is None
+        log = conn.execute(
+            "SELECT action FROM admin_logs WHERE target=? ORDER BY id DESC LIMIT 1",
+            (str(channel_id),),
+        ).fetchone()
+    assert log == ("channel_delete",)
