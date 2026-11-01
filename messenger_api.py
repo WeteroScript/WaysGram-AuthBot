@@ -962,8 +962,8 @@ def build_messenger_router(
                 SELECT id,sender_telegram_id AS sender_id,
                        recipient_telegram_id AS recipient_id,body,created_at
                 FROM messages WHERE
-                (sender_telegram_id=? AND recipient_telegram_id=?) OR
-                (sender_telegram_id=? AND recipient_telegram_id=?)
+                ((sender_telegram_id=? AND recipient_telegram_id=?) OR
+                 (sender_telegram_id=? AND recipient_telegram_id=?))
             """
             params: tuple[Any, ...] = (uid, peer, peer, uid)
             if after_id:
