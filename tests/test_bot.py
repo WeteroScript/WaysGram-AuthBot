@@ -310,6 +310,17 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
         supply = conn.execute("SELECT supply FROM gift_catalog WHERE id=?", (gift_id,)).fetchone()[0]
     assert supply == 9
 
+    grant_callback = FakeAdminCallback(f"wgadm:grantgift:{bot_module.ADMIN_ID}:{gift_id}")
+    run(bot_module.admin_callback(grant_callback))
+    assert grant_callback.answered
+    with sqlite3.connect(path) as conn:
+        serial = conn.execute(
+            "SELECT serial_number FROM user_gifts WHERE owner_telegram_id=?",
+            (bot_module.ADMIN_ID,),
+        ).fetchone()[0]
+    assert len(serial) == 15
+    assert serial.startswith("WG-")
+
     callback = FakeAdminCallback(f"wgadm:channeldelete:{channel_id}")
     run(bot_module.admin_callback(callback))
     assert callback.answered
