@@ -1,0 +1,55 @@
+name: AuthBot Container
+
+on:
+  push:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".env.example"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "bot.py"
+      - "messenger_api.py"
+      - ".github/workflows/container.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".env.example"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "bot.py"
+      - "messenger_api.py"
+      - ".github/workflows/container.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          rm .env
+
+      - name: Build AuthBot image
+        run: docker build --pull --tag waysgram-authbot:test .
+
+      - name: Compile server modules inside the image
+        run: |
+          docker run --rm --entrypoint python waysgram-authbot:test \
+            -m compileall -q bot.py messenger_api.py tests
+
+      - name: Verify healthcheck configuration
+        run: |
+          docker image inspect waysgram-authbot:test \
+            --format '{{json .Config.Healthcheck}}' |
+            grep -q '127.0.0.1'
