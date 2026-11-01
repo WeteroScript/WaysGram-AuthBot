@@ -8,7 +8,7 @@ The bot automatically generates a unique internal identifier in the format +1 fo
 
 The bot creates six-digit one-time WaysGram codes itself. When the WaysGram backend asks for a code, the bot creates a short-lived code, encrypts it in SQLite, and sends a notification that the code is ready. The user retrieves the code by tapping Get code in the bot. The backend verifies the code through the bot's private API.
 
-The bot does not read SMS, request Telegram login codes, or forward authentication codes belonging to Telegram or another service.
+The bot does not read SMS, request Telegram login codes, or forward authentication codes belonging to Telegram or another service. In Settings, the `->` button returns to the main menu.
 
 ## Run
 
@@ -41,7 +41,7 @@ All endpoints except /health require the X-Internal-Token header.
 - POST /internal/v1/auth-code/request — JSON {"number":"+1XXXXXXXXXX"}; creates a six-digit code valid for five minutes, encrypts it in SQLite, and notifies the linked bot user. The actual code is revealed only after the user taps “Get code”. Requests are rate-limited.
 - POST /internal/v1/auth-code/verify — JSON {"number":"+1XXXXXXXXXX","code":"123456"}; checks the code, limits attempts, and consumes the code after successful verification.
 
-The WaysGram backend must use the verify endpoint and enforce additional per-account and per-IP rate limits. This bot database stores the Telegram-to-virtual-number mapping and temporary authentication codes. The main WaysGram backend remains the source of truth for accounts, Stars, Gram balances, and gifts.
+The WaysGram backend must be configured with `NEXUSGRAM_AUTHBOT_URL` (the public HTTPS base URL of this service) and `NEXUSGRAM_AUTHBOT_TOKEN` (the same secret as `INTERNAL_API_TOKEN`), use the verify endpoint, and enforce additional per-account and per-IP rate limits. Run this service with a persistent disk for `DATABASE_PATH`. This bot database stores the Telegram-to-virtual-number mapping and encrypted temporary authentication codes. The main WaysGram backend remains the source of truth for accounts, Stars, Gram balances, and gifts.
 
 ## Admin
 
