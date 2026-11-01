@@ -24,7 +24,7 @@ GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
 
 async def init_messenger_storage(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(database_path) as db:
+    async with aiosqlite.connect(db_path()) as db:
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS api_sessions (
@@ -123,12 +123,13 @@ def _message_body(value: str) -> str:
 
 
 def build_messenger_router(
-    database_path: Path,
+    database_path: Path | Callable[[], Path],
     auth_store: Any,
     bot_provider: Callable[[], Any],
     account_is_banned: Callable[[int], Any],
 ) -> APIRouter:
     router = APIRouter()
+    db_path = database_path if callable(database_path) else lambda: database_path
 
     async def current_user(authorization: str | None) -> dict[str, Any]:
         if not authorization or not authorization.startswith("Bearer "):
@@ -137,7 +138,7 @@ def build_messenger_router(
         if not token:
             raise HTTPException(status_code=401, detail="Требуется вход")
         now = int(time.time())
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT a.* FROM api_sessions s
@@ -156,7 +157,7 @@ def build_messenger_router(
         return user
 
     async def channel_row(channel_id: int) -> dict[str, Any]:
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT ch.id,ch.username,ch.title,ch.owner_telegram_id,
@@ -172,7 +173,7 @@ def build_messenger_router(
         return dict(row)
 
     async def can_manage_channel(channel_id: int, telegram_id: int) -> bool:
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
                 """SELECT 1 FROM channels WHERE id=? AND owner_telegram_id=?
                    UNION SELECT 1 FROM channel_admins WHERE channel_id=? AND telegram_id=? LIMIT 1""",
@@ -221,7 +222,7 @@ def build_messenger_router(
 
         now = int(time.time())
         ip = request.client.host if request.client else "unknown"
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 "SELECT COUNT(*) FROM api_login_request_log WHERE phone=? AND created_at>?",
@@ -247,11 +248,12 @@ def build_messenger_router(
             raise HTTPException(status_code=429, detail="Повторный запрос кода доступен через 30 секунд")
         try:
             language = str(owner.get("language") or "en")
-            from bot import tr
-            await bot.send_message(
-                chat_id=int(owner["chat_id"]),
-                text=tr(language, "code_push"),
+            text = (
+                "Код WaysGram готов. Нажмите «Получить код» в меню бота."
+                if language == "ru"
+                else "Your WaysGram code is ready. Tap “Get code” in the bot menu."
             )
+            await bot.send_message(chat_id=int(owner["chat_id"]), text=text)
         except Exception as exc:
             raise HTTPException(status_code=502, detail="Не удалось отправить уведомление через Telegram-бота") from exc
         return {
@@ -278,7 +280,7 @@ def build_messenger_router(
 
         now = int(time.time())
         token = secrets.token_urlsafe(36)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute(
                 """INSERT OR IGNORE INTO accounts
@@ -308,7 +310,7 @@ def build_messenger_router(
         user = await current_user(authorization)
         token = authorization[7:].strip()
         expires_at = int(time.time()) + SESSION_TTL
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
                 "UPDATE api_sessions SET expires_at=? WHERE token_hash=? AND expires_at>?",
                 (expires_at, _token_hash(token), int(time.time())),
@@ -327,7 +329,7 @@ def build_messenger_router(
         if authorization and authorization.startswith("Bearer "):
             token = authorization[7:].strip()
             if token:
-                async with aiosqlite.connect(database_path) as db:
+                async with aiosqlite.connect(db_path()) as db:
                     await db.execute("DELETE FROM api_sessions WHERE token_hash=?", (_token_hash(token),))
                     await db.commit()
         return {"status": "logged_out"}
@@ -351,7 +353,7 @@ def build_messenger_router(
         username = username.strip().lstrip("@").lower()
         if username and not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", username):
             raise HTTPException(status_code=400, detail="Username: латиница, цифры и _, первый символ — буква")
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             await db.execute(
                 "UPDATE accounts SET username=?,display_name=?,updated_at=? WHERE telegram_id=?",
                 (username, display_name.strip(), int(time.time()), int(user["telegram_id"])),
@@ -375,7 +377,7 @@ def build_messenger_router(
     @router.get("/api/me/wallet/transactions")
     async def wallet_transactions(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         user = await current_user(authorization)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT id,asset,amount,balance_after,reason,admin_id,created_at
@@ -388,7 +390,7 @@ def build_messenger_router(
     @router.get("/api/me/gifts")
     async def my_gifts(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         user = await current_user(authorization)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT id,serial_number,gift_id,gift_name,acquired_at
@@ -402,7 +404,7 @@ def build_messenger_router(
     async def my_gift_transactions(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT id,event_type,serial_number,gift_name,from_telegram_id,
@@ -424,7 +426,7 @@ def build_messenger_router(
         q = q.strip().lstrip("@")
         if not q:
             return {"users": []}
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             if q.isdigit():
                 cur = await db.execute(
@@ -448,7 +450,7 @@ def build_messenger_router(
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         await current_user(authorization)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT telegram_id AS id,username,display_name,created_at
@@ -463,7 +465,7 @@ def build_messenger_router(
     @router.get("/api/gifts")
     async def gift_catalog(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         await current_user(authorization)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT id,name,price_grams AS price,supply FROM gift_catalog
@@ -489,7 +491,7 @@ def build_messenger_router(
         canonical = json.dumps({"gift_id": gift_id, "payload": payload}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         request_hash = hashlib.sha256(("/api/gifts/purchase\n" + canonical).encode("utf-8")).hexdigest()
         now = int(time.time())
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             if key:
@@ -601,7 +603,7 @@ def build_messenger_router(
         if not GIFT_SERIAL_RE.fullmatch(serial) or not recipient_key or len(recipient_key) > 64:
             raise HTTPException(status_code=400, detail="Проверьте серийный номер и получателя")
         now = int(time.time())
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             if recipient_key.isdigit():
@@ -653,7 +655,7 @@ def build_messenger_router(
     @router.get("/api/channels")
     async def list_channels(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         await current_user(authorization)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT ch.id,ch.username,ch.title,ch.owner_telegram_id,
@@ -679,7 +681,7 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="Username канала: латиница, цифры и _, первый символ — буква")
         now = int(time.time())
         try:
-            async with aiosqlite.connect(database_path) as db:
+            async with aiosqlite.connect(db_path()) as db:
                 cur = await db.execute(
                     "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES(?,?,?,?)",
                     (username, title.strip(), int(user["telegram_id"]), now),
@@ -706,7 +708,7 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         await current_user(authorization)
         await channel_row(channel_id)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             if after_id:
                 cur = await db.execute(
@@ -740,7 +742,7 @@ def build_messenger_router(
         if not await can_manage_channel(channel_id, uid):
             raise HTTPException(status_code=403, detail="Публиковать в канале может только владелец или администратор")
         now = int(time.time())
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
                 "SELECT COUNT(*) FROM channel_messages WHERE author_telegram_id=? AND created_at>?",
                 (uid, now - 60),
@@ -772,7 +774,7 @@ def build_messenger_router(
             target_id = 0
         if target_id <= 0:
             raise HTTPException(status_code=400, detail="Некорректный Telegram ID")
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (target_id,))
             if not await cur.fetchone():
                 raise HTTPException(status_code=404, detail="Пользователь не найден")
@@ -793,7 +795,7 @@ def build_messenger_router(
         channel = await channel_row(channel_id)
         if int(channel["owner_telegram_id"]) != int(user["telegram_id"]):
             raise HTTPException(status_code=403, detail="Только владелец может удалять администраторов")
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
                 "DELETE FROM channel_admins WHERE channel_id=? AND telegram_id=?",
                 (channel_id, telegram_id),
@@ -809,7 +811,7 @@ def build_messenger_router(
         authorization: str | None = Header(default=None),
     ) -> dict[str, bool]:
         user = await current_user(authorization)
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
                 "DELETE FROM channels WHERE id=? AND owner_telegram_id=?",
                 (channel_id, int(user["telegram_id"])),
@@ -827,7 +829,7 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (peer,))
             if not await cur.fetchone():
@@ -873,7 +875,7 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="Укажите корректного получателя")
         body = _message_body(payload.get("body", ""))
         now = int(time.time())
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 "SELECT is_banned FROM accounts WHERE telegram_id=?",
@@ -912,7 +914,7 @@ def build_messenger_router(
     async def list_conversations(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        async with aiosqlite.connect(database_path) as db:
+        async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """WITH recent AS (
