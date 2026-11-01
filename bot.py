@@ -678,7 +678,7 @@ async def account_is_banned(telegram_id: int) -> bool:
 
 app.include_router(
     build_messenger_router(
-        DATABASE_PATH,
+        lambda: DATABASE_PATH,
         store,
         lambda: bot,
         account_is_banned,
