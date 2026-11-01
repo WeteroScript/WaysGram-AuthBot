@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+from cryptography.fernet import Fernet
+
+import bot as bot_module
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.messages: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        self.messages.append((chat_id, text))
+
+
+@pytest.fixture
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> bot_module.Store:
+    instance = bot_module.Store(tmp_path / "waysgram.sqlite3")
+    instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
+    asyncio.run(instance.init())
+    monkeypatch.setattr(bot_module, "store", instance)
+    return instance
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def test_virtual_number_is_unique_and_persistent(store: bot_module.Store) -> None:
+    run(store.upsert_user(101, 101))
+    run(store.upsert_user(202, 202))
+    run(store.set_verified(101, True))
+    run(store.set_verified(202, True))
+
+    first = run(store.allocate_number(101))
+    second = run(store.allocate_number(202))
+
+    assert len(first) == 12
+    assert first.startswith("+1")
+    assert first[1:].isdigit()
+    assert first != second
+    assert run(store.allocate_number(101)) == first
+    assert run(store.resolve_number(first))["telegram_id"] == 101
+
+
+def test_otp_is_encrypted_and_consumed_once(store: bot_module.Store, tmp_path: Path) -> None:
+    run(store.upsert_user(303, 303))
+    run(store.set_verified(303, True))
+    number = run(store.allocate_number(303))
+
+    assert run(store.save_code(number, "482601", 300)) is True
+
+    with sqlite3.connect(store.path) as conn:
+        stored_code, encrypted = conn.execute(
+            "SELECT code, encrypted FROM auth_codes WHERE number=?", (number,)
+        ).fetchone()
+
+    assert encrypted == 1
+    assert stored_code != "482601"
+    assert run(store.latest_code(number))[0] == "482601"
+    assert run(store.verify_code(number, "482601")) is True
+    assert run(store.verify_code(number, "482601")) is False
+
+
+def test_otp_request_cooldown_and_attempt_limit(store: bot_module.Store) -> None:
+    run(store.upsert_user(404, 404))
+    run(store.set_verified(404, True))
+    number = run(store.allocate_number(404))
+
+    assert run(store.save_code(number, "100001", 300)) is True
+    assert run(store.save_code(number, "100002", 300)) is False
+
+    # Exercise the five-attempt limit without waiting for the cooldown.
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE numbers SET last_code_requested_at=? WHERE number=?",
+            (int(time.time()) - 31, number),
+        )
+    assert run(store.save_code(number, "100002", 300)) is True
+    for _ in range(5):
+        assert run(store.verify_code(number, "999999")) is False
+    assert run(store.verify_code(number, "100002")) is False
+
+
+def test_internal_api_requires_secret_and_delivers_otp(store: bot_module.Store, monkeypatch) -> None:
+    run(store.upsert_user(505, 505))
+    number = run(store.allocate_number(505))
+    fake_bot = FakeBot()
+    monkeypatch.setattr(bot_module, "bot", fake_bot)
+    monkeypatch.setattr(bot_module, "INTERNAL_API_TOKEN", "test-internal-secret")
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=bot_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            denied = await client.post(
+                "/internal/v1/auth-code/request", json={"number": number}
+            )
+            assert denied.status_code == 401
+
+            unverified = await client.post(
+                "/internal/v1/auth-code/request",
+                json={"number": number},
+                headers={"X-Internal-Token": "test-internal-secret"},
+            )
+            assert unverified.status_code == 403
+
+            await client.post(
+                "/internal/v1/number/resolve",
+                json={"number": number},
+                headers={"X-Internal-Token": "test-internal-secret"},
+            )
+
+            await store.set_verified(505, True)
+            requested = await client.post(
+                "/internal/v1/auth-code/request",
+                json={"number": number},
+                headers={"X-Internal-Token": "test-internal-secret"},
+            )
+            assert requested.status_code == 200
+            assert requested.json() == {"status": "delivered"}
+            assert len(fake_bot.messages) == 1
+            assert "Get code" in fake_bot.messages[0][1]
+
+            code, _remaining = await store.latest_code(number)
+            assert code not in requested.text
+
+            verified = await client.post(
+                "/internal/v1/auth-code/verify",
+                json={"number": number, "code": code},
+                headers={"X-Internal-Token": "test-internal-secret"},
+            )
+            assert verified.status_code == 200
+            assert verified.json() == {"valid": True}
+
+            replay = await client.post(
+                "/internal/v1/auth-code/verify",
+                json={"number": number, "code": code},
+                headers={"X-Internal-Token": "test-internal-secret"},
+            )
+            assert replay.json() == {"valid": False}
+
+    run(scenario())
+
+
+def test_legacy_plaintext_codes_are_encrypted_during_migration(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    now = int(time.time())
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE users (
+                telegram_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                language TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE numbers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL UNIQUE,
+                number TEXT NOT NULL UNIQUE,
+                provider_ref TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_code_requested_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE auth_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT NOT NULL,
+                code TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO users VALUES(606, 606, 'en', 1, ?)", (now,)
+        )
+        conn.execute(
+            "INSERT INTO numbers(telegram_id, number, provider_ref, created_at) VALUES(606, '+11234567890', 'internal', ?)",
+            (now,),
+        )
+        conn.execute(
+            "INSERT INTO auth_codes(number, code, expires_at, attempts, created_at) VALUES('+11234567890', '761204', ?, 0, ?)",
+            (now + 300, now),
+        )
+
+    instance = bot_module.Store(path)
+    instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
+    run(instance.init())
+
+    with sqlite3.connect(path) as conn:
+        stored_code, encrypted = conn.execute(
+            "SELECT code, encrypted FROM auth_codes"
+        ).fetchone()
+
+    assert encrypted == 1
+    assert stored_code != "761204"
+    assert run(instance.latest_code("+11234567890"))[0] == "761204"
+
+
+def test_settings_keyboard_contains_arrow_back_button() -> None:
+    keyboard = bot_module.language_keyboard(include_back=True)
+    arrow_buttons = [
+        button
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.text == "->"
+    ]
+    assert len(arrow_buttons) == 1
+    assert arrow_buttons[0].callback_data == "nav:menu"
