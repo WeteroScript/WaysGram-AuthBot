@@ -12,10 +12,24 @@
 
 ## Запуск
 
+### Docker Compose
+
+В репозитории есть `Dockerfile`, `docker-compose.yml` и безопасный шаблон `.env.example`. Для размещения на сервере:
+
+1. Клонировать репозиторий на Docker-хост.
+2. Скопировать шаблон: `cp .env.example .env`.
+3. Заполнить в `.env` значения `BOT_TOKEN`, `INTERNAL_API_TOKEN` и `OTP_FERNET_KEY`.
+4. Запустить: `docker compose up -d --build`.
+5. Проверить состояние: `docker compose ps`; endpoint проверки доступен на `http://127.0.0.1:8081/health`.
+
+Compose создаёт постоянный named volume `waysgram_data` для SQLite. Не удаляй его при обновлении контейнера. Для удалённого Android-клиента API должен быть опубликован через HTTPS reverse proxy или HTTPS ingress; не открывай порт API напрямую в публичный интернет без TLS. В GitHub Actions Android-репозитория адрес внешнего HTTPS endpoint задаётся секретом `WAYSGRAM_API_BASE_URL`.
+
+### Ручной запуск
+
 Требуется Python 3.11+.
 
 1. Установить зависимости: `pip install -r requirements.txt`.
-2. Задать `BOT_TOKEN`, `INTERNAL_API_TOKEN` и `OTP_FERNET_KEY` в переменных окружения хостинга.
+2. Задать `BOT_TOKEN`, `INTERNAL_API_TOKEN` и `OTP_FERNET_KEY` в переменных окружения.
 3. Запустить сервис командой из Procfile: `web: python bot.py`.
 
 `BOT_TOKEN` не хранится в исходниках. Создать `OTP_FERNET_KEY` можно командой:
@@ -24,7 +38,13 @@
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Сгенерированный ключ нужно сохранить в секретах хостинга и не менять между перезапусками: он нужен для расшифровки ранее сохранённых кодов. Сервис использует long polling Telegram и одновременно поднимает HTTP API. API слушает `INTERNAL_API_PORT`, затем `PORT`, по умолчанию — 8081. Для продакшена необходим постоянный диск для `DATABASE_PATH`; временное файловое хранилище может потерять базу при перезапуске.
+Создать случайный внутренний токен можно командой:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Сгенерированный `OTP_FERNET_KEY` нужно сохранить в секретах хостинга и не менять между перезапусками: он нужен для расшифровки ранее сохранённых кодов. Сервис использует long polling Telegram и одновременно поднимает HTTP API. API слушает `INTERNAL_API_PORT`, затем `PORT`, по умолчанию — 8081. Для продакшена необходим постоянный диск для `DATABASE_PATH`; временное файловое хранилище может потерять базу при перезапуске.
 
 ## Переменные окружения
 
