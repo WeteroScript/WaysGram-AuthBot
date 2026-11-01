@@ -280,6 +280,10 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
     run(instance.set_verified(bot_module.ADMIN_ID, True))
     number = run(instance.allocate_number(bot_module.ADMIN_ID))
     run(bot_module.ensure_account(bot_module.ADMIN_ID, number, "admin", "Admin"))
+    run(instance.upsert_user(90099, 90099))
+    run(instance.set_verified(90099, True))
+    moderator_number = run(instance.allocate_number(90099))
+    run(bot_module.ensure_account(90099, moderator_number, "moderator", "Moderator"))
 
     now = int(time.time())
     with sqlite3.connect(path) as conn:
@@ -295,7 +299,7 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
         channel_id = int(cur.lastrowid)
         conn.execute(
             "INSERT INTO channel_admins(channel_id,telegram_id,created_at) VALUES(?,?,?)",
-            (channel_id, bot_module.ADMIN_ID, now),
+            (channel_id, 90099, now),
         )
         conn.execute(
             "INSERT INTO channel_messages(channel_id,author_telegram_id,body,created_at) VALUES(?,?,?,?)",
@@ -320,6 +324,15 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
         ).fetchone()[0]
     assert len(serial) == 15
     assert serial.startswith("WG-")
+
+    remove_admin_callback = FakeAdminCallback(f"wgadm:channeladminremove:{channel_id}:90099")
+    run(bot_module.admin_callback(remove_admin_callback))
+    assert remove_admin_callback.answered
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM channel_admins WHERE channel_id=? AND telegram_id=90099",
+            (channel_id,),
+        ).fetchone() is None
 
     callback = FakeAdminCallback(f"wgadm:channeldelete:{channel_id}")
     run(bot_module.admin_callback(callback))
