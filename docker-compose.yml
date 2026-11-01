@@ -13,7 +13,7 @@ services:
       INTERNAL_API_PORT: "8081"
       PORT: "8081"
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     volumes:
       - waysgram_data:/data
     init: true
