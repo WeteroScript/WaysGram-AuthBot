@@ -56,11 +56,11 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 - `GET /api/conversations` — список диалогов с последним сообщением.
 - `GET /api/messages?with={telegram_id}&after_id={message_id}` — история личной переписки или новые сообщения после указанного ID.
-- `POST /api/messages` — JSON `{"recipient_id":123,"body":"Текст"}`; отправить личное сообщение.
+- `POST /api/messages` — JSON `{"recipient_id":123,"body":"Текст"}`; отправить личное сообщение. Поддерживает `Idempotency-Key` для безопасного повтора после сетевого сбоя.
 - `GET /api/channels`, `GET /api/channels/{id}` — список и карточка канала.
 - `POST /api/channels` — создать канал; JSON содержит `username` и `title`.
 - `GET /api/channels/{id}/messages?after_id=...` — получить публикации.
-- `POST /api/channels/{id}/messages` — опубликовать сообщение; доступ владельцу или администратору канала.
+- `POST /api/channels/{id}/messages` — опубликовать сообщение; доступ владельцу или администратору канала. Поддерживает `Idempotency-Key`.
 - `POST /api/channels/{id}/admins` и `DELETE /api/channels/{id}/admins/{telegram_id}` — управление администраторами канала его владельцем.
 - `DELETE /api/channels/{id}` — удалить собственный канал.
 
@@ -72,7 +72,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 - `GET /api/gifts` — каталог доступных подарков.
 - `GET /api/me/gifts`, `GET /api/me/gifts/transactions` — инвентарь и история передач.
 - `POST /api/gifts/{id}/purchase` — покупка за Gram. Для защиты от повторного списания поддерживается заголовок `Idempotency-Key` длиной 16–128 символов.
-- `POST /api/gifts/transfer` — передача принадлежащего пользователю подарка по серийному номеру и Telegram ID или username получателя.
+- `POST /api/gifts/transfer` — передача принадлежащего пользователю подарка по серийному номеру и Telegram ID или username получателя. Поддерживает `Idempotency-Key`.
 
 Покупка атомарно уменьшает баланс и остаток каталога, создаёт экземпляр с уникальным серийным номером `WG-...` и записывает операцию. Повтор того же запроса с тем же ключом идемпотентности возвращает прежний результат. Stars и Gram — внутренние единицы учёта; внешняя оплата и вывод средств этим API не реализованы.
 
@@ -92,7 +92,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 В панели доступны:
 
-- **Статистика:** пользователи, блокировки, номера, активные коды, каталог и инвентари подарков, суммарные Stars и Gram.
+- **Статистика:** пользователи, блокировки, номера, активные коды, каналы, личные сообщения, каталог и инвентари подарков, суммарные Stars и Gram.
 - **Аккаунты:** поиск по Telegram ID, виртуальному номеру, username и отображаемому имени; карточка, блокировка и разблокировка.
 - **Баланс:** начисление Stars и Gram с записью в журнал операций.
 - **Каталог:** добавление подарков, редактирование цены и остатка, скрытие подарка из пользовательского каталога.
