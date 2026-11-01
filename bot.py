@@ -733,7 +733,12 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is required")
     if not OTP_FERNET_KEY:
-        raise RuntimeError("OTP_FERNET_KEY environment variable is required")
+        raise RuntimeError(
+            "OTP_FERNET_KEY is missing. Generate it with "
+            "`python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())` and add it to the "
+            "hosting environment variables. Keep the same key across restarts."
+        )
     store.configure_otp_encryption(OTP_FERNET_KEY)
     await store.init()
     bot = Bot(token=BOT_TOKEN)
