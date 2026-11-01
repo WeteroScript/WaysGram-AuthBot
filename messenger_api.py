@@ -878,13 +878,21 @@ def build_messenger_router(
     ) -> dict[str, bool]:
         user = await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
+                "SELECT 1 FROM channels WHERE id=? AND owner_telegram_id=?",
+                (channel_id, int(user["telegram_id"])),
+            )
+            if not await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Канал не найден или вы не являетесь владельцем")
+            await db.execute("DELETE FROM channel_messages WHERE channel_id=?", (channel_id,))
+            await db.execute("DELETE FROM channel_admins WHERE channel_id=?", (channel_id,))
+            await db.execute(
                 "DELETE FROM channels WHERE id=? AND owner_telegram_id=?",
                 (channel_id, int(user["telegram_id"])),
             )
             await db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Канал не найден или вы не являетесь владельцем")
         return {"deleted": True}
 
     @router.get("/api/messages")
