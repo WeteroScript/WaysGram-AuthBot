@@ -656,6 +656,10 @@ async def init_admin_storage() -> None:
             created_at INTEGER NOT NULL
         );
         """)
+        # Backfill account records for users who received virtual numbers before this panel update.
+        await db.execute("""INSERT OR IGNORE INTO accounts
+            (telegram_id,virtual_number,created_at,updated_at)
+            SELECT telegram_id,number,created_at,created_at FROM numbers""")
         cur = await db.execute("PRAGMA table_info(accounts)")
         account_columns = {str(row[1]) for row in await cur.fetchall()}
         if "username" not in account_columns:
