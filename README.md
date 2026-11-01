@@ -42,8 +42,18 @@ All endpoints except /health require the X-Internal-Token header.
 - POST /internal/v1/auth-code/request — JSON {"number":"+1XXXXXXXXXX"}; creates a six-digit code valid for five minutes, encrypts it in SQLite, and notifies the linked bot user. The actual code is revealed only after the user taps “Get code”. Requests are rate-limited.
 - POST /internal/v1/auth-code/verify — JSON {"number":"+1XXXXXXXXXX","code":"123456"}; checks the code, limits attempts, and consumes the code after successful verification.
 
-The WaysGram backend must be configured with `NEXUSGRAM_AUTHBOT_URL` (the public HTTPS base URL of this service) and `NEXUSGRAM_AUTHBOT_TOKEN` (the same secret as `INTERNAL_API_TOKEN`), use the verify endpoint, and enforce additional per-account and per-IP rate limits. Run this service with a persistent disk for `DATABASE_PATH`. This bot database stores the Telegram-to-virtual-number mapping and encrypted temporary authentication codes. The main WaysGram backend remains the source of truth for accounts, Stars, Gram balances, and gifts.
+The Android/API integration currently uses this service for virtual-number resolution and OTP verification. The AuthBot SQLite database also stores WaysGram account balances, gift catalog entries, gift inventory, and administrator audit records. Keep `DATABASE_PATH` on persistent storage. The migration of all messaging and account-session APIs into this service is a separate implementation stage; the current OTP endpoints do not yet provide chat or message transport.
 
-## Admin
+## Admin panel
 
-Open AuthWaysGram_bot using Telegram account ID 8888957702 and send /admin. The panel shows user/number/code counts, service status, and recent Telegram user IDs.
+Open the bot using Telegram account ID `8888957702` and send `/admin`. The panel is entirely inside Telegram; there is no web or Android admin interface.
+
+Current sections:
+- **Statistics:** account count, blocked accounts, issued virtual numbers, active OTP codes, gift catalog/inventory counts, and total Stars/Gram balances.
+- **Accounts:** search by Telegram ID or virtual `+1` identifier; inspect account status and balances; block/unblock an account.
+- **Balances:** administrator-only Stars and Gram crediting, with a transaction record and audit log.
+- **Gift catalog:** create a gift with a name, Gram price, and available supply.
+- **Gift inventory:** inspect issued gifts and their serial numbers; issue a catalog gift to an account.
+- **Transactions and audit log:** inspect recent balance changes and administrator actions.
+
+Admin actions are restricted to `ADMIN_ID`. Account suspensions are enforced by the bot's number-resolution and OTP-verification API. Balance credits are internal WaysGram ledger entries; this release does not implement cash-out or external payment processing.
