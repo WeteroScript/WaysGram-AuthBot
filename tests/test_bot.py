@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, str(ROOT))
 
 import bot as bot_module
+from messenger_api import init_messenger_storage
 
 
 class FakeBot:
@@ -274,6 +275,7 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
     instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
     run(instance.init())
     run(bot_module.init_admin_storage())
+    run(init_messenger_storage(path))
     run(instance.upsert_user(bot_module.ADMIN_ID, bot_module.ADMIN_ID))
     run(instance.set_verified(bot_module.ADMIN_ID, True))
     number = run(instance.allocate_number(bot_module.ADMIN_ID))
