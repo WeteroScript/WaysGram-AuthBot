@@ -55,7 +55,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ### Переписка и каналы
 
 - `GET /api/conversations` — список диалогов с последним сообщением.
-- `GET /api/messages?with={telegram_id}&after_id={message_id}` — история личной переписки или новые сообщения после указанного ID.
+- `GET /api/messages?with={telegram_id}` — последние сообщения; `after_id` — новые после указанного ID; `before_id` — предыдущая страница истории. Одновременно указывается только один курсор.
 - `POST /api/messages` — JSON `{"recipient_id":123,"body":"Текст"}`; отправить личное сообщение. Поддерживает `Idempotency-Key` для безопасного повтора после сетевого сбоя.
 - `GET /api/channels`, `GET /api/channels/{id}` — список и карточка канала.
 - `POST /api/channels` — создать канал; JSON содержит `username` и `title`.
