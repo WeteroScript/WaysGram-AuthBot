@@ -236,7 +236,7 @@ class Store:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT n.telegram_id, u.chat_id, u.language
+                """SELECT n.telegram_id, u.chat_id, u.language, u.verified
                    FROM numbers n JOIN users u ON u.telegram_id=n.telegram_id
                    WHERE n.number=?""",
                 (number,),
@@ -570,6 +570,8 @@ async def resolve_number(
     owner = await store.resolve_number(payload.number)
     if not owner:
         raise HTTPException(status_code=404, detail="Number is not assigned")
+    if not owner.get("verified"):
+        raise HTTPException(status_code=403, detail="Bot verification is required")
     return {"assigned": True, "telegram_user_id": owner["telegram_id"]}
 
 
@@ -584,6 +586,8 @@ async def request_auth_code(
     owner = await store.resolve_number(payload.number)
     if not owner:
         raise HTTPException(status_code=404, detail="Number is not assigned")
+    if not owner.get("verified"):
+        raise HTTPException(status_code=403, detail="Bot verification is required")
     code = f"{secrets.randbelow(1_000_000):06d}"
     if not await store.save_code(payload.number, code, 300):
         raise HTTPException(status_code=429, detail="Code request is rate limited")
@@ -610,7 +614,7 @@ async def verify_auth_code(
     if not PHONE_RE.fullmatch(payload.number):
         raise HTTPException(status_code=422, detail="Invalid internal number format")
     owner = await store.resolve_number(payload.number)
-    if not owner:
+    if not owner or not owner.get("verified"):
         return {"valid": False}
     return {"valid": await store.verify_code(payload.number, payload.code)}
 
