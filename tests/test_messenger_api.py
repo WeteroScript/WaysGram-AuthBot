@@ -189,9 +189,37 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
             assert len(history.json()["messages"]) == 1
             assert history.json()["messages"][0]["body"] == "test message"
 
+            second = await client.post(
+                "/api/messages",
+                headers={**sender, "Idempotency-Key": "direct-message-order-0002"},
+                json={"recipient_id": 82002, "body": "second message"},
+            )
+            assert second.status_code == 201
+
+            after_cursor = await client.get(
+                f"/api/messages?with=82002&after_id={sent.json()['id']}",
+                headers=sender,
+            )
+            assert [m["body"] for m in after_cursor.json()["messages"]] == ["second message"]
+
+            before_cursor = await client.get(
+                f"/api/messages?with=82002&before_id={second.json()['id']}",
+                headers=sender,
+            )
+            assert [m["body"] for m in before_cursor.json()["messages"]] == ["test message"]
+
+            invalid_cursors = await client.get(
+                f"/api/messages?with=82002&after_id={sent.json()['id']}&before_id={second.json()['id']}",
+                headers=sender,
+            )
+            assert invalid_cursors.status_code == 400
+
             conversations = await client.get("/api/conversations", headers=sender)
             assert conversations.status_code == 200
-            assert conversations.json()["conversations"][0]["id"] == 82002
+            latest_conversation = conversations.json()["conversations"][0]
+            assert latest_conversation["id"] == 82002
+            assert latest_conversation["last_sender_id"] == 82001
+            assert latest_conversation["last_message"] == "second message"
 
             created = await client.post(
                 "/api/channels",
