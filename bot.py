@@ -525,6 +525,9 @@ async def get_number_handler(message: Message) -> None:
         return
     user = await store.get_user(message.from_user.id)
     lang = str(user.get("language") if user else "en")
+    if await account_is_banned(message.from_user.id):
+        await message.answer("Доступ к аккаунту WaysGram ограничен администратором.")
+        return
     if not user or not user.get("verified"):
         await ask_captcha(message, message.from_user.id, lang)
         return
@@ -546,6 +549,9 @@ async def get_code_handler(message: Message) -> None:
         return
     user = await store.get_user(message.from_user.id)
     lang = str(user.get("language") if user else "en")
+    if await account_is_banned(message.from_user.id):
+        await message.answer("Доступ к аккаунту WaysGram ограничен администратором.")
+        return
     if not user or not user.get("verified"):
         await ask_captcha(message, message.from_user.id, lang)
         return
@@ -640,6 +646,13 @@ async def init_admin_storage() -> None:
         );
         """)
         await db.commit()
+
+async def account_is_banned(telegram_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("SELECT is_banned FROM accounts WHERE telegram_id=?", (telegram_id,))
+        row = await cur.fetchone()
+        return bool(row and row[0])
+
 
 async def ensure_account(telegram_id: int, number: str) -> None:
     now = int(time.time())
@@ -980,6 +993,8 @@ async def resolve_number(
         raise HTTPException(status_code=404, detail="Number is not assigned")
     if not owner.get("verified"):
         raise HTTPException(status_code=403, detail="Bot verification is required")
+    if await account_is_banned(int(owner["telegram_id"])):
+        raise HTTPException(status_code=403, detail="WaysGram account is suspended")
     return {"assigned": True, "telegram_user_id": owner["telegram_id"]}
 
 
@@ -1022,7 +1037,7 @@ async def verify_auth_code(
     if not PHONE_RE.fullmatch(payload.number):
         raise HTTPException(status_code=422, detail="Invalid internal number format")
     owner = await store.resolve_number(payload.number)
-    if not owner or not owner.get("verified"):
+    if not owner or not owner.get("verified") or await account_is_banned(int(owner["telegram_id"])):
         return {"valid": False}
     return {"valid": await store.verify_code(payload.number, payload.code)}
 
