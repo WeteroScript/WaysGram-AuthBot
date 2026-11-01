@@ -38,7 +38,7 @@ All endpoints except /health require the X-Internal-Token header.
 
 - GET /health — health check.
 - POST /internal/v1/number/resolve — JSON {"number":"+1XXXXXXXXXX"}; confirms that the virtual number is assigned and returns the linked Telegram user ID.
-- POST /internal/v1/auth-code/request — JSON {"number":"+1XXXXXXXXXX"}; creates a six-digit code valid for five minutes and sends it to the linked bot user. Requests are rate-limited.
+- POST /internal/v1/auth-code/request — JSON {"number":"+1XXXXXXXXXX"}; creates a six-digit code valid for five minutes, encrypts it in SQLite, and notifies the linked bot user. The actual code is revealed only after the user taps “Get code”. Requests are rate-limited.
 - POST /internal/v1/auth-code/verify — JSON {"number":"+1XXXXXXXXXX","code":"123456"}; checks the code, limits attempts, and consumes the code after successful verification.
 
 The WaysGram backend must use the verify endpoint and enforce additional per-account and per-IP rate limits. This bot database stores the Telegram-to-virtual-number mapping and temporary authentication codes. The main WaysGram backend remains the source of truth for accounts, Stars, Gram balances, and gifts.
