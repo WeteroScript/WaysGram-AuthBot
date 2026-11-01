@@ -96,6 +96,22 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON api_idempotency_records(created_at);
             """
         )
+        # Older Telegram admin grants used WG- plus 8 hex digits. Expand them
+        # once so the Android client can validate every existing gift serial.
+        cur = await db.execute(
+            "SELECT id,serial_number FROM user_gifts WHERE serial_number LIKE 'WG-%' AND LENGTH(serial_number)=11"
+        )
+        legacy_gifts = await cur.fetchall()
+        for gift_id, old_serial in legacy_gifts:
+            new_serial = str(old_serial) + secrets.token_hex(2).upper()
+            await db.execute(
+                "UPDATE user_gifts SET serial_number=? WHERE id=?",
+                (new_serial, gift_id),
+            )
+            await db.execute(
+                "UPDATE gift_transactions SET serial_number=? WHERE serial_number=?",
+                (new_serial, old_serial),
+            )
         await db.commit()
 
 
