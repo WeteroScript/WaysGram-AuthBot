@@ -1284,7 +1284,8 @@ def verify_internal_token(value: str | None) -> None:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "service": "waysgram-authbot"}
+    # Keep the existing Android REST client's readiness contract.
+    return {"status": "online", "service": "waysgram-authbot"}
 
 
 @app.post("/internal/v1/number/resolve")
