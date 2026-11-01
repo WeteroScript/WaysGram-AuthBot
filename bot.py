@@ -451,36 +451,45 @@ async def admin_handler(message: Message) -> None:
         user = await store.get_user(message.from_user.id) if message.from_user else None
         await message.answer(tr(user.get("language") if user else "en", "admin_denied"))
         return
+    admin_user = await store.get_user(message.from_user.id)
+    lang = str(admin_user.get("language") if admin_user else "ru")
+    labels = (
+        ("Статистика", "Статус провайдера", "Последние пользователи")
+        if lang == "ru"
+        else ("Statistics", "Provider status", "Recent users")
+    )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Statistics", callback_data="adm:stats")],
-        [InlineKeyboardButton(text="Provider status", callback_data="adm:provider")],
-        [InlineKeyboardButton(text="Recent users", callback_data="adm:recent")],
+        [InlineKeyboardButton(text=labels[0], callback_data="adm:stats")],
+        [InlineKeyboardButton(text=labels[1], callback_data="adm:provider")],
+        [InlineKeyboardButton(text=labels[2], callback_data="adm:recent")],
     ])
-    await message.answer(tr("en", "admin_title"), reply_markup=keyboard)
-
+    await message.answer(tr(lang, "admin_title"), reply_markup=keyboard)
 
 @router.callback_query(F.data.startswith("adm:"))
 async def admin_callback(callback: CallbackQuery) -> None:
     if not callback.from_user or callback.from_user.id != ADMIN_ID or not callback.data:
         await callback.answer("Access denied", show_alert=True)
         return
+    admin_user = await store.get_user(callback.from_user.id)
+    lang = str(admin_user.get("language") if admin_user else "ru")
     action = callback.data.split(":", 1)[1]
     if action == "stats":
         users, numbers, codes = await store.stats()
-        response = tr("en", "admin_stats", users=users, numbers=numbers, codes=codes)
+        response = tr(lang, "admin_stats", users=users, numbers=numbers, codes=codes)
     elif action == "provider":
-        provider_status = "configured" if PHONE_PROVIDER_URL and PHONE_PROVIDER_TOKEN else "not configured"
-        api_status = "configured" if INTERNAL_API_TOKEN else "not configured"
-        response = tr("en", "admin_provider", status=provider_status, api=api_status)
+        provider_configured = bool(PHONE_PROVIDER_URL and PHONE_PROVIDER_TOKEN)
+        api_configured = bool(INTERNAL_API_TOKEN)
+        provider_status = ("настроен" if provider_configured else "не настроен") if lang == "ru" else ("configured" if provider_configured else "not configured")
+        api_status = ("настроен" if api_configured else "не настроен") if lang == "ru" else ("configured" if api_configured else "not configured")
+        response = tr(lang, "admin_provider", status=provider_status, api=api_status)
     elif action == "recent":
         items = await store.recent_users()
-        response = tr("en", "admin_recent", items="\n".join(map(str, items))) if items else tr("en", "admin_recent_empty")
+        response = tr(lang, "admin_recent", items="\n".join(map(str, items))) if items else tr(lang, "admin_recent_empty")
     else:
         response = "Unknown action"
     await callback.answer()
     if callback.message:
         await callback.message.answer(response)
-
 
 class NumberResolveRequest(BaseModel):
     number: str = Field(min_length=12, max_length=12)
