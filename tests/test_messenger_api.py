@@ -80,6 +80,7 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
     path, auth_store, fake_bot, app = api_env
     number = add_account(api_env, 81001, "alpha")
     add_account(api_env, 81002, "occupied")
+    assert run(bot_module.health())["status"] == "online"
 
     async def scenario() -> None:
         async with await client_for(app) as client:
