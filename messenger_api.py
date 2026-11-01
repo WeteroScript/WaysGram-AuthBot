@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 SESSION_TTL = 60 * 60 * 24 * 30
 DM_MESSAGES_PER_MINUTE = 30
 CHANNEL_POSTS_PER_MINUTE = 20
+LOGIN_REQUESTS_PER_IP_PER_HOUR = 100
 MAX_MESSAGE_LENGTH = 4000
 PHONE_RE = re.compile(r"^\+1[0-9]{10}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
@@ -233,8 +234,10 @@ def build_messenger_router(
         return {
             "brand": "WaysGram",
             "api_version": 1,
-            "auth": "AuthWaysGram_bot",
+            "auth": "authwaysgram_bot",
+            "authbot_delivery_ready": bool(bot_provider()),
             "sms_delivery_ready": False,
+            "test_otp_enabled": False,
             "currencies": ["stars", "grams"],
             "gift_model": "internal_collectible",
             "messaging_limits": {
@@ -244,7 +247,7 @@ def build_messenger_router(
             },
             "features": [
                 "profiles", "direct_messages", "incremental_messages",
-                "channels", "incremental_channel_posts", "idempotent_gift_purchase",
+                "channels", "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "gifts", "gift_inventory", "gift_transfer",
                 "stars", "grams",
             ],
@@ -271,6 +274,7 @@ def build_messenger_router(
         ip = request.client.host if request.client else "unknown"
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
+            await db.execute("DELETE FROM api_login_request_log WHERE created_at<?", (now - 7 * 86400,))
             cur = await db.execute(
                 "SELECT COUNT(*) FROM api_login_request_log WHERE phone=? AND created_at>?",
                 (phone, now - 3600),
@@ -281,7 +285,7 @@ def build_messenger_router(
                 (ip, now - 3600),
             )
             ip_count = int((await cur.fetchone())[0])
-            if phone_count >= 5 or ip_count >= 15:
+            if phone_count >= 5 or ip_count >= LOGIN_REQUESTS_PER_IP_PER_HOUR:
                 await db.rollback()
                 raise HTTPException(status_code=429, detail="Превышен часовой лимит запросов кода")
             await db.commit()
