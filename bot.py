@@ -791,6 +791,7 @@ async def admin_channel_card(channel_id: int) -> tuple[str, InlineKeyboardMarkup
         f"Администраторов: {row['admins']}"
     )
     return body, admin_keyboard([
+        [("👥 Администраторы", f"wgadm:channeladmins:{channel_id}")],
         [("Удалить канал", f"wgadm:channeldeleteask:{channel_id}")],
         [("⬅️ К списку каналов", "wgadm:channels")],
     ])
@@ -821,6 +822,8 @@ async def admin_callback(callback: CallbackQuery) -> None:
                 ("Заблокировано", "SELECT COUNT(*) FROM accounts WHERE is_banned=1", ()),
                 ("Выдано номеров", "SELECT COUNT(*) FROM numbers", ()),
                 ("Активных кодов", "SELECT COUNT(*) FROM auth_codes WHERE expires_at>?", (now,)),
+                ("Каналов", "SELECT COUNT(*) FROM channels", ()),
+                ("Личных сообщений", "SELECT COUNT(*) FROM messages", ()),
                 ("Подарков в каталоге", "SELECT COUNT(*) FROM gift_catalog", ()),
                 ("Подарков у пользователей", "SELECT COUNT(*) FROM user_gifts", ()),
             ]
@@ -906,6 +909,51 @@ async def admin_callback(callback: CallbackQuery) -> None:
             await callback.message.answer(card[0], reply_markup=card[1])
         else:
             await callback.message.answer("Канал не найден.")
+    elif action == "channeladmins" and len(parts) == 3:
+        channel_id = int(parts[2])
+        if not await admin_channel_card(channel_id):
+            await callback.message.answer("Канал не найден.")
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT ca.telegram_id,a.username,a.display_name
+                   FROM channel_admins ca
+                   LEFT JOIN accounts a ON a.telegram_id=ca.telegram_id
+                   WHERE ca.channel_id=? ORDER BY ca.telegram_id""",
+                (channel_id,),
+            )
+            rows = await cur.fetchall()
+        lines = [
+            f"TG {r['telegram_id']} · @{r['username'] or '—'} · {r['display_name'] or '—'}"
+            for r in rows
+        ]
+        keyboard_rows = [
+            [(f"Убрать TG {r['telegram_id']}", f"wgadm:channeladminremove:{channel_id}:{r['telegram_id']}")]
+            for r in rows
+        ]
+        keyboard_rows.append([("⬅️ К каналу", f"wgadm:channel:{channel_id}")])
+        await callback.message.answer(
+            f"Администраторы канала #{channel_id}\n\n" +
+            ("\n".join(lines) if lines else "Назначенных администраторов нет."),
+            reply_markup=admin_keyboard(keyboard_rows),
+        )
+    elif action == "channeladminremove" and len(parts) == 4:
+        channel_id, target_id = int(parts[2]), int(parts[3])
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute(
+                "DELETE FROM channel_admins WHERE channel_id=? AND telegram_id=?",
+                (channel_id, target_id),
+            )
+            await db.commit()
+        if cur.rowcount:
+            await admin_log("channel_admin_remove", str(channel_id), f"telegram_id={target_id}")
+            await callback.message.answer(f"TG {target_id} удалён из администраторов канала #{channel_id}.")
+        else:
+            await callback.message.answer("Назначение не найдено.")
+        card = await admin_channel_card(channel_id)
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
     elif action == "channeldeleteask" and len(parts) == 3:
         channel_id = int(parts[2])
         await callback.message.answer(
