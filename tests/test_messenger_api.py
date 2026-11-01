@@ -305,3 +305,39 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
             assert gift_history_count == 2
 
     run(scenario())
+
+
+def test_legacy_admin_gift_serials_are_migrated(api_env) -> None:
+    path, _auth_store, _fake_bot, _app = api_env
+    now = int(time.time())
+    with sqlite3.connect(path) as db:
+        cur = db.execute(
+            "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Legacy Gift',0,0,?)",
+            (now,),
+        )
+        gift_id = int(cur.lastrowid)
+        db.execute(
+            """INSERT INTO user_gifts(serial_number,gift_id,gift_name,owner_telegram_id,acquired_at)
+               VALUES('WG-ABCDEF12',?,?,84001,?)""",
+            (gift_id, "Legacy Gift", now),
+        )
+        db.execute(
+            """INSERT INTO gift_transactions(event_type,serial_number,gift_name,
+                      from_telegram_id,to_telegram_id,created_at)
+               VALUES('admin_grant','WG-ABCDEF12','Legacy Gift',NULL,84001,?)""",
+            (now,),
+        )
+
+    run(init_messenger_storage(path))
+    with sqlite3.connect(path) as db:
+        serial = db.execute(
+            "SELECT serial_number FROM user_gifts WHERE gift_id=?",
+            (gift_id,),
+        ).fetchone()[0]
+        history_serial = db.execute(
+            "SELECT serial_number FROM gift_transactions WHERE gift_name='Legacy Gift'"
+        ).fetchone()[0]
+    assert len(serial) == 15
+    assert serial.startswith("WG-")
+    assert all(char in "0123456789ABCDEF" for char in serial[3:])
+    assert history_serial == serial
