@@ -946,40 +946,51 @@ def build_messenger_router(
     async def list_messages(
         peer: int = Query(alias="with", gt=0),
         after_id: int = Query(default=0, ge=0),
+        before_id: int = Query(default=0, ge=0),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
+        if after_id and before_id:
+            raise HTTPException(status_code=400, detail="Используйте только один курсор: after_id или before_id")
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (peer,))
             if not await cur.fetchone():
                 raise HTTPException(status_code=404, detail="Собеседник не найден")
+            base = """
+                SELECT id,sender_telegram_id AS sender_id,
+                       recipient_telegram_id AS recipient_id,body,created_at
+                FROM messages WHERE
+                (sender_telegram_id=? AND recipient_telegram_id=?) OR
+                (sender_telegram_id=? AND recipient_telegram_id=?)
+            """
+            params: tuple[Any, ...] = (uid, peer, peer, uid)
             if after_id:
                 cur = await db.execute(
-                    """SELECT id,sender_telegram_id AS sender_id,
-                              recipient_telegram_id AS recipient_id,body,created_at
-                       FROM messages WHERE
-                       ((sender_telegram_id=? AND recipient_telegram_id=?) OR
-                        (sender_telegram_id=? AND recipient_telegram_id=?))
-                       AND id>? ORDER BY id ASC LIMIT 100""",
-                    (uid, peer, peer, uid, after_id),
+                    base + " AND id>? ORDER BY id ASC LIMIT 100",
+                    params + (after_id,),
+                )
+            elif before_id:
+                cur = await db.execute(
+                    base + " AND id<? ORDER BY id DESC LIMIT 100",
+                    params + (before_id,),
                 )
             else:
                 cur = await db.execute(
-                    """SELECT id,sender_telegram_id AS sender_id,
-                              recipient_telegram_id AS recipient_id,body,created_at
-                       FROM messages WHERE
-                       (sender_telegram_id=? AND recipient_telegram_id=?) OR
-                       (sender_telegram_id=? AND recipient_telegram_id=?)
-                       ORDER BY id DESC LIMIT 100""",
-                    (uid, peer, peer, uid),
+                    base + " ORDER BY id DESC LIMIT 100",
+                    params,
                 )
             rows = await cur.fetchall()
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
-        return {"messages": items}
+        return {
+            "messages": items,
+            "count": len(items),
+            "next_before_id": items[0]["id"] if items else 0,
+            "next_after_id": items[-1]["id"] if items else 0,
+        }
 
     @router.post("/api/messages", status_code=201)
     async def send_message(
@@ -1057,7 +1068,8 @@ def build_messenger_router(
                 )
                 SELECT peer.telegram_id AS id,peer.username,peer.display_name,
                        message.body AS last_message,message.created_at,
-                       message.id AS last_message_id
+                       message.id AS last_message_id,
+                       message.sender_telegram_id AS last_sender_id
                 FROM recent
                 JOIN accounts AS peer ON peer.telegram_id=recent.peer_id
                 JOIN messages AS message ON message.id=recent.last_message_id
