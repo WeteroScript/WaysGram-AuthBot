@@ -106,6 +106,21 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
             assert profile.status_code == 200
             assert profile.json()["username"] == "alpha"
 
+            rename = await client.patch(
+                "/api/me",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"display_name": "Alpha Updated"},
+            )
+            assert rename.status_code == 200
+            assert rename.json()["display_name"] == "Alpha Updated"
+
+            duplicate = await client.patch(
+                "/api/me",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"username": "occupied"},
+            )
+            assert duplicate.status_code == 409
+
             refreshed = await client.post(
                 "/api/auth/refresh",
                 headers={"Authorization": f"Bearer {token}"},
@@ -132,6 +147,7 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 82001, "sender")
     add_account(api_env, 82002, "recipient")
+    add_account(api_env, 82003, "occupied")
     add_session(path, 82001, "sender-session")
     add_session(path, 82002, "recipient-session")
 
@@ -152,6 +168,7 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
                 json={"recipient_id": 82002, "body": "test message"},
             )
             assert sent.status_code == 201
+            assert sent.json()["status"] == "sent"
             assert sent.json()["sender_id"] == 82001
             assert replay.json()["id"] == sent.json()["id"]
 
@@ -194,6 +211,7 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
                 json={"body": "first post"},
             )
             assert post.status_code == 201
+            assert post.json()["status"] == "published"
             assert post_replay.json()["id"] == post.json()["id"]
 
             forbidden = await client.post(
@@ -267,11 +285,15 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
             assert transferred.status_code == 200
             assert transfer_replay.json() == transferred.json()
             assert transferred.json()["to_user_id"] == 83002
+            assert transferred.json()["to_username"] == "receiver"
 
             buyer_inventory = await client.get("/api/me/gifts", headers=buyer)
             receiver_inventory = await client.get("/api/me/gifts", headers=receiver)
             assert buyer_inventory.json()["gifts"] == []
             assert receiver_inventory.json()["gifts"][0]["serial_number"] == serial
+            history = await client.get("/api/me/gifts/transactions", headers=buyer)
+            assert history.status_code == 200
+            assert history.json()["transactions"][0]["to_username"] == "receiver"
 
             with sqlite3.connect(path) as db:
                 supply = db.execute("SELECT supply FROM gift_catalog WHERE id=1").fetchone()[0]
