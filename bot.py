@@ -38,7 +38,7 @@ INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT") or os.getenv("PORT") or "
 
 PHONE_RE = re.compile(r"^\+1\d{10}$")
 OTP_RE = re.compile(r"^\d{6}$")
-EMOJI = ["🐱", "🐶", "🦊", "🐼", "🐸", "🐵", "🐧", "🐰"]
+EMOJI = ["🐱", "🐶", "🦊", "🐼", "🐸", "🐵", "🐧", "🐰", "🦁", "🐨", "🐯", "🐹"]
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -57,7 +57,7 @@ TEXT: dict[str, dict[str, str]] = {
         "settings": "Настройки",
         "number_exists": "Ваш номер WaysGram: {number}",
         "provider_missing": "Не удалось создать виртуальный номер. Повторите попытку позже.",
-        "number_error": "Не удалось получить номер от провайдера. Попробуйте позже или обратитесь к администратору.",
+        "number_error": "Не удалось создать виртуальный номер. Попробуйте ещё раз позже.",
         "number_ready": "Ваш номер WaysGram: {number}",
         "need_number": "Сначала получите номер WaysGram.",
         "code_missing": "Для этого номера пока нет активного кода WaysGram.",
@@ -83,7 +83,7 @@ TEXT: dict[str, dict[str, str]] = {
         "settings": "Settings",
         "number_exists": "Your WaysGram number: {number}",
         "provider_missing": "Could not create a virtual number. Please try again later.",
-        "number_error": "The provider could not allocate a number. Try again later or contact the administrator.",
+        "number_error": "Could not create your virtual number. Please try again later.",
         "number_ready": "Your WaysGram number: {number}",
         "need_number": "Get a WaysGram number first.",
         "code_missing": "There is no active WaysGram code for this number yet.",
@@ -434,18 +434,24 @@ def language_keyboard(include_back: bool = False) -> InlineKeyboardMarkup:
 
 
 async def ask_captcha(message: Message, telegram_id: int, lang: str) -> None:
+    now = time.time()
+    for old_id, challenge in list(CHALLENGES.items()):
+        if challenge[3] <= now:
+            CHALLENGES.pop(old_id, None)
+
     target = random.choice(EMOJI)
-    choices = random.sample(EMOJI, 5)
+    choices = random.sample(EMOJI, 9)
     if target not in choices:
         choices[random.randrange(len(choices))] = target
     random.shuffle(choices)
-    challenge_id = secrets.token_urlsafe(6).replace("-", "a").replace("_", "b")[:10]
-    CHALLENGES[challenge_id] = (telegram_id, target, choices, time.time() + 180)
+    challenge_id = secrets.token_urlsafe(8).replace("-", "a").replace("_", "b")[:12]
+    CHALLENGES[challenge_id] = (telegram_id, target, choices, now + 180)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=e, callback_data=f"cap:{challenge_id}:{i}")
-         for i, e in enumerate(choices[:3])],
-        [InlineKeyboardButton(text=e, callback_data=f"cap:{challenge_id}:{i}")
-         for i, e in enumerate(choices[3:])],
+        [
+            InlineKeyboardButton(text=choices[i], callback_data=f"cap:{challenge_id}:{i}")
+            for i in range(start, start + 3)
+        ]
+        for start in (0, 3, 6)
     ])
     await message.answer(tr(lang, "captcha_prompt", emoji=target), reply_markup=keyboard)
 
@@ -488,10 +494,14 @@ async def captcha_handler(callback: CallbackQuery) -> None:
     if len(parts) != 3:
         await callback.answer()
         return
-    challenge = CHALLENGES.pop(parts[1], None)
+    challenge = CHALLENGES.get(parts[1])
     user = await store.get_user(callback.from_user.id)
     lang = str(user.get("language") if user else "en")
-    if not challenge or challenge[0] != callback.from_user.id or challenge[3] < time.time():
+    if challenge and challenge[0] != callback.from_user.id:
+        await callback.answer("This check belongs to another user.", show_alert=True)
+        return
+    CHALLENGES.pop(parts[1], None)
+    if not challenge or challenge[3] < time.time():
         await callback.answer("Expired", show_alert=True)
         await ask_captcha(callback.message, callback.from_user.id, lang)
         return
