@@ -222,13 +222,64 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
             )
             assert forbidden.status_code == 403
 
+            appointed = await client.post(
+                f"/api/channels/{channel_id}/admins",
+                headers=sender,
+                json={"telegram_id": 82002},
+            )
+            assert appointed.status_code == 201
+
+            admin_post = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=recipient,
+                json={"body": "admin post"},
+            )
+            assert admin_post.status_code == 201
+
+            denied_owner_action = await client.post(
+                f"/api/channels/{channel_id}/admins",
+                headers=recipient,
+                json={"telegram_id": 82003},
+            )
+            assert denied_owner_action.status_code == 403
+
+            removed = await client.delete(
+                f"/api/channels/{channel_id}/admins/82002",
+                headers=sender,
+            )
+            assert removed.status_code == 200
+
+            forbidden_again = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=recipient,
+                json={"body": "after removal"},
+            )
+            assert forbidden_again.status_code == 403
+
             channel_history = await client.get(
                 f"/api/channels/{channel_id}/messages",
                 headers=recipient,
             )
             assert channel_history.status_code == 200
-            assert len(channel_history.json()["messages"]) == 1
+            assert len(channel_history.json()["messages"]) == 2
             assert channel_history.json()["messages"][0]["body"] == "first post"
+            assert channel_history.json()["messages"][1]["body"] == "admin post"
+
+            denied_delete = await client.delete(
+                f"/api/channels/{channel_id}",
+                headers=recipient,
+            )
+            assert denied_delete.status_code == 404
+            owner_delete = await client.delete(
+                f"/api/channels/{channel_id}",
+                headers=sender,
+            )
+            assert owner_delete.status_code == 200
+            remaining = await client.get(
+                f"/api/channels/{channel_id}/messages",
+                headers=sender,
+            )
+            assert remaining.status_code == 404
 
     run(scenario())
 
