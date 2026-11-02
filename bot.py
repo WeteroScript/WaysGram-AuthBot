@@ -656,6 +656,32 @@ async def init_admin_storage() -> None:
             details TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS gift_auctions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gift_id INTEGER NOT NULL,
+            gift_name TEXT NOT NULL,
+            starting_bid INTEGER NOT NULL CHECK(starting_bid > 0),
+            current_bid INTEGER NOT NULL DEFAULT 0 CHECK(current_bid >= 0),
+            current_bidder_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active','ended','cancelled')),
+            starts_at INTEGER NOT NULL,
+            ends_at INTEGER NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            settled_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_gift_auctions_status_end
+            ON gift_auctions(status, ends_at);
+        CREATE TABLE IF NOT EXISTS auction_bids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            auction_id INTEGER NOT NULL,
+            bidder_telegram_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_auction_bids_auction
+            ON auction_bids(auction_id, id DESC);
         """)
         # Backfill account records for users who received virtual numbers before this panel update.
         await db.execute("""INSERT OR IGNORE INTO accounts
@@ -734,6 +760,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [("📊 Статистика", "wgadm:stats")],
         [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Подарки", "wgadm:gifts")],
         [("📦 Инвентарь", "wgadm:inventory"), ("🧾 Операции", "wgadm:transactions")],
+        [("🎟 Аукционы подарков", "wgadm:auctions")],
         [("🎟 История подарков", "wgadm:gifthistory")],
         [("📡 Каналы", "wgadm:channels")],
         [("🔐 Журнал действий", "wgadm:logs")],
@@ -892,6 +919,124 @@ async def admin_callback(callback: CallbackQuery) -> None:
         keyboard_rows.extend([[( "➕ Добавить подарок", "wgadm:giftadd")],
                               [( "⬅️ В меню", "wgadm:home")]])
         await callback.message.answer(body, reply_markup=admin_keyboard(keyboard_rows))
+    elif action == "auctions":
+        now = int(time.time())
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,gift_name,starting_bid,current_bid,current_bidder_id,
+                          status,ends_at FROM gift_auctions
+                   ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC
+                   LIMIT 30"""
+            )
+            rows = await cur.fetchall()
+        keyboard_rows = []
+        for row in rows:
+            label = (f"#{row['id']} · {row['gift_name']} · старт {row['starting_bid']} Stars · "
+                     f"ставка {row['current_bid']} · {row['status']}")
+            keyboard_rows.append([(label[:64], f"wgadm:auctioncancel:{row['id']}")])
+        if not rows:
+            body = "Системных аукционов пока нет."
+        else:
+            body = "Системные аукционы. Нажатие на активный аукцион отменяет его и возвращает ставку лидеру."
+        keyboard_rows.extend([
+            [("➕ Создать системный аукцион", "wgadm:auctioncreate")],
+            [("⬅️ В меню", "wgadm:home")],
+        ])
+        await callback.message.answer(
+            body,
+            reply_markup=admin_keyboard(keyboard_rows),
+        )
+    elif action == "auctioncreate":
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id,name,supply FROM gift_catalog WHERE supply>0 ORDER BY id ASC LIMIT 30"
+            )
+            rows = await cur.fetchall()
+        if not rows:
+            await callback.message.answer("Нет подарков с доступным остатком для аукциона.")
+            return
+        keyboard_rows = [
+            [(f"{row['name']} · остаток {row['supply']}"[:64], f"wgadm:auctiongift:{row['id']}")]
+            for row in rows
+        ]
+        keyboard_rows.append([("⬅️ К аукционам", "wgadm:auctions")])
+        await callback.message.answer(
+            "Выберите подарок. Для аукциона будет зарезервирован один системный экземпляр:",
+            reply_markup=admin_keyboard(keyboard_rows),
+        )
+    elif action == "auctiongift" and len(parts) == 3:
+        try:
+            gift_id = int(parts[2])
+        except ValueError:
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute(
+                "SELECT name,supply FROM gift_catalog WHERE id=?",
+                (gift_id,),
+            )
+            gift = await cur.fetchone()
+        if not gift or int(gift[1]) < 1:
+            await callback.message.answer("Подарок недоступен или закончился.")
+            return
+        ADMIN_INPUT[ADMIN_ID] = ("auction_start_bid", {"gift_id": gift_id, "gift_name": str(gift[0])})
+        await callback.message.answer("Введите стартовую ставку в Stars (целое число больше нуля).")
+    elif action == "auctioncancel" and len(parts) == 3:
+        try:
+            auction_id = int(parts[2])
+        except ValueError:
+            return
+        now = int(time.time())
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT * FROM gift_auctions WHERE id=? AND status='active'",
+                (auction_id,),
+            )
+            auction = await cur.fetchone()
+            if not auction:
+                await db.rollback()
+                await callback.message.answer("Активный аукцион не найден.")
+                return
+            bidder_id = auction["current_bidder_id"]
+            amount = int(auction["current_bid"])
+            if bidder_id is not None and amount > 0:
+                cur = await db.execute(
+                    "SELECT stars FROM accounts WHERE telegram_id=?",
+                    (int(bidder_id),),
+                )
+                account = await cur.fetchone()
+                if account:
+                    balance = int(account[0]) + amount
+                    await db.execute(
+                        "UPDATE accounts SET stars=?,updated_at=? WHERE telegram_id=?",
+                        (balance, now, int(bidder_id)),
+                    )
+                    await db.execute(
+                        """INSERT INTO economy_transactions
+                           (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                           VALUES(?,'stars',?,?,?, ?,?)""",
+                        (int(bidder_id), amount, balance, f"auction_cancel_refund:{auction_id}", ADMIN_ID, now),
+                    )
+            await db.execute(
+                "UPDATE gift_catalog SET supply=supply+1 WHERE id=?",
+                (int(auction["gift_id"]),),
+            )
+            await db.execute(
+                "UPDATE gift_auctions SET status='cancelled',settled_at=? WHERE id=?",
+                (now, auction_id),
+            )
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, "auction_cancel", str(auction_id), f"refund={amount}", now),
+            )
+            await db.commit()
+        await callback.message.answer(
+            f"Аукцион #{auction_id} отменён. Ставка лидеру возвращена, подарок вернулся в каталог.",
+            reply_markup=admin_keyboard([[("К аукционам", "wgadm:auctions")]]),
+        )
     elif action == "gift" and len(parts) == 3:
         try:
             gift_id = int(parts[2])
@@ -1259,6 +1404,83 @@ async def admin_text_input(message: Message) -> None:
                         str(gift_id), f"{column}={number}")
         card = await admin_gift_card(gift_id)
         await message.answer(card[0], reply_markup=card[1]) if card else await message.answer("Подарок обновлён.")
+    elif kind == "auction_start_bid":
+        try:
+            amount = int(value)
+        except ValueError:
+            await message.answer("Введите целое число Stars больше нуля.")
+            return
+        if not 1 <= amount <= 1_000_000_000:
+            await message.answer("Стартовая ставка должна быть от 1 до 1000000000 Stars.")
+            return
+        payload["starting_bid"] = amount
+        ADMIN_INPUT[ADMIN_ID] = ("auction_duration", payload)
+        await message.answer("Введите длительность аукциона в минутах (1–10080).")
+    elif kind == "auction_duration":
+        try:
+            minutes = int(value)
+        except ValueError:
+            await message.answer("Введите целое количество минут.")
+            return
+        if not 1 <= minutes <= 10080:
+            await message.answer("Длительность должна быть от 1 до 10080 минут.")
+            return
+        now = int(time.time())
+        gift_id = int(payload["gift_id"])
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT name,supply FROM gift_catalog WHERE id=?",
+                (gift_id,),
+            )
+            gift = await cur.fetchone()
+            if not gift or int(gift[1]) < 1:
+                await db.rollback()
+                ADMIN_INPUT.pop(ADMIN_ID, None)
+                await message.answer("Подарок закончился. Выберите другой подарок.")
+                return
+            cur = await db.execute(
+                "UPDATE gift_catalog SET supply=supply-1 WHERE id=? AND supply>0",
+                (gift_id,),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                ADMIN_INPUT.pop(ADMIN_ID, None)
+                await message.answer("Не удалось зарезервировать подарок.")
+                return
+            cur = await db.execute(
+                """INSERT INTO gift_auctions
+                   (gift_id,gift_name,starting_bid,current_bid,status,starts_at,ends_at,
+                    created_by,created_at)
+                   VALUES(?,?,?,0,'active',?,?,?,?)""",
+                (
+                    gift_id,
+                    str(gift[0]),
+                    int(payload["starting_bid"]),
+                    now,
+                    now + minutes * 60,
+                    ADMIN_ID,
+                    now,
+                ),
+            )
+            auction_id = int(cur.lastrowid)
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (
+                    ADMIN_ID,
+                    "auction_create",
+                    str(auction_id),
+                    f"{gift[0]}; starting_bid={payload['starting_bid']}; duration_minutes={minutes}",
+                    now,
+                ),
+            )
+            await db.commit()
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        await message.answer(
+            f"Создан системный аукцион #{auction_id}: {gift[0]}. "
+            f"Старт: {payload['starting_bid']} Stars. Длительность: {minutes} мин.",
+            reply_markup=admin_keyboard([[("Открыть аукционы", "wgadm:auctions")]]),
+        )
     elif kind == "gift_name":
         if not value or len(value) > 80:
             await message.answer("Название должно содержать 1–80 символов.")
