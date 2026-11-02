@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import mimetypes
 import hmac
 import json
 import re
 import secrets
 import time
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Callable
 
 import aiosqlite
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+import httpx
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 
@@ -94,6 +98,43 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_api_idempotency_created
                 ON api_idempotency_records(created_at);
+            CREATE TABLE IF NOT EXISTS telegram_gift_catalog (
+                gift_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                sticker_file_id TEXT NOT NULL,
+                sticker_file_unique_id TEXT NOT NULL DEFAULT '',
+                sticker_type TEXT NOT NULL DEFAULT 'regular',
+                sticker_emoji TEXT NOT NULL DEFAULT '',
+                sticker_set_name TEXT NOT NULL DEFAULT '',
+                sticker_width INTEGER,
+                sticker_height INTEGER,
+                sticker_is_animated INTEGER NOT NULL DEFAULT 0,
+                sticker_is_video INTEGER NOT NULL DEFAULT 0,
+                sticker_mime_type TEXT NOT NULL DEFAULT '',
+                star_count INTEGER NOT NULL DEFAULT 0 CHECK(star_count >= 0),
+                upgrade_star_count INTEGER,
+                is_premium INTEGER NOT NULL DEFAULT 0,
+                has_colors INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER,
+                remaining_count INTEGER,
+                personal_total_count INTEGER,
+                personal_remaining_count INTEGER,
+                unique_gift_variant_count INTEGER,
+                background_json TEXT,
+                publisher_chat_json TEXT,
+                source_payload TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                is_available INTEGER NOT NULL DEFAULT 1,
+                synced_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_telegram_gifts_available
+                ON telegram_gift_catalog(is_available,position);
+            CREATE TABLE IF NOT EXISTS telegram_gift_sync_state (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                last_synced_at INTEGER NOT NULL,
+                gift_count INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'telegram_bot_api'
+            );
             CREATE TABLE IF NOT EXISTS chat_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT COLLATE NOCASE UNIQUE,
@@ -201,6 +242,186 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
     return result
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+async def fetch_telegram_gifts(bot: Any) -> list[dict[str, Any]]:
+    """Fetch the current catalog that the configured AuthBot may send."""
+    token = str(getattr(bot, "token", "") or "").strip()
+    if not token:
+        raise RuntimeError("Telegram bot token is unavailable")
+    url = f"https://api.telegram.org/bot{token}/getAvailableGifts"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0)) as client:
+        response = await client.post(url)
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError("Telegram getAvailableGifts returned an unsuccessful response")
+    result = payload.get("result")
+    gifts = result.get("gifts") if isinstance(result, dict) else None
+    if not isinstance(gifts, list):
+        raise RuntimeError("Telegram getAvailableGifts returned an invalid catalog")
+    return [gift for gift in gifts if isinstance(gift, dict)]
+
+
+async def store_telegram_gifts(
+    database_path: Path,
+    gifts: list[dict[str, Any]],
+    synced_at: int | None = None,
+) -> dict[str, Any]:
+    """Persist a Telegram Bot API gift snapshot without changing WaysGram gifts."""
+    now = int(synced_at or time.time())
+    normalized: list[tuple[Any, ...]] = []
+    for position, gift in enumerate(gifts):
+        gift_id = str(gift.get("id") or "").strip()
+        sticker = gift.get("sticker")
+        if not gift_id or not isinstance(sticker, dict):
+            continue
+        sticker_file_id = str(sticker.get("file_id") or "").strip()
+        if not sticker_file_id:
+            continue
+        emoji = str(sticker.get("emoji") or "")
+        title = str(gift.get("title") or emoji or f"Telegram gift {gift_id}")
+        normalized.append((
+            gift_id,
+            title[:160],
+            sticker_file_id,
+            str(sticker.get("file_unique_id") or ""),
+            str(sticker.get("type") or "regular"),
+            emoji[:32],
+            str(sticker.get("set_name") or ""),
+            _optional_int(sticker.get("width")),
+            _optional_int(sticker.get("height")),
+            int(bool(sticker.get("is_animated"))),
+            int(bool(sticker.get("is_video"))),
+            str(sticker.get("mime_type") or ""),
+            max(0, _optional_int(gift.get("star_count")) or 0),
+            _optional_int(gift.get("upgrade_star_count")),
+            int(bool(gift.get("is_premium"))),
+            int(bool(gift.get("has_colors"))),
+            _optional_int(gift.get("total_count")),
+            _optional_int(gift.get("remaining_count")),
+            _optional_int(gift.get("personal_total_count")),
+            _optional_int(gift.get("personal_remaining_count")),
+            _optional_int(gift.get("unique_gift_variant_count")),
+            _json_text(gift.get("background")),
+            _json_text(gift.get("publisher_chat")),
+            json.dumps(gift, ensure_ascii=False, separators=(",", ":")),
+            position,
+            now,
+        ))
+    if gifts and not normalized:
+        raise ValueError("Telegram returned gifts without usable identifiers or sticker files")
+
+    async with aiosqlite.connect(database_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        for row in normalized:
+            await db.execute(
+                """INSERT INTO telegram_gift_catalog (
+                       gift_id,title,sticker_file_id,sticker_file_unique_id,sticker_type,
+                       sticker_emoji,sticker_set_name,sticker_width,sticker_height,
+                       sticker_is_animated,sticker_is_video,sticker_mime_type,star_count,
+                       upgrade_star_count,is_premium,has_colors,total_count,remaining_count,
+                       personal_total_count,personal_remaining_count,unique_gift_variant_count,
+                       background_json,publisher_chat_json,source_payload,position,synced_at,
+                       is_available
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                   ON CONFLICT(gift_id) DO UPDATE SET
+                       title=excluded.title,
+                       sticker_file_id=excluded.sticker_file_id,
+                       sticker_file_unique_id=excluded.sticker_file_unique_id,
+                       sticker_type=excluded.sticker_type,
+                       sticker_emoji=excluded.sticker_emoji,
+                       sticker_set_name=excluded.sticker_set_name,
+                       sticker_width=excluded.sticker_width,
+                       sticker_height=excluded.sticker_height,
+                       sticker_is_animated=excluded.sticker_is_animated,
+                       sticker_is_video=excluded.sticker_is_video,
+                       sticker_mime_type=excluded.sticker_mime_type,
+                       star_count=excluded.star_count,
+                       upgrade_star_count=excluded.upgrade_star_count,
+                       is_premium=excluded.is_premium,
+                       has_colors=excluded.has_colors,
+                       total_count=excluded.total_count,
+                       remaining_count=excluded.remaining_count,
+                       personal_total_count=excluded.personal_total_count,
+                       personal_remaining_count=excluded.personal_remaining_count,
+                       unique_gift_variant_count=excluded.unique_gift_variant_count,
+                       background_json=excluded.background_json,
+                       publisher_chat_json=excluded.publisher_chat_json,
+                       source_payload=excluded.source_payload,
+                       position=excluded.position,
+                       synced_at=excluded.synced_at,
+                       is_available=1""",
+                row,
+            )
+        active_ids = [row[0] for row in normalized]
+        if active_ids:
+            placeholders = ",".join("?" for _ in active_ids)
+            await db.execute(
+                f"UPDATE telegram_gift_catalog SET is_available=0 WHERE gift_id NOT IN ({placeholders})",
+                active_ids,
+            )
+        else:
+            await db.execute("UPDATE telegram_gift_catalog SET is_available=0")
+        await db.execute(
+            """INSERT INTO telegram_gift_sync_state(id,last_synced_at,gift_count,source)
+               VALUES(1,?,?,'telegram_bot_api')
+               ON CONFLICT(id) DO UPDATE SET
+                   last_synced_at=excluded.last_synced_at,
+                   gift_count=excluded.gift_count,
+                   source=excluded.source""",
+            (now, len(normalized)),
+        )
+        await db.commit()
+    return {
+        "source": "telegram_bot_api",
+        "synced_at": now,
+        "gift_count": len(normalized),
+    }
+
+
+async def fetch_telegram_sticker(bot: Any, file_id: str, preferred_mime: str = "") -> tuple[bytes, str]:
+    """Download a sticker without ever exposing the AuthBot token to the client."""
+    token = str(getattr(bot, "token", "") or "").strip()
+    if not token:
+        raise RuntimeError("Telegram bot token is unavailable")
+    base = f"https://api.telegram.org/bot{token}"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        meta_response = await client.post(f"{base}/getFile", json={"file_id": file_id})
+        meta_response.raise_for_status()
+        meta_payload = meta_response.json()
+        if not isinstance(meta_payload, dict) or not meta_payload.get("ok"):
+            raise RuntimeError("Telegram getFile returned an unsuccessful response")
+        result = meta_payload.get("result")
+        file_path = str(result.get("file_path") or "") if isinstance(result, dict) else ""
+        file_size = _optional_int(result.get("file_size")) if isinstance(result, dict) else None
+        if not file_path:
+            raise RuntimeError("Telegram getFile returned no file path")
+        if file_size is not None and file_size > 20 * 1024 * 1024:
+            raise ValueError("Telegram sticker file exceeds the supported size")
+        file_url = f"https://api.telegram.org/file/bot{token}/{quote(file_path, safe='/')}"
+        file_response = await client.get(file_url)
+        file_response.raise_for_status()
+        content = file_response.content
+        if len(content) > 20 * 1024 * 1024:
+            raise ValueError("Telegram sticker file exceeds the supported size")
+    media_type = preferred_mime or mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    return content, media_type
+
+
 def _message_body(value: str) -> str:
     body = str(value).strip()
     if not body or len(body) > MAX_MESSAGE_LENGTH:
@@ -216,6 +437,44 @@ def build_messenger_router(
 ) -> APIRouter:
     router = APIRouter()
     db_path = database_path if callable(database_path) else lambda: database_path
+    telegram_gift_sync_lock = asyncio.Lock()
+
+    async def ensure_telegram_gifts_fresh() -> dict[str, Any]:
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT last_synced_at,gift_count,source FROM telegram_gift_sync_state WHERE id=1"
+            )
+            state = await cur.fetchone()
+        if state and now - int(state["last_synced_at"]) < 60:
+            return dict(state)
+
+        async with telegram_gift_sync_lock:
+            now = int(time.time())
+            async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT last_synced_at,gift_count,source FROM telegram_gift_sync_state WHERE id=1"
+                )
+                state = await cur.fetchone()
+            if state and now - int(state["last_synced_at"]) < 60:
+                return dict(state)
+            bot = bot_provider()
+            if bot is None:
+                if state:
+                    return dict(state)
+                raise HTTPException(status_code=503, detail="Telegram gift catalog is not available yet")
+            try:
+                gifts = await fetch_telegram_gifts(bot)
+                return await store_telegram_gifts(db_path(), gifts, now)
+            except Exception as exc:
+                if state:
+                    return dict(state)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Не удалось загрузить каталог подарков Telegram. Проверьте BOT_TOKEN и повторите запрос.",
+                ) from exc
 
     async def current_user(authorization: str | None) -> dict[str, Any]:
         if not authorization or not authorization.startswith("Bearer "):
@@ -366,7 +625,8 @@ def build_messenger_router(
                 "profiles", "direct_messages", "incremental_messages",
                 "channels", "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "gifts", "gift_inventory", "gift_transfer",
-                "gift_auctions", "auction_bids", "groups", "group_members", "group_messages",
+                "gift_auctions", "auction_bids", "telegram_gift_catalog",
+                "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages",
                 "botfather", "bot_commands", "bot_runtime", "stars", "grams",
             ],
         }
@@ -843,6 +1103,101 @@ def build_messenger_router(
             "stars_balance": new_balance,
             "ends_at": int(auction["ends_at"]),
         }
+
+    @router.get("/api/telegram/gifts")
+    async def telegram_gift_catalog(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        await current_user(authorization)
+        state = await ensure_telegram_gifts_fresh()
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT gift_id,title,sticker_type,sticker_emoji,sticker_set_name,
+                          sticker_width,sticker_height,sticker_is_animated,sticker_is_video,
+                          sticker_mime_type,star_count,upgrade_star_count,is_premium,has_colors,
+                          total_count,remaining_count,personal_total_count,personal_remaining_count,
+                          unique_gift_variant_count,background_json,publisher_chat_json,
+                          position,synced_at
+                   FROM telegram_gift_catalog
+                   WHERE is_available=1
+                   ORDER BY position ASC"""
+            )
+            rows = await cur.fetchall()
+        gifts = []
+        for row in rows:
+            gifts.append({
+                "id": str(row["gift_id"]),
+                "source": "telegram",
+                "title": str(row["title"]),
+                "emoji": str(row["sticker_emoji"] or ""),
+                "star_count": int(row["star_count"]),
+                "currency": "telegram_stars",
+                "upgrade_star_count": row["upgrade_star_count"],
+                "is_premium": bool(row["is_premium"]),
+                "has_colors": bool(row["has_colors"]),
+                "is_limited": row["total_count"] is not None,
+                "total_count": row["total_count"],
+                "remaining_count": row["remaining_count"],
+                "personal_total_count": row["personal_total_count"],
+                "personal_remaining_count": row["personal_remaining_count"],
+                "unique_gift_variant_count": row["unique_gift_variant_count"],
+                "background": json.loads(row["background_json"]) if row["background_json"] else None,
+                "publisher_chat": json.loads(row["publisher_chat_json"]) if row["publisher_chat_json"] else None,
+                "sticker": {
+                    "type": str(row["sticker_type"]),
+                    "set_name": str(row["sticker_set_name"] or ""),
+                    "width": row["sticker_width"],
+                    "height": row["sticker_height"],
+                    "is_animated": bool(row["sticker_is_animated"]),
+                    "is_video": bool(row["sticker_is_video"]),
+                    "mime_type": str(row["sticker_mime_type"] or ""),
+                    "url": f"/api/telegram/gifts/{quote(str(row['gift_id']), safe='')}/sticker",
+                },
+                "synced_at": int(row["synced_at"]),
+            })
+        synced_at = int(state["last_synced_at"])
+        return {
+            "source": "telegram_bot_api",
+            "scope": "gifts_available_to_authbot",
+            "currency": "telegram_stars",
+            "synced_at": synced_at,
+            "stale": int(time.time()) - synced_at >= 60,
+            "count": len(gifts),
+            "gifts": gifts,
+        }
+
+    @router.get("/api/telegram/gifts/{gift_id}/sticker")
+    async def telegram_gift_sticker(
+        gift_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                """SELECT sticker_file_id,sticker_mime_type
+                   FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1""",
+                (gift_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Подарок Telegram не найден")
+        bot = bot_provider()
+        if bot is None:
+            raise HTTPException(status_code=503, detail="Telegram Bot API недоступен")
+        try:
+            content, media_type = await fetch_telegram_sticker(
+                bot,
+                str(row[0]),
+                str(row[1] or ""),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram") from exc
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
 
     @router.get("/api/gifts")
     async def gift_catalog(authorization: str | None = Header(default=None)) -> dict[str, Any]:
