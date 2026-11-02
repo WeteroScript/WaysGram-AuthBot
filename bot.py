@@ -687,13 +687,34 @@ app.include_router(
 
 
 async def ensure_account(telegram_id: int, number: str, username: str = "", display_name: str = "") -> None:
+    """Create a WaysGram account once and grant its one-time welcome balance."""
     now = int(time.time())
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""INSERT INTO accounts(telegram_id,virtual_number,username,display_name,created_at,updated_at)
-            VALUES(?,?,?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET
-            virtual_number=excluded.virtual_number,username=excluded.username,
-            display_name=excluded.display_name,updated_at=excluded.updated_at""",
-            (telegram_id, number, username[:64], display_name[:128], now, now))
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            """INSERT OR IGNORE INTO accounts
+               (telegram_id,virtual_number,username,display_name,stars,grams,created_at,updated_at)
+               VALUES(?,?,?,?,5000,15,?,?)""",
+            (telegram_id, number, username[:64], display_name[:128], now, now),
+        )
+        created = cur.rowcount == 1
+        if not created:
+            await db.execute(
+                """UPDATE accounts SET virtual_number=?,username=?,display_name=?,updated_at=?
+                   WHERE telegram_id=?""",
+                (number, username[:64], display_name[:128], now, telegram_id),
+            )
+        else:
+            # Keep both welcome grants visible in the same transaction as their balances.
+            await db.executemany(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,?,?,?,?,NULL,?)""",
+                [
+                    (telegram_id, "stars", 5000, 5000, "welcome_bonus", now),
+                    (telegram_id, "grams", 15, 15, "welcome_bonus", now),
+                ],
+            )
         await db.commit()
 
 async def admin_log(action: str, target: str = "", details: str = "") -> None:
@@ -711,7 +732,7 @@ def admin_keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 def admin_home_keyboard() -> InlineKeyboardMarkup:
     return admin_keyboard([
         [("📊 Статистика", "wgadm:stats")],
-        [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Каталог подарков", "wgadm:gifts")],
+        [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Подарки", "wgadm:gifts")],
         [("📦 Инвентарь", "wgadm:inventory"), ("🧾 Операции", "wgadm:transactions")],
         [("🎟 История подарков", "wgadm:gifthistory")],
         [("📡 Каналы", "wgadm:channels")],
@@ -840,17 +861,36 @@ async def admin_callback(callback: CallbackQuery) -> None:
         ADMIN_INPUT[ADMIN_ID] = ("search", None)
         await callback.message.answer("Отправьте Telegram ID или виртуальный номер +1… для поиска аккаунта.")
     elif action == "gifts":
+        page = 0
+        if len(parts) >= 3:
+            try:
+                page = max(0, int(parts[2]))
+            except ValueError:
+                page = 0
+        page_size = 30
         async with aiosqlite.connect(DATABASE_PATH) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT id,name,price_grams,supply FROM gift_catalog ORDER BY id DESC LIMIT 30")
+            cur = await db.execute("SELECT COUNT(*) FROM gift_catalog")
+            total = int((await cur.fetchone())[0])
+            cur = await db.execute(
+                "SELECT id,name,price_grams,supply FROM gift_catalog ORDER BY id ASC LIMIT ? OFFSET ?",
+                (page_size, page * page_size),
+            )
             rows = await cur.fetchall()
-        body = "Каталог подарков. Выберите запись для изменения:"
+        body = f"Подарки WaysGram · страница {page + 1} · всего {total}. Выберите подарок для управления:"
         keyboard_rows = [[(f"#{r['id']} · {r['name']} · {r['price_grams']} Gram · остаток {r['supply']}",
                            f"wgadm:gift:{r['id']}")] for r in rows]
         if not rows:
             body += "\n\nКаталог пуст."
-        keyboard_rows.extend([[("➕ Добавить подарок", "wgadm:giftadd")],
-                              [("⬅️ В меню", "wgadm:home")]])
+        navigation = []
+        if page > 0:
+            navigation.append(("⬅️ Назад", f"wgadm:gifts:{page - 1}"))
+        if (page + 1) * page_size < total:
+            navigation.append(("Вперёд ➡️", f"wgadm:gifts:{page + 1}"))
+        if navigation:
+            keyboard_rows.append(navigation)
+        keyboard_rows.extend([[( "➕ Добавить подарок", "wgadm:giftadd")],
+                              [( "⬅️ В меню", "wgadm:home")]])
         await callback.message.answer(body, reply_markup=admin_keyboard(keyboard_rows))
     elif action == "gift" and len(parts) == 3:
         try:
