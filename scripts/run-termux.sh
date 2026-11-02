@@ -41,6 +41,10 @@ if (( ${#missing[@]} > 0 )); then
   exit 1
 fi
 
-mkdir -p "${DATABASE_PATH%/*}"
+db_dir="${DATABASE_PATH%/*}"
+if [[ "$db_dir" == "$DATABASE_PATH" ]]; then
+  db_dir="."
+fi
+mkdir -p "$db_dir"
 echo "Запуск WaysGram AuthBot. Локальный API: http://127.0.0.1:${INTERNAL_API_PORT:-8081}"
 exec python bot.py
