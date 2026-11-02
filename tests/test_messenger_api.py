@@ -486,6 +486,186 @@ def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> 
 
     run(scenario())
 
+
+def test_group_creation_roles_membership_and_messages(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 85001, "group_owner")
+    add_account(api_env, 85002, "group_admin")
+    add_account(api_env, 85003, "group_guest")
+    add_session(path, 85001, "group-owner-session")
+    add_session(path, 85002, "group-admin-session")
+    add_session(path, 85003, "group-guest-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer group-owner-session"}
+            admin = {"Authorization": "Bearer group-admin-session"}
+            guest = {"Authorization": "Bearer group-guest-session"}
+
+            created = await client.post(
+                "/api/groups",
+                headers=owner,
+                json={"title": "WaysGram Test Group", "username": "waysgram_test", "description": "Group API test"},
+            )
+            assert created.status_code == 201
+            group_id = created.json()["id"]
+
+            denied = await client.get(f"/api/groups/{group_id}", headers=guest)
+            assert denied.status_code == 403
+
+            joined = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=owner,
+                json={"username": "group_admin"},
+            )
+            assert joined.status_code == 201
+            assert joined.json()["joined"] is True
+
+            promoted = await client.post(
+                f"/api/groups/{group_id}/admins",
+                headers=owner,
+                json={"telegram_id": 85002},
+            )
+            assert promoted.status_code == 201
+            assert promoted.json()["role"] == "admin"
+
+            guest_joined = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=admin,
+                json={"telegram_id": 85003},
+            )
+            assert guest_joined.status_code == 201
+
+            post = await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=guest,
+                json={"body": "Group message"},
+            )
+            assert post.status_code == 201
+            history = await client.get(
+                f"/api/groups/{group_id}/messages",
+                headers=owner,
+            )
+            assert history.status_code == 200
+            assert history.json()["messages"][0]["body"] == "Group message"
+
+            member_list = await client.get(f"/api/groups/{group_id}", headers=owner)
+            assert member_list.status_code == 200
+            roles = {row["telegram_id"]: row["role"] for row in member_list.json()["members"]}
+            assert roles == {85001: "owner", 85002: "admin", 85003: "member"}
+
+            left = await client.delete(
+                f"/api/groups/{group_id}/members/85003",
+                headers=guest,
+            )
+            assert left.status_code == 200
+            denied_after_leave = await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=guest,
+                json={"body": "Cannot post after leaving"},
+            )
+            assert denied_after_leave.status_code == 403
+
+    run(scenario())
+
+
+def test_internal_botfather_create_commands_and_message_runtime(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 86001, "bot_owner")
+    add_account(api_env, 86002, "bot_user")
+    add_session(path, 86001, "bot-owner-session")
+    add_session(path, 86002, "bot-user-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer bot-owner-session"}
+            user = {"Authorization": "Bearer bot-user-session"}
+
+            created = await client.post(
+                "/api/bots",
+                headers=owner,
+                json={
+                    "name": "WaysGram Helper",
+                    "username": "waysgram_helper_bot",
+                    "about": "A test bot",
+                    "description": "Internal bot API test",
+                },
+            )
+            assert created.status_code == 201
+            bot_data = created.json()
+            bot_id = bot_data["id"]
+            token = bot_data["token"]
+            assert token.startswith("wgbot_")
+
+            owned = await client.get("/api/bots", headers=owner)
+            assert owned.status_code == 200
+            assert owned.json()["bots"][0]["username"] == "waysgram_helper_bot"
+            assert "token" not in owned.json()["bots"][0]
+
+            commands = await client.put(
+                f"/api/bots/{bot_id}/commands",
+                headers=owner,
+                json={"commands": [
+                    {"command": "start", "description": "Start the bot"},
+                    {"command": "help", "description": "Show help"},
+                ]},
+            )
+            assert commands.status_code == 200
+            assert len(commands.json()["commands"]) == 2
+
+            public = await client.get(
+                "/api/bots/by-username/waysgram_helper_bot",
+                headers=user,
+            )
+            assert public.status_code == 200
+            assert public.json()["id"] == bot_id
+
+            incoming = await client.post(
+                f"/api/bots/{bot_id}/messages",
+                headers=user,
+                json={"body": "/start"},
+            )
+            assert incoming.status_code == 201
+
+            bot_headers = {"Authorization": f"Bearer {token}"}
+            updates = await client.get("/api/bot-api/getUpdates?offset=0", headers=bot_headers)
+            assert updates.status_code == 200
+            assert updates.json()["result"][0]["text"] == "/start"
+            assert updates.json()["result"][0]["chat_id"] == 86002
+
+            sent = await client.post(
+                "/api/bot-api/sendMessage",
+                headers=bot_headers,
+                json={"chat_id": 86002, "text": "Hello from the internal bot"},
+            )
+            assert sent.status_code == 200
+            assert sent.json()["ok"] is True
+
+            history = await client.get(
+                f"/api/bots/{bot_id}/messages",
+                headers=user,
+            )
+            assert [message["sender"] for message in history.json()["messages"]] == ["user", "bot"]
+            assert history.json()["messages"][1]["body"] == "Hello from the internal bot"
+
+            reset = await client.post(
+                f"/api/bots/{bot_id}/token/reset",
+                headers=owner,
+            )
+            assert reset.status_code == 200
+            old_token = await client.get("/api/bot-api/getUpdates", headers=bot_headers)
+            assert old_token.status_code == 401
+            new_headers = {"Authorization": f"Bearer {reset.json()['token']}"}
+            new_token = await client.get("/api/bot-api/getUpdates", headers=new_headers)
+            assert new_token.status_code == 200
+
+            revoked = await client.delete(f"/api/bots/{bot_id}", headers=owner)
+            assert revoked.status_code == 200
+            revoked_token = await client.get("/api/bot-api/getUpdates", headers=new_headers)
+            assert revoked_token.status_code == 401
+
+    run(scenario())
+
 def test_legacy_admin_gift_serials_are_migrated(api_env) -> None:
     path, _auth_store, _fake_bot, _app = api_env
     now = int(time.time())
