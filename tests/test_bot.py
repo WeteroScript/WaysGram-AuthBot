@@ -346,3 +346,48 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
             (str(channel_id),),
         ).fetchone()
     assert log == ("channel_delete",)
+
+def test_new_account_receives_one_time_welcome_balances(
+    store: bot_module.Store,
+) -> None:
+    user_id = 880001
+    number = "+15550000001"
+
+    run(bot_module.ensure_account(user_id, number, "starter", "Starter User"))
+
+    with sqlite3.connect(store.path) as conn:
+        stars, grams = conn.execute(
+            "SELECT stars, grams FROM accounts WHERE telegram_id=?", (user_id,)
+        ).fetchone()
+        grants = conn.execute(
+            "SELECT asset, amount, reason FROM economy_transactions "
+            "WHERE telegram_id=? AND reason='welcome_bonus' ORDER BY asset",
+            (user_id,),
+        ).fetchall()
+
+    assert (stars, grams) == (5000, 15)
+    assert grants == [
+        ("grams", 15, "welcome_bonus"),
+        ("stars", 5000, "welcome_bonus"),
+    ]
+
+    # A repeated number/account sync must not issue the welcome balance twice.
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE accounts SET stars=4900, grams=14 WHERE telegram_id=?",
+            (user_id,),
+        )
+    run(bot_module.ensure_account(user_id, number, "starter", "Starter User"))
+
+    with sqlite3.connect(store.path) as conn:
+        stars, grams = conn.execute(
+            "SELECT stars, grams FROM accounts WHERE telegram_id=?", (user_id,)
+        ).fetchone()
+        grant_count = conn.execute(
+            "SELECT COUNT(*) FROM economy_transactions "
+            "WHERE telegram_id=? AND reason='welcome_bonus'",
+            (user_id,),
+        ).fetchone()[0]
+
+    assert (stars, grams) == (4900, 14)
+    assert grant_count == 2
