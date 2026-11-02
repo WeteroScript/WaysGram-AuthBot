@@ -393,6 +393,11 @@ async def store_telegram_gifts(
     }
 
 
+async def sync_telegram_gifts(database_path: Path, bot: Any) -> dict[str, Any]:
+    gifts = await fetch_telegram_gifts(bot)
+    return await store_telegram_gifts(database_path, gifts)
+
+
 async def fetch_telegram_sticker(bot: Any, file_id: str, preferred_mime: str = "") -> tuple[bytes, str]:
     """Download a sticker without ever exposing the AuthBot token to the client."""
     token = str(getattr(bot, "token", "") or "").strip()
