@@ -366,7 +366,8 @@ def build_messenger_router(
                 "profiles", "direct_messages", "incremental_messages",
                 "channels", "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "gifts", "gift_inventory", "gift_transfer",
-                "gift_auctions", "auction_bids", "stars", "grams",
+                "gift_auctions", "auction_bids", "groups", "group_members", "group_messages",
+                "botfather", "bot_commands", "bot_runtime", "stars", "grams",
             ],
         }
 
