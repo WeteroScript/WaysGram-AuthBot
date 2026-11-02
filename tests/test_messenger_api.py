@@ -387,6 +387,105 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
     run(scenario())
 
 
+
+def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 84001, "first_bidder")
+    add_account(api_env, 84002, "second_bidder")
+    add_session(path, 84001, "first-bidder-session")
+    add_session(path, 84002, "second-bidder-session")
+    now = int(time.time())
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE accounts SET stars=200 WHERE telegram_id IN (84001,84002)")
+        db.execute(
+            "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Auction Gift',40,0,?)",
+            (now,),
+        )
+        db.execute(
+            """INSERT INTO gift_auctions
+               (gift_id,gift_name,starting_bid,current_bid,status,starts_at,ends_at,created_by,created_at)
+               VALUES(1,'Auction Gift',50,0,'active',?,?,999,?)""",
+            (now - 1, now + 3600, now),
+        )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            first = {"Authorization": "Bearer first-bidder-session"}
+            second = {"Authorization": "Bearer second-bidder-session"}
+
+            first_bid = await client.post(
+                "/api/auctions/1/bid",
+                headers=first,
+                json={"amount": 50},
+            )
+            assert first_bid.status_code == 201
+            assert first_bid.json()["stars_balance"] == 150
+
+            second_bid = await client.post(
+                "/api/auctions/1/bid",
+                headers=second,
+                json={"amount": 80},
+            )
+            assert second_bid.status_code == 201
+            assert second_bid.json()["stars_balance"] == 120
+
+            too_low = await client.post(
+                "/api/auctions/1/bid",
+                headers=first,
+                json={"amount": 80},
+            )
+            assert too_low.status_code == 409
+            assert "Минимальная следующая ставка" in too_low.json()["detail"]
+
+            with sqlite3.connect(path) as db:
+                first_balance = db.execute(
+                    "SELECT stars FROM accounts WHERE telegram_id=84001"
+                ).fetchone()[0]
+                second_balance = db.execute(
+                    "SELECT stars FROM accounts WHERE telegram_id=84002"
+                ).fetchone()[0]
+            assert first_balance == 200
+            assert second_balance == 120
+
+            # A new high bid refunds the previous leader and escrows only the current bid.
+            third_bid = await client.post(
+                "/api/auctions/1/bid",
+                headers=first,
+                json={"amount": 100},
+            )
+            assert third_bid.status_code == 201
+            assert third_bid.json()["stars_balance"] == 100
+
+            with sqlite3.connect(path) as db:
+                db.execute(
+                    "UPDATE gift_auctions SET ends_at=? WHERE id=1",
+                    (int(time.time()) - 1,),
+                )
+
+            auctions = await client.get("/api/auctions", headers=first)
+            assert auctions.status_code == 200
+            assert auctions.json()["auctions"][0]["status"] == "ended"
+
+            with sqlite3.connect(path) as db:
+                first_balance = db.execute(
+                    "SELECT stars FROM accounts WHERE telegram_id=84001"
+                ).fetchone()[0]
+                second_balance = db.execute(
+                    "SELECT stars FROM accounts WHERE telegram_id=84002"
+                ).fetchone()[0]
+                winner = db.execute(
+                    "SELECT owner_telegram_id,gift_name FROM user_gifts"
+                ).fetchone()
+                auction_status = db.execute(
+                    "SELECT status FROM gift_auctions WHERE id=1"
+                ).fetchone()[0]
+            assert first_balance == 100
+            assert second_balance == 200
+            assert winner == (84001, "Auction Gift")
+            assert auction_status == "ended"
+
+    run(scenario())
+
 def test_legacy_admin_gift_serials_are_migrated(api_env) -> None:
     path, _auth_store, _fake_bot, _app = api_env
     now = int(time.time())
