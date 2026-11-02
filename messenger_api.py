@@ -472,7 +472,12 @@ def build_messenger_router(
                 raise HTTPException(status_code=503, detail="Telegram gift catalog is not available yet")
             try:
                 gifts = await fetch_telegram_gifts(bot)
-                return await store_telegram_gifts(db_path(), gifts, now)
+                synced = await store_telegram_gifts(db_path(), gifts, now)
+                return {
+                    "last_synced_at": int(synced["synced_at"]),
+                    "gift_count": int(synced["gift_count"]),
+                    "source": str(synced["source"]),
+                }
             except Exception as exc:
                 if state:
                     return dict(state)
