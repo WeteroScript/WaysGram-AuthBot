@@ -763,6 +763,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [("🎟 Аукционы подарков", "wgadm:auctions")],
         [("🎟 История подарков", "wgadm:gifthistory")],
         [("📡 Каналы", "wgadm:channels")],
+        [("👥 Группы", "wgadm:groups"), ("🤖 Боты", "wgadm:bots")],
         [("🔐 Журнал действий", "wgadm:logs")],
     ])
 
@@ -871,6 +872,9 @@ async def admin_callback(callback: CallbackQuery) -> None:
                 ("Выдано номеров", "SELECT COUNT(*) FROM numbers", ()),
                 ("Активных кодов", "SELECT COUNT(*) FROM auth_codes WHERE expires_at>?", (now,)),
                 ("Каналов", "SELECT COUNT(*) FROM channels", ()),
+                ("Групп", "SELECT COUNT(*) FROM chat_groups", ()),
+                ("Внутренних ботов", "SELECT COUNT(*) FROM bots", ()),
+                ("Активных аукционов", "SELECT COUNT(*) FROM gift_auctions WHERE status='active'", ()),
                 ("Личных сообщений", "SELECT COUNT(*) FROM messages", ()),
                 ("Подарков в каталоге", "SELECT COUNT(*) FROM gift_catalog", ()),
                 ("Подарков у пользователей", "SELECT COUNT(*) FROM user_gifts", ()),
@@ -1036,6 +1040,148 @@ async def admin_callback(callback: CallbackQuery) -> None:
         await callback.message.answer(
             f"Аукцион #{auction_id} отменён. Ставка лидеру возвращена, подарок вернулся в каталог.",
             reply_markup=admin_keyboard([[("К аукционам", "wgadm:auctions")]]),
+        )
+    elif action == "groups":
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT g.id,g.title,g.username,g.owner_telegram_id,
+                          (SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id) AS members
+                   FROM chat_groups g ORDER BY g.id DESC LIMIT 30"""
+            )
+            rows = await cur.fetchall()
+        keyboard_rows = [
+            [(f"#{row['id']} · {row['title']} · {row['members']} участн."[:64],
+              f"wgadm:group:{row['id']}")]
+            for row in rows
+        ]
+        body = "Группы WaysGram. Выберите группу:" if rows else "Групп пока нет."
+        keyboard_rows.append([("⬅️ В меню", "wgadm:home")])
+        await callback.message.answer(body, reply_markup=admin_keyboard(keyboard_rows))
+    elif action == "group" and len(parts) == 3:
+        try:
+            group_id = int(parts[2])
+        except ValueError:
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT g.id,g.title,g.username,g.description,g.owner_telegram_id,
+                          (SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id) AS members,
+                          (SELECT COUNT(*) FROM group_messages x WHERE x.group_id=g.id) AS messages
+                   FROM chat_groups g WHERE g.id=?""",
+                (group_id,),
+            )
+            group = await cur.fetchone()
+        if not group:
+            await callback.message.answer("Группа не найдена.")
+            return
+        body = (
+            f"Группа #{group['id']}\nНазвание: {group['title']}\n"
+            f"Username: @{group['username'] or '—'}\nВладелец: {group['owner_telegram_id']}\n"
+            f"Участников: {group['members']}\nСообщений: {group['messages']}\n"
+            f"Описание: {group['description'] or '—'}"
+        )
+        await callback.message.answer(
+            body,
+            reply_markup=admin_keyboard([
+                [("🗑 Удалить группу", f"wgadm:groupdelete:{group_id}")],
+                [("⬅️ К группам", "wgadm:groups")],
+            ]),
+        )
+    elif action == "groupdelete" and len(parts) == 3:
+        try:
+            group_id = int(parts[2])
+        except ValueError:
+            return
+        now = int(time.time())
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute("SELECT title FROM chat_groups WHERE id=?", (group_id,))
+            group = await cur.fetchone()
+            if not group:
+                await db.rollback()
+                await callback.message.answer("Группа не найдена.")
+                return
+            await db.execute("DELETE FROM group_messages WHERE group_id=?", (group_id,))
+            await db.execute("DELETE FROM group_members WHERE group_id=?", (group_id,))
+            await db.execute("DELETE FROM chat_groups WHERE id=?", (group_id,))
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, "group_delete", str(group_id), str(group[0]), now),
+            )
+            await db.commit()
+        await callback.message.answer("Группа удалена.", reply_markup=admin_keyboard([[("К группам", "wgadm:groups")]]))
+    elif action == "bots":
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT b.id,b.name,b.username,b.owner_telegram_id,b.is_active
+                   FROM bots b ORDER BY b.id DESC LIMIT 30"""
+            )
+            rows = await cur.fetchall()
+        keyboard_rows = [
+            [(f"#{row['id']} · {row['username']} · {'активен' if row['is_active'] else 'отключён'}"[:64],
+              f"wgadm:bot:{row['id']}")]
+            for row in rows
+        ]
+        body = "Внутренние боты WaysGram. Выберите бота:" if rows else "Пользовательских ботов пока нет."
+        keyboard_rows.append([("⬅️ В меню", "wgadm:home")])
+        await callback.message.answer(body, reply_markup=admin_keyboard(keyboard_rows))
+    elif action == "bot" and len(parts) == 3:
+        try:
+            bot_id = int(parts[2])
+        except ValueError:
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT b.id,b.name,b.username,b.about,b.description,b.token_prefix,
+                          b.is_active,b.owner_telegram_id,
+                          (SELECT COUNT(*) FROM bot_chats c WHERE c.bot_id=b.id) AS chats
+                   FROM bots b WHERE b.id=?""",
+                (bot_id,),
+            )
+            bot_row = await cur.fetchone()
+        if not bot_row:
+            await callback.message.answer("Бот не найден.")
+            return
+        state = "активен" if bot_row["is_active"] else "отключён"
+        body = (
+            f"Бот #{bot_row['id']}\nИмя: {bot_row['name']}\nUsername: @{bot_row['username']}\n"
+            f"Владелец: {bot_row['owner_telegram_id']}\nСтатус: {state}\n"
+            f"Префикс токена: {bot_row['token_prefix']}…\nЧатов: {bot_row['chats']}\n"
+            f"О боте: {bot_row['about'] or '—'}"
+        )
+        label = "Включить бота" if not bot_row["is_active"] else "Отключить бота"
+        await callback.message.answer(
+            body,
+            reply_markup=admin_keyboard([
+                [(label, f"wgadm:botoggle:{bot_id}")],
+                [("⬅️ К ботам", "wgadm:bots")],
+            ]),
+        )
+    elif action == "botoggle" and len(parts) == 3:
+        try:
+            bot_id = int(parts[2])
+        except ValueError:
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute("SELECT is_active,username FROM bots WHERE id=?", (bot_id,))
+            bot_row = await cur.fetchone()
+            if not bot_row:
+                await callback.message.answer("Бот не найден.")
+                return
+            active = 0 if bot_row[0] else 1
+            await db.execute(
+                "UPDATE bots SET is_active=?,updated_at=? WHERE id=?",
+                (active,int(time.time()),bot_id),
+            )
+            await db.commit()
+        await admin_log("bot_enable" if active else "bot_disable", str(bot_id), str(bot_row[1]))
+        await callback.message.answer(
+            "Бот включён." if active else "Бот отключён.",
+            reply_markup=admin_keyboard([[("Открыть ботов", "wgadm:bots")]]),
         )
     elif action == "gift" and len(parts) == 3:
         try:
