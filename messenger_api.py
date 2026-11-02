@@ -265,7 +265,7 @@ def build_messenger_router(
                 "profiles", "direct_messages", "incremental_messages",
                 "channels", "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "gifts", "gift_inventory", "gift_transfer",
-                "stars", "grams",
+                "gift_auctions", "auction_bids", "stars", "grams",
             ],
         }
 
@@ -548,6 +548,199 @@ def build_messenger_router(
         if row is None:
             raise HTTPException(status_code=404, detail="Пользователь не найден")
         return dict(row)
+
+    async def settle_due_auctions(db: Any, now: int) -> int:
+        cur = await db.execute(
+            """SELECT id,gift_id,gift_name,current_bidder_id
+               FROM gift_auctions
+               WHERE status='active' AND ends_at<=?
+               ORDER BY ends_at,id""",
+            (now,),
+        )
+        due = await cur.fetchall()
+        settled = 0
+        for auction in due:
+            auction_id = int(auction["id"])
+            bidder_id = auction["current_bidder_id"]
+            if bidder_id is not None:
+                serial = "WG-" + secrets.token_hex(6).upper()
+                await db.execute(
+                    """INSERT INTO user_gifts
+                       (serial_number,gift_id,gift_name,owner_telegram_id,acquired_at)
+                       VALUES(?,?,?,?,?)""",
+                    (
+                        serial,
+                        int(auction["gift_id"]),
+                        str(auction["gift_name"]),
+                        int(bidder_id),
+                        now,
+                    ),
+                )
+                await db.execute(
+                    """INSERT INTO gift_transactions
+                       (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
+                       VALUES('auction_win',?,?,NULL,?,?)""",
+                    (serial, str(auction["gift_name"]), int(bidder_id), now),
+                )
+            else:
+                # No bids: return the reserved system gift to the market supply.
+                await db.execute(
+                    "UPDATE gift_catalog SET supply=supply+1 WHERE id=?",
+                    (int(auction["gift_id"]),),
+                )
+            await db.execute(
+                "UPDATE gift_auctions SET status='ended',settled_at=? WHERE id=? AND status='active'",
+                (now, auction_id),
+            )
+            settled += 1
+        return settled
+
+    @router.get("/api/auctions")
+    async def list_auctions(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        await current_user(authorization)
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            settled = await settle_due_auctions(db, now)
+            cur = await db.execute(
+                """SELECT id,gift_id,gift_name,starting_bid,current_bid,status,
+                          starts_at,ends_at,settled_at,
+                          (SELECT COUNT(*) FROM auction_bids b WHERE b.auction_id=a.id) AS bid_count
+                   FROM gift_auctions a
+                   ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'ended' THEN 1 ELSE 2 END,
+                            ends_at DESC,id DESC
+                   LIMIT 100"""
+            )
+            rows = await cur.fetchall()
+            await db.commit()
+        return {"auctions": [dict(row) for row in rows], "settled_count": settled}
+
+    @router.post("/api/auctions/{auction_id}/bid", status_code=201)
+    async def place_auction_bid(
+        auction_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            amount = int(payload.get("amount", 0))
+        except (TypeError, ValueError):
+            amount = 0
+        if not 1 <= amount <= 1_000_000_000:
+            raise HTTPException(status_code=400, detail="Ставка должна быть от 1 до 1000000000 Stars")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await settle_due_auctions(db, now)
+            cur = await db.execute(
+                """SELECT id,gift_name,starting_bid,current_bid,current_bidder_id,
+                          status,starts_at,ends_at
+                   FROM gift_auctions WHERE id=?""",
+                (auction_id,),
+            )
+            auction = await cur.fetchone()
+            if (
+                not auction
+                or str(auction["status"]) != "active"
+                or int(auction["starts_at"]) > now
+                or int(auction["ends_at"]) <= now
+            ):
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Аукцион уже завершён или недоступен")
+            previous_bid = int(auction["current_bid"])
+            previous_bidder = auction["current_bidder_id"]
+            minimum = max(int(auction["starting_bid"]), previous_bid + 1)
+            if amount < minimum:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Минимальная следующая ставка: {minimum} Stars",
+                )
+            cur = await db.execute(
+                "SELECT stars,is_banned FROM accounts WHERE telegram_id=?",
+                (uid,),
+            )
+            bidder = await cur.fetchone()
+            if not bidder or bidder["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Аккаунт недоступен")
+            available = int(bidder["stars"])
+            if previous_bidder is not None and int(previous_bidder) == uid:
+                available += previous_bid
+            if available < amount:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Недостаточно Stars для ставки")
+
+            if previous_bidder is not None and previous_bid > 0:
+                cur = await db.execute(
+                    "SELECT stars FROM accounts WHERE telegram_id=?",
+                    (int(previous_bidder),),
+                )
+                previous_account = await cur.fetchone()
+                if previous_account:
+                    refunded_balance = int(previous_account["stars"]) + previous_bid
+                    await db.execute(
+                        "UPDATE accounts SET stars=?,updated_at=? WHERE telegram_id=?",
+                        (refunded_balance, now, int(previous_bidder)),
+                    )
+                    await db.execute(
+                        """INSERT INTO economy_transactions
+                           (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                           VALUES(?,'stars',?,?,?,NULL,?)""",
+                        (
+                            int(previous_bidder),
+                            previous_bid,
+                            refunded_balance,
+                            f"auction_outbid_refund:{auction_id}",
+                            now,
+                        ),
+                    )
+
+            cur = await db.execute(
+                "SELECT stars FROM accounts WHERE telegram_id=?",
+                (uid,),
+            )
+            current_account = await cur.fetchone()
+            new_balance = int(current_account["stars"]) - amount
+            if new_balance < 0:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Недостаточно Stars для ставки")
+            await db.execute(
+                "UPDATE accounts SET stars=?,updated_at=? WHERE telegram_id=?",
+                (new_balance, now, uid),
+            )
+            await db.execute(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,'stars',?,?,?,NULL,?)""",
+                (uid, -amount, new_balance, f"auction_bid:{auction_id}", now),
+            )
+            await db.execute(
+                """INSERT INTO auction_bids(auction_id,bidder_telegram_id,amount,created_at)
+                   VALUES(?,?,?,?)""",
+                (auction_id, uid, amount, now),
+            )
+            await db.execute(
+                """UPDATE gift_auctions
+                   SET current_bid=?,current_bidder_id=?
+                   WHERE id=? AND status='active'""",
+                (amount, uid, auction_id),
+            )
+            await db.commit()
+        return {
+            "status": "accepted",
+            "auction_id": auction_id,
+            "gift_name": str(auction["gift_name"]),
+            "bid": amount,
+            "currency": "stars",
+            "stars_balance": new_balance,
+            "ends_at": int(auction["ends_at"]),
+        }
 
     @router.get("/api/gifts")
     async def gift_catalog(authorization: str | None = Header(default=None)) -> dict[str, Any]:
