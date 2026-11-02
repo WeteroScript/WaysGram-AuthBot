@@ -94,6 +94,75 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_api_idempotency_created
                 ON api_idempotency_records(created_at);
+            CREATE TABLE IF NOT EXISTS chat_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT COLLATE NOCASE UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                owner_telegram_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id INTEGER NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member'
+                    CHECK(role IN ('owner','admin','member')),
+                joined_at INTEGER NOT NULL,
+                PRIMARY KEY(group_id,telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_group_members_user
+                ON group_members(telegram_id,group_id);
+            CREATE TABLE IF NOT EXISTS group_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sender_telegram_id INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_group_messages_group
+                ON group_messages(group_id,id DESC);
+            CREATE INDEX IF NOT EXISTS idx_group_messages_sender_time
+                ON group_messages(sender_telegram_id,created_at);
+            CREATE TABLE IF NOT EXISTS bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_telegram_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                about TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bots_owner
+                ON bots(owner_telegram_id,is_active);
+            CREATE TABLE IF NOT EXISTS bot_commands (
+                bot_id INTEGER NOT NULL,
+                command TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(bot_id,command)
+            );
+            CREATE TABLE IF NOT EXISTS bot_chats (
+                bot_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_activity INTEGER NOT NULL,
+                PRIMARY KEY(bot_id,user_telegram_id)
+            );
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                sender_type TEXT NOT NULL CHECK(sender_type IN ('user','bot')),
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bot_messages_chat
+                ON bot_messages(bot_id,user_telegram_id,id);
+            CREATE INDEX IF NOT EXISTS idx_bot_messages_updates
+                ON bot_messages(bot_id,sender_type,id);
             """
         )
         # Older Telegram admin grants used WG- plus 8 hex digits. Expand them
@@ -244,6 +313,38 @@ def build_messenger_router(
                 (channel_id, telegram_id, channel_id, telegram_id),
             )
             return await cur.fetchone() is not None
+
+    async def require_group_member(
+        db: Any, group_id: int, telegram_id: int
+    ) -> dict[str, Any]:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT gm.role,g.title,g.username,g.owner_telegram_id
+               FROM group_members gm JOIN chat_groups g ON g.id=gm.group_id
+               WHERE gm.group_id=? AND gm.telegram_id=?""",
+            (group_id, telegram_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=403, detail="Вы не состоите в этой группе")
+        return dict(row)
+
+    async def current_bot(authorization: str | None) -> dict[str, Any]:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Требуется токен бота")
+        token = authorization[7:].strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="Требуется токен бота")
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM bots WHERE token_hash=? AND is_active=1",
+                (_token_hash(token),),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Токен бота недействителен или отозван")
+        return dict(row)
 
     @router.get("/api/config")
     async def api_config() -> dict[str, Any]:
@@ -1271,5 +1372,651 @@ def build_messenger_router(
             )
             rows = await cur.fetchall()
         return {"conversations": [dict(row) for row in rows]}
+
+    # Group chats: membership and role checks are enforced on every read/write.
+    @router.get("/api/groups")
+    async def list_groups(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT g.id,g.username,g.title,g.description,g.owner_telegram_id,
+                          gm.role,gm.joined_at,
+                          (SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id) AS member_count,
+                          (SELECT COUNT(*) FROM group_messages x WHERE x.group_id=g.id) AS message_count
+                   FROM group_members gm
+                   JOIN chat_groups g ON g.id=gm.group_id
+                   WHERE gm.telegram_id=?
+                   ORDER BY g.id DESC LIMIT 100""",
+                (uid,),
+            )
+            rows = await cur.fetchall()
+        return {"groups": [dict(row) for row in rows]}
+
+    @router.post("/api/groups", status_code=201)
+    async def create_group(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        title = payload.get("title")
+        username = str(payload.get("username") or "").strip().lstrip("@").lower()
+        description = str(payload.get("description") or "").strip()
+        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 80:
+            raise HTTPException(status_code=400, detail="Название группы должно содержать 1–80 символов")
+        if len(description) > 512:
+            raise HTTPException(status_code=400, detail="Описание группы слишком длинное")
+        if username and not re.fullmatch(r"[a-z][a-z0-9_]{3,31}", username):
+            raise HTTPException(status_code=400, detail="Username группы должен содержать 4–32 символа")
+        now = int(time.time())
+        uid = int(user["telegram_id"])
+        try:
+            async with aiosqlite.connect(db_path()) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                cur = await db.execute(
+                    """INSERT INTO chat_groups(username,title,description,owner_telegram_id,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (username or None, title.strip(), description, uid, now),
+                )
+                group_id = int(cur.lastrowid)
+                await db.execute(
+                    "INSERT INTO group_members(group_id,telegram_id,role,joined_at) VALUES(?,?,'owner',?)",
+                    (group_id, uid, now),
+                )
+                await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="Username группы уже занят") from exc
+        return {
+            "id": group_id,
+            "username": username,
+            "title": title.strip(),
+            "description": description,
+            "owner_telegram_id": uid,
+            "role": "owner",
+            "created_at": now,
+        }
+
+    @router.get("/api/groups/{group_id}")
+    async def get_group(
+        group_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            membership = await require_group_member(db, group_id, uid)
+            cur = await db.execute(
+                """SELECT g.id,g.username,g.title,g.description,g.owner_telegram_id,g.created_at,
+                          (SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id) AS member_count
+                   FROM chat_groups g WHERE g.id=?""",
+                (group_id,),
+            )
+            group = await cur.fetchone()
+            cur = await db.execute(
+                """SELECT gm.telegram_id,gm.role,gm.joined_at,a.username,a.display_name
+                   FROM group_members gm LEFT JOIN accounts a ON a.telegram_id=gm.telegram_id
+                   WHERE gm.group_id=? ORDER BY
+                   CASE gm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                   gm.joined_at LIMIT 200""",
+                (group_id,),
+            )
+            members = await cur.fetchall()
+        result = dict(group)
+        result["my_role"] = membership["role"]
+        result["members"] = [dict(row) for row in members]
+        return result
+
+    @router.post("/api/groups/{group_id}/members", status_code=201)
+    async def add_group_member(
+        group_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            membership = await require_group_member(db, group_id, uid)
+            if membership["role"] not in ("owner", "admin"):
+                raise HTTPException(status_code=403, detail="Добавлять участников могут администраторы группы")
+            target_id = 0
+            if payload.get("telegram_id") is not None:
+                try:
+                    target_id = int(payload.get("telegram_id"))
+                except (TypeError, ValueError):
+                    target_id = 0
+            elif payload.get("username") is not None:
+                username = str(payload.get("username")).strip().lstrip("@")
+                cur = await db.execute(
+                    "SELECT telegram_id FROM accounts WHERE username=? COLLATE NOCASE",
+                    (username,),
+                )
+                target = await cur.fetchone()
+                target_id = int(target["telegram_id"]) if target else 0
+            if target_id <= 0:
+                raise HTTPException(status_code=404, detail="Пользователь не найден")
+            cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?",
+                (target_id,),
+            )
+            target = await cur.fetchone()
+            if not target or target["is_banned"]:
+                raise HTTPException(status_code=404, detail="Пользователь не найден или заблокирован")
+            now = int(time.time())
+            cur = await db.execute(
+                """INSERT OR IGNORE INTO group_members(group_id,telegram_id,role,joined_at)
+                   VALUES(?,?,'member',?)""",
+                (group_id, target_id, now),
+            )
+            await db.commit()
+        return {
+            "group_id": group_id,
+            "telegram_id": target_id,
+            "joined": cur.rowcount == 1,
+        }
+
+    @router.delete("/api/groups/{group_id}/members/{telegram_id}")
+    async def remove_group_member(
+        group_id: int,
+        telegram_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            actor = await require_group_member(db, group_id, uid)
+            target = await require_group_member(db, group_id, telegram_id)
+            if telegram_id == uid:
+                if target["role"] == "owner":
+                    raise HTTPException(status_code=409, detail="Владелец не может покинуть группу без передачи владения")
+            elif actor["role"] not in ("owner", "admin") or target["role"] == "owner":
+                raise HTTPException(status_code=403, detail="Недостаточно прав для удаления участника")
+            cur = await db.execute(
+                "DELETE FROM group_members WHERE group_id=? AND telegram_id=?",
+                (group_id, telegram_id),
+            )
+            await db.commit()
+        return {"removed": cur.rowcount == 1, "group_id": group_id, "telegram_id": telegram_id}
+
+    @router.post("/api/groups/{group_id}/admins", status_code=201)
+    async def promote_group_admin(
+        group_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            target_id = int(payload.get("telegram_id", 0))
+        except (TypeError, ValueError):
+            target_id = 0
+        if target_id <= 0:
+            raise HTTPException(status_code=400, detail="Некорректный Telegram ID")
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            owner = await require_group_member(db, group_id, uid)
+            if owner["role"] != "owner":
+                raise HTTPException(status_code=403, detail="Назначать администраторов может только владелец")
+            target = await require_group_member(db, group_id, target_id)
+            if target["role"] == "owner":
+                raise HTTPException(status_code=409, detail="Владелец уже обладает полными правами")
+            await db.execute(
+                "UPDATE group_members SET role='admin' WHERE group_id=? AND telegram_id=?",
+                (group_id, target_id),
+            )
+            await db.commit()
+        return {"group_id": group_id, "telegram_id": target_id, "role": "admin"}
+
+    @router.delete("/api/groups/{group_id}/admins/{telegram_id}")
+    async def demote_group_admin(
+        group_id: int,
+        telegram_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            owner = await require_group_member(db, group_id, uid)
+            if owner["role"] != "owner":
+                raise HTTPException(status_code=403, detail="Изменять права может только владелец")
+            cur = await db.execute(
+                "UPDATE group_members SET role='member' WHERE group_id=? AND telegram_id=? AND role='admin'",
+                (group_id, telegram_id),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Администратор группы не найден")
+        return {"group_id": group_id, "telegram_id": telegram_id, "role": "member"}
+
+    @router.get("/api/groups/{group_id}/messages")
+    async def list_group_messages(
+        group_id: int,
+        after_id: int = Query(default=0, ge=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            await require_group_member(db, group_id, uid)
+            db.row_factory = aiosqlite.Row
+            if after_id:
+                cur = await db.execute(
+                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,created_at
+                       FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
+                    (group_id, after_id),
+                )
+            else:
+                cur = await db.execute(
+                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,created_at
+                       FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
+                    (group_id,),
+                )
+            rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        if not after_id:
+            items.reverse()
+        return {"messages": items, "next_after_id": items[-1]["id"] if items else 0}
+
+    @router.post("/api/groups/{group_id}/messages", status_code=201)
+    async def send_group_message(
+        group_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        body = _message_body(payload.get("body", ""))
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await require_group_member(db, group_id, uid)
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM group_messages WHERE sender_telegram_id=? AND created_at>?",
+                (uid, now - 60),
+            )
+            if int((await cur.fetchone())[0]) >= DM_MESSAGES_PER_MINUTE:
+                await db.rollback()
+                raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
+            cur = await db.execute(
+                """INSERT INTO group_messages(group_id,sender_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (group_id, uid, body, now),
+            )
+            message_id = int(cur.lastrowid)
+            await db.commit()
+        return {
+            "id": message_id,
+            "group_id": group_id,
+            "sender_id": uid,
+            "body": body,
+            "created_at": now,
+        }
+
+    # Internal BotFather registry and chat API for bots created inside WaysGram.
+    @router.get("/api/bots")
+    async def list_owned_bots(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        user = await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,name,username,about,description,token_prefix,is_active,created_at,updated_at
+                   FROM bots WHERE owner_telegram_id=? ORDER BY id DESC LIMIT 100""",
+                (int(user["telegram_id"]),),
+            )
+            rows = await cur.fetchall()
+        return {"bots": [dict(row) for row in rows]}
+
+    @router.post("/api/bots", status_code=201)
+    async def create_owned_bot(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        name = payload.get("name")
+        username = str(payload.get("username") or "").strip().lstrip("@").lower()
+        about = str(payload.get("about") or "").strip()
+        description = str(payload.get("description") or "").strip()
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64:
+            raise HTTPException(status_code=400, detail="Имя бота должно содержать 1–64 символа")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{2,28}_bot", username):
+            raise HTTPException(status_code=400, detail="Username бота должен иметь формат example_bot")
+        if len(about) > 120 or len(description) > 512:
+            raise HTTPException(status_code=400, detail="Описание бота слишком длинное")
+        uid = int(user["telegram_id"])
+        now = int(time.time())
+        token = "wgbot_" + secrets.token_urlsafe(32)
+        try:
+            async with aiosqlite.connect(db_path()) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM bots WHERE owner_telegram_id=? AND is_active=1",
+                    (uid,),
+                )
+                if int((await cur.fetchone())[0]) >= 20:
+                    await db.rollback()
+                    raise HTTPException(status_code=409, detail="Можно создать не более 20 активных ботов")
+                cur = await db.execute(
+                    """INSERT INTO bots
+                       (owner_telegram_id,name,username,about,description,token_hash,token_prefix,
+                        is_active,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,1,?,?)""",
+                    (
+                        uid,name.strip(),username,about,description,_token_hash(token),
+                        token[:12],now,now,
+                    ),
+                )
+                bot_id = int(cur.lastrowid)
+                await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="Username бота уже занят") from exc
+        return {
+            "id": bot_id,
+            "name": name.strip(),
+            "username": username,
+            "token": token,
+            "token_notice": "Токен показывается только при создании или сбросе. Сохрани его в защищённом месте.",
+            "is_active": True,
+            "created_at": now,
+        }
+
+    @router.get("/api/bots/by-username/{username}")
+    async def get_public_bot(
+        username: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        await current_user(authorization)
+        key = username.strip().lstrip("@")
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,name,username,about,description,created_at
+                   FROM bots WHERE username=? COLLATE NOCASE AND is_active=1""",
+                (key,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Бот не найден")
+        return dict(row)
+
+    @router.get("/api/bots/{bot_id}")
+    async def get_owned_bot(
+        bot_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,name,username,about,description,token_prefix,is_active,created_at,updated_at
+                   FROM bots WHERE id=? AND owner_telegram_id=?""",
+                (bot_id,int(user["telegram_id"])),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Бот не найден")
+        return dict(row)
+
+    @router.patch("/api/bots/{bot_id}")
+    async def update_owned_bot(
+        bot_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        allowed = {}
+        if "name" in payload:
+            name = payload["name"]
+            if not isinstance(name, str) or not 1 <= len(name.strip()) <= 64:
+                raise HTTPException(status_code=400, detail="Имя бота должно содержать 1–64 символа")
+            allowed["name"] = name.strip()
+        if "about" in payload:
+            about = str(payload["about"]).strip()
+            if len(about) > 120:
+                raise HTTPException(status_code=400, detail="Краткое описание слишком длинное")
+            allowed["about"] = about
+        if "description" in payload:
+            description = str(payload["description"]).strip()
+            if len(description) > 512:
+                raise HTTPException(status_code=400, detail="Описание слишком длинное")
+            allowed["description"] = description
+        if not allowed:
+            raise HTTPException(status_code=400, detail="Нет полей для изменения")
+        fields = ",".join(f"{key}=?" for key in allowed)
+        values = list(allowed.values()) + [int(time.time()),bot_id,uid]
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                f"UPDATE bots SET {fields},updated_at=? WHERE id=? AND owner_telegram_id=?",
+                values,
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Бот не найден")
+        return {"updated": True, "bot_id": bot_id}
+
+    @router.delete("/api/bots/{bot_id}")
+    async def revoke_owned_bot(
+        bot_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "UPDATE bots SET is_active=0,updated_at=? WHERE id=? AND owner_telegram_id=?",
+                (int(time.time()),bot_id,int(user["telegram_id"])),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Бот не найден")
+        return {"revoked": True, "bot_id": bot_id}
+
+    @router.post("/api/bots/{bot_id}/token/reset")
+    async def reset_owned_bot_token(
+        bot_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        token = "wgbot_" + secrets.token_urlsafe(32)
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                """UPDATE bots SET token_hash=?,token_prefix=?,updated_at=?
+                   WHERE id=? AND owner_telegram_id=? AND is_active=1""",
+                (_token_hash(token),token[:12],int(time.time()),bot_id,int(user["telegram_id"])),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Активный бот не найден")
+        return {"bot_id": bot_id, "token": token}
+
+    @router.get("/api/bots/{bot_id}/commands")
+    async def list_bot_commands(
+        bot_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT 1 FROM bots WHERE id=? AND owner_telegram_id=?",
+                (bot_id,int(user["telegram_id"])),
+            )
+            if not await cur.fetchone():
+                raise HTTPException(status_code=404, detail="Бот не найден")
+            cur = await db.execute(
+                "SELECT command,description FROM bot_commands WHERE bot_id=? ORDER BY command",
+                (bot_id,),
+            )
+            rows = await cur.fetchall()
+        return {"commands": [dict(row) for row in rows]}
+
+    @router.put("/api/bots/{bot_id}/commands")
+    async def replace_bot_commands(
+        bot_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        commands = payload.get("commands")
+        if not isinstance(commands, list) or len(commands) > 100:
+            raise HTTPException(status_code=400, detail="Передайте массив из не более чем 100 команд")
+        normalized = []
+        seen = set()
+        for item in commands:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail="Некорректная команда")
+            command = str(item.get("command") or "").strip().lower().lstrip("/")
+            description = str(item.get("description") or "").strip()
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", command) or len(description) > 256:
+                raise HTTPException(status_code=400, detail="Проверьте имя или описание команды")
+            if command in seen:
+                raise HTTPException(status_code=400, detail="Команды должны быть уникальными")
+            seen.add(command)
+            normalized.append((bot_id,command,description))
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM bots WHERE id=? AND owner_telegram_id=? AND is_active=1",
+                (bot_id,int(user["telegram_id"])),
+            )
+            if not await cur.fetchone():
+                raise HTTPException(status_code=404, detail="Активный бот не найден")
+            await db.execute("DELETE FROM bot_commands WHERE bot_id=?",(bot_id,))
+            if normalized:
+                await db.executemany(
+                    "INSERT INTO bot_commands(bot_id,command,description) VALUES(?,?,?)",
+                    normalized,
+                )
+            await db.commit()
+        return {"bot_id": bot_id, "commands": [{"command":x[1],"description":x[2]} for x in normalized]}
+
+    @router.post("/api/bots/{bot_id}/messages", status_code=201)
+    async def send_message_to_bot(
+        bot_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        body = _message_body(payload.get("body", ""))
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id FROM bots WHERE id=? AND is_active=1",
+                (bot_id,),
+            )
+            if not await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Бот не найден")
+            await db.execute(
+                """INSERT INTO bot_chats(bot_id,user_telegram_id,created_at,last_activity)
+                   VALUES(?,?,?,?) ON CONFLICT(bot_id,user_telegram_id)
+                   DO UPDATE SET last_activity=excluded.last_activity""",
+                (bot_id,uid,now,now),
+            )
+            cur = await db.execute(
+                """INSERT INTO bot_messages(bot_id,user_telegram_id,sender_type,body,created_at)
+                   VALUES(?,?,'user',?,?)""",
+                (bot_id,uid,body,now),
+            )
+            message_id = int(cur.lastrowid)
+            await db.commit()
+        return {"id":message_id,"bot_id":bot_id,"sender":"user","body":body,"created_at":now}
+
+    @router.get("/api/bots/{bot_id}/messages")
+    async def list_bot_chat_messages(
+        bot_id: int,
+        after_id: int = Query(default=0, ge=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT 1 FROM bot_chats WHERE bot_id=? AND user_telegram_id=?",
+                (bot_id,uid),
+            )
+            if not await cur.fetchone():
+                raise HTTPException(status_code=404, detail="Чат с ботом ещё не создан")
+            if after_id:
+                cur = await db.execute(
+                    """SELECT id,bot_id,user_telegram_id,sender_type AS sender,body,created_at
+                       FROM bot_messages WHERE bot_id=? AND user_telegram_id=? AND id>?
+                       ORDER BY id ASC LIMIT 100""",
+                    (bot_id,uid,after_id),
+                )
+            else:
+                cur = await db.execute(
+                    """SELECT id,bot_id,user_telegram_id,sender_type AS sender,body,created_at
+                       FROM bot_messages WHERE bot_id=? AND user_telegram_id=?
+                       ORDER BY id DESC LIMIT 100""",
+                    (bot_id,uid),
+                )
+            rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        if not after_id:
+            items.reverse()
+        return {"messages":items,"next_after_id":items[-1]["id"] if items else 0}
+
+    @router.get("/api/bot-api/getUpdates")
+    async def bot_get_updates(
+        offset: int = Query(default=0, ge=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        bot = await current_bot(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,user_telegram_id AS chat_id,body AS text,created_at
+                   FROM bot_messages
+                   WHERE bot_id=? AND sender_type='user' AND id>?
+                   ORDER BY id ASC LIMIT 100""",
+                (int(bot["id"]),offset),
+            )
+            rows = await cur.fetchall()
+        return {"ok":True,"result":[dict(row) for row in rows]}
+
+    @router.post("/api/bot-api/sendMessage")
+    async def bot_send_message(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        bot = await current_bot(authorization)
+        try:
+            chat_id = int(payload.get("chat_id",0))
+        except (TypeError,ValueError):
+            chat_id = 0
+        body = _message_body(payload.get("text",""))
+        if chat_id <= 0:
+            raise HTTPException(status_code=400, detail="Некорректный chat_id")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT 1 FROM bot_chats WHERE bot_id=? AND user_telegram_id=?",
+                (int(bot["id"]),chat_id),
+            )
+            if not await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Пользователь ещё не запускал этого бота")
+            cur = await db.execute(
+                """INSERT INTO bot_messages(bot_id,user_telegram_id,sender_type,body,created_at)
+                   VALUES(?,?,'bot',?,?)""",
+                (int(bot["id"]),chat_id,body,now),
+            )
+            message_id = int(cur.lastrowid)
+            await db.execute(
+                "UPDATE bot_chats SET last_activity=? WHERE bot_id=? AND user_telegram_id=?",
+                (now,int(bot["id"]),chat_id),
+            )
+            await db.commit()
+        return {
+            "ok":True,
+            "result":{"message_id":message_id,"chat":{"id":chat_id},"text":body},
+        }
 
     return router
