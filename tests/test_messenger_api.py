@@ -16,11 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import bot as bot_module
+import messenger_api
 from messenger_api import build_messenger_router, init_messenger_storage
 
 
 class FakeBot:
     def __init__(self) -> None:
+        self.token = "test-telegram-bot-token"
         self.messages: list[tuple[int, str]] = []
 
     async def send_message(self, chat_id: int, text: str) -> None:
@@ -663,6 +665,106 @@ def test_internal_botfather_create_commands_and_message_runtime(api_env) -> None
             assert revoked.status_code == 200
             revoked_token = await client.get("/api/bot-api/getUpdates", headers=new_headers)
             assert revoked_token.status_code == 401
+
+    run(scenario())
+
+
+def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> None:
+    path, _auth_store, fake_bot, app = api_env
+    add_account(api_env, 87001, "telegram_gift_user")
+    add_session(path, 87001, "telegram-gift-session")
+
+    remote_gifts = [
+        {
+            "id": "gift_123",
+            "sticker": {
+                "file_id": "telegram-file-id",
+                "file_unique_id": "telegram-unique-id",
+                "type": "regular",
+                "width": 512,
+                "height": 512,
+                "is_animated": False,
+                "is_video": False,
+                "emoji": "🎁",
+                "set_name": "TelegramGifts",
+                "mime_type": "image/webp",
+            },
+            "star_count": 25,
+            "upgrade_star_count": 100,
+            "is_premium": True,
+            "has_colors": True,
+            "total_count": 5000,
+            "remaining_count": 4500,
+            "personal_total_count": 100,
+            "personal_remaining_count": 90,
+            "unique_gift_variant_count": 12,
+            "background": {"center_color": 123, "edge_color": 456, "text_color": 789},
+        }
+    ]
+    fetch_calls: list[str] = []
+
+    async def fake_fetch_telegram_gifts(bot):
+        fetch_calls.append(bot.token)
+        return remote_gifts
+
+    async def fake_fetch_telegram_sticker(bot, file_id: str, preferred_mime: str = ""):
+        assert bot.token == "test-telegram-bot-token"
+        assert file_id == "telegram-file-id"
+        assert preferred_mime == "image/webp"
+        return b"fake-webp-sticker", "image/webp"
+
+    monkeypatch.setattr(messenger_api, "fetch_telegram_gifts", fake_fetch_telegram_gifts)
+    monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_fetch_telegram_sticker)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = {"Authorization": "Bearer telegram-gift-session"}
+            catalog = await client.get("/api/telegram/gifts", headers=auth)
+            assert catalog.status_code == 200
+            payload = catalog.json()
+            assert payload["source"] == "telegram_bot_api"
+            assert payload["scope"] == "gifts_available_to_authbot"
+            assert payload["currency"] == "telegram_stars"
+            assert payload["count"] == 1
+
+            gift = payload["gifts"][0]
+            assert gift["id"] == "gift_123"
+            assert gift["title"] == "🎁"
+            assert gift["star_count"] == 25
+            assert gift["upgrade_star_count"] == 100
+            assert gift["is_premium"] is True
+            assert gift["is_limited"] is True
+            assert gift["remaining_count"] == 4500
+            assert gift["sticker"]["mime_type"] == "image/webp"
+            assert gift["sticker"]["url"] == "/api/telegram/gifts/gift_123/sticker"
+
+            sticker = await client.get(gift["sticker"]["url"], headers=auth)
+            assert sticker.status_code == 200
+            assert sticker.content == b"fake-webp-sticker"
+            assert sticker.headers["content-type"].startswith("image/webp")
+            assert "private" in sticker.headers["cache-control"]
+
+            # A second request inside the one-minute cache interval must not call Telegram again.
+            second = await client.get("/api/telegram/gifts", headers=auth)
+            assert second.status_code == 200
+            assert len(fetch_calls) == 1
+
+            with sqlite3.connect(path) as db:
+                row = db.execute(
+                    "SELECT gift_id,star_count,sticker_file_id,is_available "
+                    "FROM telegram_gift_catalog"
+                ).fetchone()
+                sync_count = db.execute(
+                    "SELECT gift_count FROM telegram_gift_sync_state WHERE id=1"
+                ).fetchone()[0]
+            assert row == ("gift_123", 25, "telegram-file-id", 1)
+            assert sync_count == 1
+
+            # Telegram gift records remain a separate catalog and are not purchasable
+            # through the internal Gram gift endpoint.
+            internal_catalog = await client.get("/api/gifts", headers=auth)
+            assert internal_catalog.status_code == 200
+            assert internal_catalog.json()["gifts"] == []
 
     run(scenario())
 
