@@ -131,6 +131,20 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 Каждый пользователь может иметь до 20 активных ботов. Токены хранятся в базе только в виде SHA-256 хеша. Это внутренняя система WaysGram: созданные здесь боты не становятся ботами Telegram и не получают доступ к Telegram Bot API.
 
+### Каталог официальных подарков Telegram
+
+- `GET /api/telegram/gifts` — каталог подарков, доступных для отправки настроенному `@AuthWaysGram_bot`.
+- `GET /api/telegram/gifts/{gift_id}/sticker` — получить файл стикера подарка через серверный proxy.
+- `POST /internal/v1/telegram/gifts/sync` — принудительно обновить каталог; требуется `X-Internal-Token`.
+
+Источник — официальный метод Telegram Bot API `getAvailableGifts`. Сервер сохраняет ID подарка, стоимость в **Telegram Stars**, лимиты, upgrade-цену, premium/color-флаги, метаданные стикера и сведения о фоне. Каталог автоматически обновляется при запросе, если предыдущая синхронизация старше 60 секунд; первая загрузка также выполняется при старте AuthBot. При временной ошибке Telegram API отдаётся последний сохранённый снимок каталога.
+
+Файлы стикеров загружаются через `getFile` и проксируются AuthBot: токен Telegram-бота и исходный `file_id` не передаются Android-клиенту. Для анимированных и видео-стикеров сохраняются тип и MIME type.
+
+**Границы источника:** `getAvailableGifts` возвращает подарки, доступные именно боту для отправки. Это не полная MTProto-выгрузка `payments.getStarGifts`: в ней могут отсутствовать MTProto-only данные, отдельные аукционные/коллекционные карточки, resale-лоты и расширенные атрибуты. Полный MTProto-каталог потребует отдельного Telegram API ID/hash и bot-authenticated MTProto-клиента. Telegram Stars не конвертируются автоматически в внутренние Gram или Stars WaysGram.
+
+Каталог Telegram хранится отдельно от внутреннего `gift_catalog`: внутренние покупки и инвентарь WaysGram продолжают использовать собственные Gram и собственные серийные номера.
+
 ### Баланс и подарки
 
 - `GET /api/me/wallet`, `GET /api/me/wallet/transactions` — балансы и история операций.
@@ -155,6 +169,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 - `POST /internal/v1/number/resolve` — проверить назначение виртуального номера.
 - `POST /internal/v1/auth-code/request` — создать и доставить одноразовый код через Telegram-бота.
 - `POST /internal/v1/auth-code/verify` — проверить и погасить код.
+- `POST /internal/v1/telegram/gifts/sync` — обновить снимок каталога Telegram через Bot API.
 
 `GET /health` — проверка работоспособности. Клиентские маршруты `/api/...` используют пользовательские Bearer-сессии, а не внутренний секрет.
 
