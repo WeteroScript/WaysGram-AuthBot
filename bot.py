@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
-from messenger_api import build_messenger_router, init_messenger_storage
+from messenger_api import build_messenger_router, init_messenger_storage, sync_telegram_gifts
 
 # All secrets are read only from hosting environment variables.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -1696,6 +1696,25 @@ async def health() -> dict[str, str]:
     return {"status": "online", "service": "waysgram-authbot"}
 
 
+@app.post("/internal/v1/telegram/gifts/sync")
+async def sync_telegram_gifts_internal(
+    x_internal_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_internal_token(x_internal_token)
+    if bot is None:
+        raise HTTPException(status_code=503, detail="Telegram bot is not ready")
+    try:
+        result = await sync_telegram_gifts(DATABASE_PATH, bot)
+    except Exception as exc:
+        log.warning("Telegram gift catalog sync failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось синхронизировать каталог подарков Telegram",
+        ) from exc
+    log.info("Synchronized %s Telegram gifts", result["gift_count"])
+    return result
+
+
 @app.post("/internal/v1/number/resolve")
 async def resolve_number(
     payload: NumberResolveRequest,
@@ -1776,6 +1795,12 @@ async def main() -> None:
     await init_admin_storage()
     await init_messenger_storage(DATABASE_PATH)
     bot = Bot(token=BOT_TOKEN)
+    try:
+        sync_result = await sync_telegram_gifts(DATABASE_PATH, bot)
+        log.info("Loaded %s Telegram gifts into catalog", sync_result["gift_count"])
+    except Exception as exc:
+        # Keep login and the rest of the API online if Telegram's catalog is temporarily unavailable.
+        log.warning("Initial Telegram gift catalog sync failed (%s)", type(exc).__name__)
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
 
