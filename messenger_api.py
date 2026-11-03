@@ -908,6 +908,7 @@ def build_messenger_router(
                 "session_refresh", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
                 "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages",
+                "image_uploads", "message_media", "private_media_downloads",
                 "botfather", "bot_commands", "bot_runtime", "stars", "grams",
             ],
         }
