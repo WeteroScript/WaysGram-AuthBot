@@ -233,6 +233,14 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
             assert created.status_code == 201
             channel_id = created.json()["id"]
 
+            initial_admins = await client.get(
+                f"/api/channels/{channel_id}/admins",
+                headers=sender,
+            )
+            assert initial_admins.status_code == 200
+            assert initial_admins.json()["my_role"] == "owner"
+            assert initial_admins.json()["admins"] == []
+
             channel_headers = {**sender, "Idempotency-Key": "channel-post-order-0001"}
             post = await client.post(
                 f"/api/channels/{channel_id}/messages",
@@ -262,6 +270,15 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
             )
             assert appointed.status_code == 201
 
+            listed_admins = await client.get(
+                f"/api/channels/{channel_id}/admins",
+                headers=recipient,
+            )
+            assert listed_admins.status_code == 200
+            assert listed_admins.json()["my_role"] == "admin"
+            assert listed_admins.json()["admins"][0]["telegram_id"] == 82002
+            assert listed_admins.json()["admins"][0]["username"] == "recipient"
+
             admin_post = await client.post(
                 f"/api/channels/{channel_id}/messages",
                 headers=recipient,
@@ -281,6 +298,13 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
                 headers=sender,
             )
             assert removed.status_code == 200
+
+            admins_after_removal = await client.get(
+                f"/api/channels/{channel_id}/admins",
+                headers=sender,
+            )
+            assert admins_after_removal.status_code == 200
+            assert admins_after_removal.json()["admins"] == []
 
             forbidden_again = await client.post(
                 f"/api/channels/{channel_id}/messages",
