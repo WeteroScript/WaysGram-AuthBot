@@ -99,6 +99,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 - `GET /api/conversations` — список диалогов с последним сообщением.
 - `GET /api/messages?with={telegram_id}` — последние сообщения; `after_id` — новые после указанного ID; `before_id` — предыдущая страница истории. Одновременно указывается только один курсор.
+  Для активного диалога можно добавить `after_id` и `wait_seconds=20`: API подождёт новые сообщения до 20 секунд и вернёт их сразу после появления. Для обычной загрузки истории `wait_seconds` не требуется.
 - `POST /api/messages` — JSON `{"recipient_id":123,"body":"Текст"}`; отправить личное сообщение. Поддерживает `Idempotency-Key` для безопасного повтора после сетевого сбоя.
 - `GET /api/channels`, `GET /api/channels/{id}` — список и карточка канала.
 - `POST /api/channels` — создать канал; JSON содержит `username` и `title`.
