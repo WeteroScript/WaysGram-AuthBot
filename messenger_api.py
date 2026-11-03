@@ -1864,27 +1864,34 @@ def build_messenger_router(
     async def list_channel_messages(
         channel_id: int,
         after_id: int = Query(default=0, ge=0),
+        wait_seconds: int = Query(default=0, ge=0, le=20),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         await current_user(authorization)
-        await channel_row(channel_id)
-        async with aiosqlite.connect(db_path()) as db:
-            db.row_factory = aiosqlite.Row
-            if after_id:
-                cur = await db.execute(
-                    """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
-                       FROM channel_messages WHERE channel_id=? AND id>?
-                       ORDER BY id ASC LIMIT 100""",
-                    (channel_id, after_id),
-                )
-            else:
-                cur = await db.execute(
-                    """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
-                       FROM channel_messages WHERE channel_id=?
-                       ORDER BY id DESC LIMIT 100""",
-                    (channel_id,),
-                )
-            rows = await cur.fetchall()
+        deadline = time.monotonic() + (wait_seconds if after_id else 0)
+        rows = []
+        while True:
+            await channel_row(channel_id)
+            async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
+                if after_id:
+                    cur = await db.execute(
+                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
+                           FROM channel_messages WHERE channel_id=? AND id>?
+                           ORDER BY id ASC LIMIT 100""",
+                        (channel_id, after_id),
+                    )
+                else:
+                    cur = await db.execute(
+                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
+                           FROM channel_messages WHERE channel_id=?
+                           ORDER BY id DESC LIMIT 100""",
+                        (channel_id,),
+                    )
+                rows = await cur.fetchall()
+            if rows or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
@@ -2009,6 +2016,7 @@ def build_messenger_router(
         peer: int = Query(alias="with", gt=0),
         after_id: int = Query(default=0, ge=0),
         before_id: int = Query(default=0, ge=0),
+        wait_seconds: int = Query(default=0, ge=0, le=20),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
@@ -2016,34 +2024,43 @@ def build_messenger_router(
         if after_id and before_id:
             raise HTTPException(status_code=400, detail="Используйте только один курсор: after_id или before_id")
         async with aiosqlite.connect(db_path()) as db:
-            db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (peer,))
             if not await cur.fetchone():
                 raise HTTPException(status_code=404, detail="Собеседник не найден")
-            base = """
-                SELECT id,sender_telegram_id AS sender_id,
-                       recipient_telegram_id AS recipient_id,body,media_id,created_at
-                FROM messages WHERE
-                ((sender_telegram_id=? AND recipient_telegram_id=?) OR
-                 (sender_telegram_id=? AND recipient_telegram_id=?))
-            """
-            params: tuple[Any, ...] = (uid, peer, peer, uid)
-            if after_id:
-                cur = await db.execute(
-                    base + " AND id>? ORDER BY id ASC LIMIT 100",
-                    params + (after_id,),
-                )
-            elif before_id:
-                cur = await db.execute(
-                    base + " AND id<? ORDER BY id DESC LIMIT 100",
-                    params + (before_id,),
-                )
-            else:
-                cur = await db.execute(
-                    base + " ORDER BY id DESC LIMIT 100",
-                    params,
-                )
-            rows = await cur.fetchall()
+
+        params: tuple[Any, ...] = (uid, peer, peer, uid)
+        base = """
+            SELECT id,sender_telegram_id AS sender_id,
+                   recipient_telegram_id AS recipient_id,body,media_id,created_at
+            FROM messages WHERE
+            ((sender_telegram_id=? AND recipient_telegram_id=?) OR
+             (sender_telegram_id=? AND recipient_telegram_id=?))
+        """
+        deadline = time.monotonic() + (wait_seconds if after_id and not before_id else 0)
+        rows = []
+        while True:
+            async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
+                if after_id:
+                    cur = await db.execute(
+                        base + " AND id>? ORDER BY id ASC LIMIT 100",
+                        params + (after_id,),
+                    )
+                elif before_id:
+                    cur = await db.execute(
+                        base + " AND id<? ORDER BY id DESC LIMIT 100",
+                        params + (before_id,),
+                    )
+                else:
+                    cur = await db.execute(
+                        base + " ORDER BY id DESC LIMIT 100",
+                        params,
+                    )
+                rows = await cur.fetchall()
+            if rows or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
@@ -2370,26 +2387,33 @@ def build_messenger_router(
     async def list_group_messages(
         group_id: int,
         after_id: int = Query(default=0, ge=0),
+        wait_seconds: int = Query(default=0, ge=0, le=20),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        async with aiosqlite.connect(db_path()) as db:
-            await require_group_member(db, group_id, uid)
-            db.row_factory = aiosqlite.Row
-            if after_id:
-                cur = await db.execute(
-                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
-                       FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
-                    (group_id, after_id),
-                )
-            else:
-                cur = await db.execute(
-                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
-                       FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
-                    (group_id,),
-                )
-            rows = await cur.fetchall()
+        deadline = time.monotonic() + (wait_seconds if after_id else 0)
+        rows = []
+        while True:
+            async with aiosqlite.connect(db_path()) as db:
+                await require_group_member(db, group_id, uid)
+                db.row_factory = aiosqlite.Row
+                if after_id:
+                    cur = await db.execute(
+                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
+                           FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
+                        (group_id, after_id),
+                    )
+                else:
+                    cur = await db.execute(
+                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
+                           FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
+                        (group_id,),
+                    )
+                rows = await cur.fetchall()
+            if rows or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
@@ -2709,33 +2733,40 @@ def build_messenger_router(
     async def list_bot_chat_messages(
         bot_id: int,
         after_id: int = Query(default=0, ge=0),
+        wait_seconds: int = Query(default=0, ge=0, le=20),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        async with aiosqlite.connect(db_path()) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT 1 FROM bot_chats WHERE bot_id=? AND user_telegram_id=?",
-                (bot_id,uid),
-            )
-            if not await cur.fetchone():
-                raise HTTPException(status_code=404, detail="Чат с ботом ещё не создан")
-            if after_id:
+        deadline = time.monotonic() + (wait_seconds if after_id else 0)
+        rows = []
+        while True:
+            async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
                 cur = await db.execute(
-                    """SELECT id,bot_id,user_telegram_id,sender_type AS sender,body,created_at
-                       FROM bot_messages WHERE bot_id=? AND user_telegram_id=? AND id>?
-                       ORDER BY id ASC LIMIT 100""",
-                    (bot_id,uid,after_id),
-                )
-            else:
-                cur = await db.execute(
-                    """SELECT id,bot_id,user_telegram_id,sender_type AS sender,body,created_at
-                       FROM bot_messages WHERE bot_id=? AND user_telegram_id=?
-                       ORDER BY id DESC LIMIT 100""",
+                    "SELECT 1 FROM bot_chats WHERE bot_id=? AND user_telegram_id=?",
                     (bot_id,uid),
                 )
-            rows = await cur.fetchall()
+                if not await cur.fetchone():
+                    raise HTTPException(status_code=404, detail="Чат с ботом ещё не создан")
+                if after_id:
+                    cur = await db.execute(
+                        """SELECT id,bot_id,user_telegram_id,sender_type AS sender,body,created_at
+                           FROM bot_messages WHERE bot_id=? AND user_telegram_id=? AND id>?
+                           ORDER BY id ASC LIMIT 100""",
+                        (bot_id,uid,after_id),
+                    )
+                else:
+                    cur = await db.execute(
+                        """SELECT id,bot_id,user_telegram_id,sender_type AS sender,body,created_at
+                           FROM bot_messages WHERE bot_id=? AND user_telegram_id=?
+                           ORDER BY id DESC LIMIT 100""",
+                        (bot_id,uid),
+                    )
+                rows = await cur.fetchall()
+            if rows or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
