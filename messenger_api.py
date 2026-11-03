@@ -2009,6 +2009,7 @@ def build_messenger_router(
             members = await cur.fetchall()
         result = dict(group)
         result["my_role"] = membership["role"]
+        result["my_telegram_id"] = uid
         result["members"] = [dict(row) for row in members]
         return result
 
