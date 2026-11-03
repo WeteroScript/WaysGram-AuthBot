@@ -396,7 +396,7 @@ def test_image_upload_direct_message_and_private_download(api_env) -> None:
             assert sent.json()["body"] == "Изображение"
             assert sent.json()["media_id"] == media["id"]
 
-            history = await client.get("/api/messages?with=89002", headers=recipient)
+            history = await client.get("/api/messages?with=89001", headers=recipient)
             assert history.status_code == 200
             assert history.json()["messages"][0]["media_id"] == media["id"]
 
