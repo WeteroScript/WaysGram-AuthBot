@@ -143,6 +143,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 - `POST /api/bots/{id}/token/reset` — перевыпустить токен; старый токен отзывается.
 - `GET /api/bots/{id}/commands` и `PUT /api/bots/{id}/commands` — настройка списка команд.
 - `POST /api/bots/{id}/messages` и `GET /api/bots/{id}/messages` — чат пользователя с внутренним ботом.
+  История с `after_id` поддерживает `wait_seconds=20` для ожидания ответов без частых пустых запросов.
 - `GET /api/bot-api/getUpdates?offset=...` — получить входящие сообщения по токену бота.
 - `POST /api/bot-api/sendMessage` — отправить ответ пользователю по токену бота.
 
