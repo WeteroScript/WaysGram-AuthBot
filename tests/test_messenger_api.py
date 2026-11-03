@@ -725,6 +725,89 @@ def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> 
     run(scenario())
 
 
+def test_group_and_channel_long_poll_return_incremental_messages(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89301, "timeline_owner")
+    add_account(api_env, 89302, "timeline_member")
+    add_session(path, 89301, "timeline-owner-session")
+    add_session(path, 89302, "timeline-member-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer timeline-owner-session"}
+            member = {"Authorization": "Bearer timeline-member-session"}
+
+            group = await client.post(
+                "/api/groups",
+                headers=owner,
+                json={"title": "Long poll group", "username": "longpoll_group"},
+            )
+            assert group.status_code == 201
+            group_id = group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=owner,
+                json={"telegram_id": 89302},
+            )
+            assert joined.status_code == 201
+
+            group_initial = await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=owner,
+                json={"body": "group initial"},
+            )
+            assert group_initial.status_code == 201
+            group_pending = asyncio.create_task(
+                client.get(
+                    f"/api/groups/{group_id}/messages?after_id={group_initial.json()['id']}&wait_seconds=5",
+                    headers=member,
+                )
+            )
+            await asyncio.sleep(0.2)
+            group_next = await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=owner,
+                json={"body": "group arrived"},
+            )
+            group_response = await asyncio.wait_for(group_pending, timeout=3)
+            assert group_response.status_code == 200
+            assert [item["body"] for item in group_response.json()["messages"]] == ["group arrived"]
+            assert group_next.status_code == 201
+
+            channel = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"username": "longpoll_channel", "title": "Long poll channel"},
+            )
+            assert channel.status_code == 201
+            channel_id = channel.json()["id"]
+
+            channel_initial = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+                json={"body": "channel initial"},
+            )
+            assert channel_initial.status_code == 201
+            channel_pending = asyncio.create_task(
+                client.get(
+                    f"/api/channels/{channel_id}/messages?after_id={channel_initial.json()['id']}&wait_seconds=5",
+                    headers=member,
+                )
+            )
+            await asyncio.sleep(0.2)
+            channel_next = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+                json={"body": "channel arrived"},
+            )
+            channel_response = await asyncio.wait_for(channel_pending, timeout=3)
+            assert channel_response.status_code == 200
+            assert [item["body"] for item in channel_response.json()["messages"]] == ["channel arrived"]
+            assert channel_next.status_code == 201
+
+    run(scenario())
+
+
 def test_group_creation_roles_membership_and_messages(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 85001, "group_owner")
