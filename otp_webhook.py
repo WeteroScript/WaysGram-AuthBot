@@ -119,7 +119,18 @@ def parse_telesrv_delivery(
 
     number = payload.get("recipient")
     code = payload.get("code")
-    if not isinstance(number, str) or not PHONE_RE.fullmatch(number):
+    if not isinstance(number, str):
+        raise OtpWebhookError(
+            "Recipient is not an assigned WaysGram virtual number",
+            status_code=422,
+            error_code="RECIPIENT_INVALID",
+        )
+    # telesrv normalizes phone numbers to digits before calling the delivery
+    # provider (for example, 15550009301). AuthBot stores the same virtual
+    # number in +1XXXXXXXXXX form, so canonicalize both representations.
+    if re.fullmatch(r"1[0-9]{10}", number):
+        number = "+" + number
+    elif not PHONE_RE.fullmatch(number):
         raise OtpWebhookError(
             "Recipient is not an assigned WaysGram virtual number",
             status_code=422,
