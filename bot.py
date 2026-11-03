@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import random
 import re
 import secrets
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +26,8 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
@@ -35,6 +40,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8888957702"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/waysgram_authbot.sqlite3"))
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 OTP_FERNET_KEY = os.getenv("OTP_FERNET_KEY", "").strip()
+TELESRV_OTP_WEBHOOK_SECRET = os.getenv("TELESRV_OTP_WEBHOOK_SECRET", "").strip()
 INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "0.0.0.0")
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT") or os.getenv("PORT") or "8081")
 try:
@@ -167,6 +173,16 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_auth_codes_number_expiry
                     ON auth_codes(number, expires_at DESC);
+                CREATE TABLE IF NOT EXISTS telesrv_otp_deliveries (
+                    delivery_id TEXT PRIMARY KEY,
+                    payload_sha256 TEXT NOT NULL,
+                    number TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    telegram_message_id INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 """
             )
             cur = await db.execute("PRAGMA table_info(users)")
@@ -315,6 +331,87 @@ class Store:
             )
             await db.commit()
             return True
+
+    async def save_telesrv_code(
+        self,
+        number: str,
+        code: str,
+        expires_at: int,
+        delivery_id: str,
+        payload_sha256: str,
+    ) -> tuple[str, int]:
+        """Persist a signed MTProto-server OTP and an idempotent delivery receipt.
+
+        Returns (status, telegram_message_id). Status is one of stored,
+        delivered, conflict, expired, unknown_number, or rate_limited.
+        """
+        now = int(time.time())
+        encrypted_code = self._encrypt_code(code)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT payload_sha256,status,expires_at,telegram_message_id
+                   FROM telesrv_otp_deliveries WHERE delivery_id=?""",
+                (delivery_id,),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                saved_hash, status, saved_expiry, message_id = existing
+                if not secrets.compare_digest(str(saved_hash), payload_sha256):
+                    await db.rollback()
+                    return "conflict", 0
+                if int(saved_expiry) <= now:
+                    await db.rollback()
+                    return "expired", int(message_id)
+                await db.commit()
+                return str(status), int(message_id)
+
+            cur = await db.execute(
+                "SELECT last_code_requested_at FROM numbers WHERE number=?",
+                (number,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return "unknown_number", 0
+            if now - int(row[0]) < 30:
+                await db.rollback()
+                return "rate_limited", 0
+            if expires_at <= now or expires_at - now > 900:
+                await db.rollback()
+                return "expired", 0
+
+            await db.execute(
+                "UPDATE numbers SET last_code_requested_at=? WHERE number=?",
+                (now, number),
+            )
+            await db.execute("DELETE FROM auth_codes WHERE number=?", (number,))
+            await db.execute(
+                """INSERT INTO auth_codes
+                   (number,code,expires_at,attempts,encrypted,created_at)
+                   VALUES(?,?,?,0,1,?)""",
+                (number, encrypted_code, expires_at, now),
+            )
+            await db.execute(
+                """INSERT INTO telesrv_otp_deliveries
+                   (delivery_id,payload_sha256,number,expires_at,status,
+                    telegram_message_id,created_at,updated_at)
+                   VALUES(?,?,?,?, 'stored',0,?,?)""",
+                (delivery_id, payload_sha256, number, expires_at, now, now),
+            )
+            await db.commit()
+            return "stored", 0
+
+    async def mark_telesrv_delivery_sent(self, delivery_id: str, message_id: int) -> None:
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE telesrv_otp_deliveries
+                   SET status='delivered',telegram_message_id=?,updated_at=?
+                   WHERE delivery_id=? AND status='stored'""",
+                (max(0, int(message_id)), now, delivery_id),
+            )
+            await db.commit()
 
     async def latest_code(self, number: str) -> tuple[str, int] | None:
         now = int(time.time())
@@ -1789,6 +1886,142 @@ async def verify_auth_code(
     if not owner or not owner.get("verified") or await account_is_banned(int(owner["telegram_id"])):
         return {"valid": False}
     return {"valid": await store.verify_code(payload.number, payload.code)}
+
+
+def _telesrv_webhook_error(status_code: int, error_code: str, retryable: bool) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"accepted": False, "error_code": error_code, "retryable": retryable},
+    )
+
+
+@app.post("/internal/v1/telesrv/otp")
+async def receive_telesrv_otp(request: Request) -> JSONResponse:
+    """Receive a login code generated by the self-hosted MTProto server.
+
+    The code is not verified here. AuthWaysGram_bot only delivers it to the
+    verified owner of the internal virtual number; the MTProto server remains
+    the authority that validates auth.signIn.
+    """
+    secret = TELESRV_OTP_WEBHOOK_SECRET
+    if not secret:
+        return _telesrv_webhook_error(503, "WEBHOOK_NOT_CONFIGURED", False)
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        return _telesrv_webhook_error(415, "CONTENT_TYPE_INVALID", False)
+
+    raw_body = await request.body()
+    if not raw_body or len(raw_body) > 64 * 1024:
+        return _telesrv_webhook_error(413, "REQUEST_TOO_LARGE", False)
+
+    timestamp = request.headers.get("X-Telesrv-Timestamp", "")
+    try:
+        issued_at = int(timestamp)
+    except (TypeError, ValueError):
+        return _telesrv_webhook_error(401, "SIGNATURE_INVALID", False)
+    if abs(int(time.time()) - issued_at) > 300:
+        return _telesrv_webhook_error(401, "TIMESTAMP_EXPIRED", False)
+
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        timestamp.encode("ascii") + b"." + raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    provided = request.headers.get("X-Telesrv-Signature", "")
+    if not hmac.compare_digest(provided, expected):
+        return _telesrv_webhook_error(401, "SIGNATURE_INVALID", False)
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _telesrv_webhook_error(400, "JSON_INVALID", False)
+    if not isinstance(payload, dict):
+        return _telesrv_webhook_error(400, "JSON_INVALID", False)
+
+    delivery_id = str(payload.get("delivery_id", "")).strip()
+    idempotency_key = request.headers.get("Idempotency-Key", "")
+    if (
+        payload.get("version") != "1"
+        or not delivery_id
+        or len(delivery_id) > 128
+        or not hmac.compare_digest(delivery_id, idempotency_key)
+    ):
+        return _telesrv_webhook_error(400, "DELIVERY_ID_INVALID", False)
+    if payload.get("purpose") != "login_sms" or payload.get("channel") != "sms":
+        return _telesrv_webhook_error(422, "PURPOSE_UNSUPPORTED", False)
+
+    recipient = str(payload.get("recipient", "")).strip()
+    if PHONE_RE.fullmatch(recipient):
+        number = recipient
+    elif re.fullmatch(r"1[0-9]{10}", recipient):
+        number = "+" + recipient
+    else:
+        return _telesrv_webhook_error(422, "RECIPIENT_INVALID", False)
+
+    code = str(payload.get("code", "")).strip()
+    if not OTP_RE.fullmatch(code):
+        return _telesrv_webhook_error(422, "CODE_INVALID", False)
+
+    try:
+        expiry_text = str(payload.get("expires_at", "")).strip()
+        expiry = datetime.fromisoformat(expiry_text.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            raise ValueError("timezone is required")
+        expires_at = int(expiry.astimezone(timezone.utc).timestamp())
+        expires_in = int(payload.get("expires_in", 0))
+    except (TypeError, ValueError, OverflowError):
+        return _telesrv_webhook_error(422, "EXPIRY_INVALID", False)
+    now = int(time.time())
+    if expires_at <= now or expires_at - now > 900 or expires_in < 1 or expires_in > 900:
+        return _telesrv_webhook_error(422, "EXPIRY_INVALID", False)
+
+    owner = await store.resolve_number(number)
+    if not owner:
+        return _telesrv_webhook_error(404, "NUMBER_NOT_ASSIGNED", False)
+    if not owner.get("verified") or await account_is_banned(int(owner["telegram_id"])):
+        return _telesrv_webhook_error(403, "ACCOUNT_NOT_VERIFIED", False)
+    if bot is None:
+        return _telesrv_webhook_error(503, "BOT_NOT_READY", True)
+
+    payload_sha256 = hashlib.sha256(raw_body).hexdigest()
+    status, saved_message_id = await store.save_telesrv_code(
+        number=number,
+        code=code,
+        expires_at=expires_at,
+        delivery_id=delivery_id,
+        payload_sha256=payload_sha256,
+    )
+    if status == "conflict":
+        return _telesrv_webhook_error(409, "IDEMPOTENCY_CONFLICT", False)
+    if status == "expired":
+        return _telesrv_webhook_error(410, "CODE_EXPIRED", False)
+    if status == "unknown_number":
+        return _telesrv_webhook_error(404, "NUMBER_NOT_ASSIGNED", False)
+    if status == "rate_limited":
+        return _telesrv_webhook_error(429, "RATE_LIMITED", True)
+    if status == "delivered":
+        return JSONResponse(
+            status_code=200,
+            content={"accepted": True, "message_id": str(saved_message_id) if saved_message_id else ""},
+        )
+
+    language = str(owner.get("language") or "en")
+    try:
+        sent = await bot.send_message(
+            chat_id=int(owner["chat_id"]),
+            text=tr(language, "code_push"),
+        )
+        telegram_message_id = int(getattr(sent, "message_id", 0) or 0)
+        await store.mark_telesrv_delivery_sent(delivery_id, telegram_message_id)
+    except Exception as exc:
+        log.warning("MTProto login-code notification failed (%s)", type(exc).__name__)
+        # Leave the encrypted code and pending receipt intact. A retry with the
+        # same delivery ID can resend the notification without replacing OTP.
+        return _telesrv_webhook_error(502, "BOT_DELIVERY_FAILED", True)
+
+    return JSONResponse(
+        status_code=200,
+        content={"accepted": True, "message_id": str(telegram_message_id) if telegram_message_id else ""},
+    )
 
 
 async def main() -> None:
