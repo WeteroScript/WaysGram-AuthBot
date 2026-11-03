@@ -5,6 +5,7 @@ import hashlib
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 import bot as bot_module
 import messenger_api
 from messenger_api import build_messenger_router, init_messenger_storage
+from telegram_mtproto import TelegramMTProtoGiftCatalog
 
 
 class FakeBot:
@@ -765,6 +767,103 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             internal_catalog = await client.get("/api/gifts", headers=auth)
             assert internal_catalog.status_code == 200
             assert internal_catalog.json()["gifts"] == []
+
+    run(scenario())
+
+
+def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
+    path, auth_store, fake_bot, _old_app = api_env
+    add_account(api_env, 88001, "mtproto_catalog_user")
+    add_session(path, 88001, "mtproto-catalog-session")
+
+    class FakeMTProtoClient:
+        def __init__(self):
+            self.document = SimpleNamespace(
+                id=9901,
+                dc_id=2,
+                size=512,
+                mime_type="image/webp",
+                attributes=[],
+            )
+            self.gift = SimpleNamespace(
+                id=987654321,
+                title="MTProto Gift",
+                sticker=self.document,
+                stars=42,
+                limited=True,
+                sold_out=False,
+                birthday=True,
+                require_premium=True,
+                limited_per_user=True,
+                peer_color_available=True,
+                auction=True,
+                availability_remains=7,
+                availability_total=25,
+                availability_resale=3,
+                convert_stars=8,
+                first_sale_date=1700000000,
+                last_sale_date=1700000100,
+                upgrade_stars=150,
+                resell_min_stars=45,
+                released_by=None,
+                per_user_total=2,
+                per_user_remains=1,
+                locked_until_date=1700000200,
+                auction_slug="mtproto-auction",
+                gifts_per_round=10,
+                auction_start_date=1700000300,
+                upgrade_variants=5,
+                background=None,
+            )
+
+        async def __call__(self, request):
+            return SimpleNamespace(gifts=[self.gift])
+
+        async def download_media(self, document, file=bytes):
+            assert document is self.document
+            return b"mtproto-gift-sticker"
+
+    mtproto_client = FakeMTProtoClient()
+    provider = TelegramMTProtoGiftCatalog(mtproto_client)
+    run(provider.sync(path))
+
+    app = FastAPI()
+    app.include_router(
+        build_messenger_router(
+            path,
+            auth_store,
+            lambda: fake_bot,
+            bot_module.account_is_banned,
+            lambda: provider,
+        )
+    )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = {"Authorization": "Bearer mtproto-catalog-session"}
+            catalog = await client.get("/api/telegram/gifts", headers=auth)
+            assert catalog.status_code == 200
+            payload = catalog.json()
+            assert payload["source"] == "telegram_mtproto"
+            assert payload["scope"] == "telegram_full_mtproto_catalog"
+            assert payload["currency"] == "telegram_stars"
+            assert payload["count"] == 1
+
+            gift = payload["gifts"][0]
+            assert gift["id"] == "987654321"
+            assert gift["title"] == "MTProto Gift"
+            assert gift["star_count"] == 42
+            assert gift["auction"] is True
+            assert gift["sold_out"] is False
+            assert gift["require_premium"] is True
+            assert gift["total_count"] == 25
+            assert gift["remaining_count"] == 7
+            assert gift["sticker"]["mime_type"] == "image/webp"
+
+            sticker = await client.get(gift["sticker"]["url"], headers=auth)
+            assert sticker.status_code == 200
+            assert sticker.content == b"mtproto-gift-sticker"
+            assert sticker.headers["content-type"].startswith("image/webp")
 
     run(scenario())
 
