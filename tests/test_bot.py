@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -391,3 +395,127 @@ def test_new_account_receives_one_time_welcome_balances(
 
     assert (stars, grams) == (4900, 14)
     assert grant_count == 2
+
+
+
+def _signed_telesrv_otp(number: str, delivery_id: str, code: str, secret: str):
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+    payload = {
+        "version": "1",
+        "delivery_id": delivery_id,
+        "purpose": "login_sms",
+        "channel": "sms",
+        "recipient": number[1:],
+        "code": code,
+        "expires_at": expiry.isoformat().replace("+00:00", "Z"),
+        "expires_in": 300,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    timestamp = str(int(time.time()))
+    signature = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        timestamp.encode("ascii") + b"." + raw,
+        hashlib.sha256,
+    ).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": delivery_id,
+        "X-Telesrv-Timestamp": timestamp,
+        "X-Telesrv-Signature": signature,
+    }
+    return raw, headers
+
+
+def test_telesrv_webhook_delivers_server_generated_code_idempotently(
+    store: bot_module.Store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = 950001
+    run(store.upsert_user(user_id, user_id))
+    run(store.set_verified(user_id, True))
+    number = run(store.allocate_number(user_id))
+    secret = "test-telesrv-webhook-secret"
+    monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", secret)
+
+    class MessageBot(FakeBot):
+        async def send_message(self, chat_id: int, text: str):
+            await super().send_message(chat_id, text)
+            return SimpleNamespace(message_id=len(self.messages))
+
+    fake_bot = MessageBot()
+    monkeypatch.setattr(bot_module, "bot", fake_bot)
+    raw, headers = _signed_telesrv_otp(number, "delivery_950001", "482913", secret)
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=bot_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            delivered = await client.post(
+                "/internal/v1/telesrv/otp",
+                content=raw,
+                headers=headers,
+            )
+            assert delivered.status_code == 200
+            assert delivered.json() == {"accepted": True, "message_id": "1"}
+            assert len(fake_bot.messages) == 1
+            assert "482913" not in delivered.text
+            assert "482913" not in fake_bot.messages[0][1]
+
+            saved_code, seconds_left = await store.latest_code(number)
+            assert saved_code == "482913"
+            assert seconds_left > 0
+
+            replay = await client.post(
+                "/internal/v1/telesrv/otp",
+                content=raw,
+                headers=headers,
+            )
+            assert replay.status_code == 200
+            assert replay.json() == delivered.json()
+            assert len(fake_bot.messages) == 1
+
+            changed_raw, changed_headers = _signed_telesrv_otp(
+                number, "delivery_950001", "112233", secret
+            )
+            conflict = await client.post(
+                "/internal/v1/telesrv/otp",
+                content=changed_raw,
+                headers=changed_headers,
+            )
+            assert conflict.status_code == 409
+            assert conflict.json()["error_code"] == "IDEMPOTENCY_CONFLICT"
+            assert (await store.latest_code(number))[0] == "482913"
+
+    run(scenario())
+
+
+def test_telesrv_webhook_rejects_invalid_signature_and_unverified_number(
+    store: bot_module.Store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = 950002
+    run(store.upsert_user(user_id, user_id))
+    number = run(store.allocate_number(user_id))
+    secret = "another-test-secret"
+    monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", secret)
+    fake_bot = FakeBot()
+    monkeypatch.setattr(bot_module, "bot", fake_bot)
+    raw, headers = _signed_telesrv_otp(number, "delivery_950002", "123456", secret)
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=bot_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            invalid = dict(headers)
+            invalid["X-Telesrv-Signature"] = "sha256=" + ("0" * 64)
+            denied = await client.post(
+                "/internal/v1/telesrv/otp", content=raw, headers=invalid
+            )
+            assert denied.status_code == 401
+
+            unverified = await client.post(
+                "/internal/v1/telesrv/otp", content=raw, headers=headers
+            )
+            assert unverified.status_code == 403
+            assert fake_bot.messages == []
+            assert await store.latest_code(number) is None
+
+    run(scenario())
