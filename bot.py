@@ -22,7 +22,8 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from otp_webhook import OtpWebhookError, parse_telesrv_delivery
 from pydantic import BaseModel, Field
 import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
@@ -34,6 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8888957702"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/waysgram_authbot.sqlite3"))
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
+TELESRV_OTP_WEBHOOK_SECRET = os.getenv("TELESRV_OTP_WEBHOOK_SECRET", "").strip()
 OTP_FERNET_KEY = os.getenv("OTP_FERNET_KEY", "").strip()
 INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "0.0.0.0")
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT") or os.getenv("PORT") or "8081")
@@ -167,6 +169,15 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_auth_codes_number_expiry
                     ON auth_codes(number, expires_at DESC);
+                CREATE TABLE IF NOT EXISTS otp_webhook_receipts (
+                    delivery_id TEXT PRIMARY KEY,
+                    payload_sha256 TEXT NOT NULL,
+                    number TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message_id TEXT NOT NULL DEFAULT '',
+                    expires_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
                 """
             )
             cur = await db.execute("PRAGMA table_info(users)")
@@ -1697,6 +1708,132 @@ def verify_internal_token(value: str | None) -> None:
         raise HTTPException(status_code=503, detail="Internal API token is not configured")
     if value is None or not secrets.compare_digest(value, INTERNAL_API_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@app.post("/v1/otp/deliveries")
+async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
+    """Deliver a telesrv-owned six-digit login code through AuthWaysGram_bot."""
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media_type != "application/json":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/json")
+
+    try:
+        body = await request.body()
+        delivery = parse_telesrv_delivery(
+            body,
+            request.headers,
+            TELESRV_OTP_WEBHOOK_SECRET,
+        )
+    except OtpWebhookError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error_code": exc.error_code, "message": str(exc)},
+        ) from exc
+
+    if bot is None:
+        raise HTTPException(status_code=503, detail="AuthWaysGram_bot is not ready")
+
+    owner = await store.resolve_number(delivery.number)
+    if not owner:
+        raise HTTPException(status_code=404, detail="WaysGram virtual number is not assigned")
+    if not owner.get("verified"):
+        raise HTTPException(status_code=403, detail="AuthWaysGram_bot verification is required")
+    telegram_id = int(owner["telegram_id"])
+    if await account_is_banned(telegram_id):
+        raise HTTPException(status_code=403, detail="WaysGram account is suspended")
+
+    # Persist an idempotency receipt before sending. If the process restarts
+    # during delivery, a repeated webhook cannot silently send the same OTP twice.
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "DELETE FROM otp_webhook_receipts WHERE expires_at < ?",
+            (int(time.time()),),
+        )
+        cur = await db.execute(
+            "SELECT payload_sha256,status,message_id FROM otp_webhook_receipts WHERE delivery_id=?",
+            (delivery.delivery_id,),
+        )
+        existing = await cur.fetchone()
+        if existing:
+            await db.commit()
+            old_fingerprint, old_status, old_message_id = existing
+            if str(old_fingerprint) != delivery.payload_sha256:
+                raise HTTPException(status_code=409, detail="Delivery ID was reused with another payload")
+            if old_status == "delivered":
+                return {
+                    "accepted": True,
+                    "message_id": str(old_message_id),
+                    "duplicate": True,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={"error_code": "DELIVERY_ALREADY_PROCESSED", "status": str(old_status)},
+            )
+
+        await db.execute(
+            """INSERT INTO otp_webhook_receipts
+               (delivery_id,payload_sha256,number,status,message_id,expires_at,created_at)
+               VALUES(?,?,?,'pending','',?,?)""",
+            (
+                delivery.delivery_id,
+                delivery.payload_sha256,
+                delivery.number,
+                delivery.expires_at,
+                int(time.time()),
+            ),
+        )
+        await db.commit()
+
+    if not await store.save_code(delivery.number, delivery.code, delivery.expires_in):
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "UPDATE otp_webhook_receipts SET status='failed' WHERE delivery_id=?",
+                (delivery.delivery_id,),
+            )
+            await db.commit()
+        raise HTTPException(
+            status_code=429,
+            detail={"error_code": "RECIPIENT_RATE_LIMITED", "retryable": True},
+        )
+
+    language = str(owner.get("language") or "en")
+    minutes = max(1, (delivery.expires_in + 59) // 60)
+    try:
+        sent = await bot.send_message(
+            chat_id=int(owner["chat_id"]),
+            text=tr(language, "code_ready", code=delivery.code, minutes=minutes),
+        )
+    except Exception as exc:
+        log.warning(
+            "AuthWaysGram_bot OTP delivery failed (delivery_id=%s, error=%s)",
+            delivery.delivery_id,
+            type(exc).__name__,
+        )
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "UPDATE otp_webhook_receipts SET status='failed' WHERE delivery_id=?",
+                (delivery.delivery_id,),
+            )
+            await db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail={"error_code": "BOT_DELIVERY_FAILED", "retryable": True},
+        ) from exc
+
+    telegram_message_id = int(getattr(sent, "message_id", 0) or 0)
+    message_id = f"authwaysgram:{telegram_message_id}" if telegram_message_id else (
+        "authwaysgram:" + delivery.delivery_id[:48]
+    )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE otp_webhook_receipts SET status='delivered',message_id=? WHERE delivery_id=?",
+            (message_id, delivery.delivery_id),
+        )
+        await db.commit()
+
+    log.info("Delivered MTProto login code through AuthWaysGram_bot (delivery_id=%s)", delivery.delivery_id)
+    return {"accepted": True, "message_id": message_id}
 
 
 @app.get("/health")
