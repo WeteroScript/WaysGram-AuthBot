@@ -604,10 +604,14 @@ def test_document_upload_attachment_and_private_download(api_env) -> None:
             assert sent.status_code == 201
             assert sent.json()["body"] == "Документ: project notes.pdf"
             assert sent.json()["media_id"] == media["id"]
+            assert sent.json()["media_type"] == "application/pdf"
+            assert sent.json()["media_name"] == "project notes.pdf"
 
             history = await client.get("/api/messages?with=89201", headers=recipient)
             assert history.status_code == 200
             assert history.json()["messages"][0]["media_id"] == media["id"]
+            assert history.json()["messages"][0]["media_type"] == "application/pdf"
+            assert history.json()["messages"][0]["media_name"] == "project notes.pdf"
 
             downloaded = await client.get(media["url"], headers=recipient)
             assert downloaded.status_code == 200
