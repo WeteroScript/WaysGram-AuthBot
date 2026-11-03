@@ -135,6 +135,51 @@ async def init_messenger_storage(database_path: Path) -> None:
                 gift_count INTEGER NOT NULL,
                 source TEXT NOT NULL DEFAULT 'telegram_bot_api'
             );
+            CREATE TABLE IF NOT EXISTS telegram_mtproto_gift_catalog (
+                gift_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                sticker_emoji TEXT NOT NULL DEFAULT '',
+                sticker_set_name TEXT NOT NULL DEFAULT '',
+                sticker_width INTEGER,
+                sticker_height INTEGER,
+                sticker_is_animated INTEGER NOT NULL DEFAULT 0,
+                sticker_is_video INTEGER NOT NULL DEFAULT 0,
+                sticker_mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                sticker_document_id INTEGER,
+                sticker_dc_id INTEGER,
+                sticker_size INTEGER,
+                stars INTEGER NOT NULL DEFAULT 0 CHECK(stars >= 0),
+                limited INTEGER NOT NULL DEFAULT 0,
+                sold_out INTEGER NOT NULL DEFAULT 0,
+                birthday INTEGER NOT NULL DEFAULT 0,
+                require_premium INTEGER NOT NULL DEFAULT 0,
+                limited_per_user INTEGER NOT NULL DEFAULT 0,
+                peer_color_available INTEGER NOT NULL DEFAULT 0,
+                auction INTEGER NOT NULL DEFAULT 0,
+                availability_remains INTEGER,
+                availability_total INTEGER,
+                availability_resale INTEGER,
+                convert_stars INTEGER,
+                first_sale_date INTEGER,
+                last_sale_date INTEGER,
+                upgrade_stars INTEGER,
+                resell_min_stars INTEGER,
+                released_by_json TEXT,
+                per_user_total INTEGER,
+                per_user_remains INTEGER,
+                locked_until_date INTEGER,
+                auction_slug TEXT NOT NULL DEFAULT '',
+                gifts_per_round INTEGER,
+                auction_start_date INTEGER,
+                upgrade_variants INTEGER,
+                background_json TEXT,
+                source_payload TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                is_available INTEGER NOT NULL DEFAULT 1,
+                synced_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_telegram_mtproto_gifts_available
+                ON telegram_mtproto_gift_catalog(is_available,position);
             CREATE TABLE IF NOT EXISTS chat_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT COLLATE NOCASE UNIQUE,
@@ -439,6 +484,7 @@ def build_messenger_router(
     auth_store: Any,
     bot_provider: Callable[[], Any],
     account_is_banned: Callable[[int], Any],
+    mtproto_gift_provider: Callable[[], Any] | None = None,
 ) -> APIRouter:
     router = APIRouter()
     db_path = database_path if callable(database_path) else lambda: database_path
@@ -465,6 +511,14 @@ def build_messenger_router(
                 state = await cur.fetchone()
             if state and now - int(state["last_synced_at"]) < 60:
                 return dict(state)
+            mtproto = mtproto_gift_provider() if mtproto_gift_provider else None
+            if mtproto is not None:
+                try:
+                    return await mtproto.sync(db_path())
+                except Exception:
+                    # Bot API remains a safe read-only fallback if MTProto is temporarily unavailable.
+                    pass
+
             bot = bot_provider()
             if bot is None:
                 if state:
@@ -483,7 +537,7 @@ def build_messenger_router(
                     return dict(state)
                 raise HTTPException(
                     status_code=503,
-                    detail="Не удалось загрузить каталог подарков Telegram. Проверьте BOT_TOKEN и повторите запрос.",
+                    detail="Не удалось загрузить каталог подарков Telegram. Проверьте BOT_TOKEN и настройки MTProto.",
                 ) from exc
 
     async def current_user(authorization: str | None) -> dict[str, Any]:
@@ -1120,56 +1174,131 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         await current_user(authorization)
         state = await ensure_telegram_gifts_fresh()
+        source = str(state.get("source") or "telegram_bot_api")
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                """SELECT gift_id,title,sticker_type,sticker_emoji,sticker_set_name,
-                          sticker_width,sticker_height,sticker_is_animated,sticker_is_video,
-                          sticker_mime_type,star_count,upgrade_star_count,is_premium,has_colors,
-                          total_count,remaining_count,personal_total_count,personal_remaining_count,
-                          unique_gift_variant_count,background_json,publisher_chat_json,
-                          position,synced_at
-                   FROM telegram_gift_catalog
-                   WHERE is_available=1
-                   ORDER BY position ASC"""
-            )
-            rows = await cur.fetchall()
-        gifts = []
+            if source == "telegram_mtproto":
+                cur = await db.execute(
+                    """SELECT gift_id,title,sticker_emoji,sticker_set_name,sticker_width,
+                              sticker_height,sticker_is_animated,sticker_is_video,
+                              sticker_mime_type,stars,limited,sold_out,birthday,require_premium,
+                              limited_per_user,peer_color_available,auction,availability_remains,
+                              availability_total,availability_resale,convert_stars,first_sale_date,
+                              last_sale_date,upgrade_stars,resell_min_stars,released_by_json,
+                              per_user_total,per_user_remains,locked_until_date,auction_slug,
+                              gifts_per_round,auction_start_date,upgrade_variants,background_json,
+                              sticker_document_id,sticker_dc_id,sticker_size,position,synced_at
+                       FROM telegram_mtproto_gift_catalog
+                       WHERE is_available=1
+                       ORDER BY position ASC"""
+                )
+                rows = await cur.fetchall()
+            else:
+                cur = await db.execute(
+                    """SELECT gift_id,title,sticker_type,sticker_emoji,sticker_set_name,
+                              sticker_width,sticker_height,sticker_is_animated,sticker_is_video,
+                              sticker_mime_type,star_count,upgrade_star_count,is_premium,has_colors,
+                              total_count,remaining_count,personal_total_count,personal_remaining_count,
+                              unique_gift_variant_count,background_json,publisher_chat_json,
+                              position,synced_at
+                       FROM telegram_gift_catalog
+                       WHERE is_available=1
+                       ORDER BY position ASC"""
+                )
+                rows = await cur.fetchall()
+
+        gifts: list[dict[str, Any]] = []
         for row in rows:
-            gifts.append({
-                "id": str(row["gift_id"]),
-                "source": "telegram",
-                "title": str(row["title"]),
-                "emoji": str(row["sticker_emoji"] or ""),
-                "star_count": int(row["star_count"]),
-                "currency": "telegram_stars",
-                "upgrade_star_count": row["upgrade_star_count"],
-                "is_premium": bool(row["is_premium"]),
-                "has_colors": bool(row["has_colors"]),
-                "is_limited": row["total_count"] is not None,
-                "total_count": row["total_count"],
-                "remaining_count": row["remaining_count"],
-                "personal_total_count": row["personal_total_count"],
-                "personal_remaining_count": row["personal_remaining_count"],
-                "unique_gift_variant_count": row["unique_gift_variant_count"],
-                "background": json.loads(row["background_json"]) if row["background_json"] else None,
-                "publisher_chat": json.loads(row["publisher_chat_json"]) if row["publisher_chat_json"] else None,
-                "sticker": {
-                    "type": str(row["sticker_type"]),
-                    "set_name": str(row["sticker_set_name"] or ""),
-                    "width": row["sticker_width"],
-                    "height": row["sticker_height"],
-                    "is_animated": bool(row["sticker_is_animated"]),
-                    "is_video": bool(row["sticker_is_video"]),
-                    "mime_type": str(row["sticker_mime_type"] or ""),
-                    "url": f"/api/telegram/gifts/{quote(str(row['gift_id']), safe='')}/sticker",
-                },
-                "synced_at": int(row["synced_at"]),
-            })
+            if source == "telegram_mtproto":
+                gift_id = str(row["gift_id"])
+                sticker_url = f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker"
+                released_by = json.loads(row["released_by_json"]) if row["released_by_json"] else None
+                background = json.loads(row["background_json"]) if row["background_json"] else None
+                gifts.append({
+                    "id": gift_id,
+                    "source": "telegram",
+                    "title": str(row["title"]),
+                    "emoji": str(row["sticker_emoji"] or ""),
+                    "star_count": int(row["stars"]),
+                    "currency": "telegram_stars",
+                    "upgrade_star_count": row["upgrade_stars"],
+                    "is_premium": bool(row["require_premium"]),
+                    "has_colors": bool(row["peer_color_available"]),
+                    "is_limited": bool(row["limited"]),
+                    "sold_out": bool(row["sold_out"]),
+                    "birthday": bool(row["birthday"]),
+                    "require_premium": bool(row["require_premium"]),
+                    "limited_per_user": bool(row["limited_per_user"]),
+                    "auction": bool(row["auction"]),
+                    "availability_resale": row["availability_resale"],
+                    "convert_stars": row["convert_stars"],
+                    "first_sale_date": row["first_sale_date"],
+                    "last_sale_date": row["last_sale_date"],
+                    "resell_min_stars": row["resell_min_stars"],
+                    "released_by": released_by,
+                    "per_user_total": row["per_user_total"],
+                    "per_user_remains": row["per_user_remains"],
+                    "locked_until_date": row["locked_until_date"],
+                    "auction_slug": str(row["auction_slug"] or ""),
+                    "gifts_per_round": row["gifts_per_round"],
+                    "auction_start_date": row["auction_start_date"],
+                    "upgrade_variants": row["upgrade_variants"],
+                    "total_count": row["availability_total"],
+                    "remaining_count": row["availability_remains"],
+                    "personal_total_count": row["per_user_total"],
+                    "personal_remaining_count": row["per_user_remains"],
+                    "background": background,
+                    "sticker": {
+                        "type": "video" if bool(row["sticker_is_video"]) else (
+                            "animated" if bool(row["sticker_is_animated"]) else "regular"
+                        ),
+                        "set_name": str(row["sticker_set_name"] or ""),
+                        "width": row["sticker_width"],
+                        "height": row["sticker_height"],
+                        "is_animated": bool(row["sticker_is_animated"]),
+                        "is_video": bool(row["sticker_is_video"]),
+                        "mime_type": str(row["sticker_mime_type"] or ""),
+                        "url": sticker_url,
+                    },
+                    "synced_at": int(row["synced_at"]),
+                })
+            else:
+                gift_id = str(row["gift_id"])
+                gifts.append({
+                    "id": gift_id,
+                    "source": "telegram",
+                    "title": str(row["title"]),
+                    "emoji": str(row["sticker_emoji"] or ""),
+                    "star_count": int(row["star_count"]),
+                    "currency": "telegram_stars",
+                    "upgrade_star_count": row["upgrade_star_count"],
+                    "is_premium": bool(row["is_premium"]),
+                    "has_colors": bool(row["has_colors"]),
+                    "is_limited": row["total_count"] is not None,
+                    "total_count": row["total_count"],
+                    "remaining_count": row["remaining_count"],
+                    "personal_total_count": row["personal_total_count"],
+                    "personal_remaining_count": row["personal_remaining_count"],
+                    "unique_gift_variant_count": row["unique_gift_variant_count"],
+                    "background": json.loads(row["background_json"]) if row["background_json"] else None,
+                    "publisher_chat": json.loads(row["publisher_chat_json"]) if row["publisher_chat_json"] else None,
+                    "sticker": {
+                        "type": str(row["sticker_type"]),
+                        "set_name": str(row["sticker_set_name"] or ""),
+                        "width": row["sticker_width"],
+                        "height": row["sticker_height"],
+                        "is_animated": bool(row["sticker_is_animated"]),
+                        "is_video": bool(row["sticker_is_video"]),
+                        "mime_type": str(row["sticker_mime_type"] or ""),
+                        "url": f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker",
+                    },
+                    "synced_at": int(row["synced_at"]),
+                })
+
         synced_at = int(state["last_synced_at"])
         return {
-            "source": "telegram_bot_api",
-            "scope": "gifts_available_to_authbot",
+            "source": source,
+            "scope": "telegram_full_mtproto_catalog" if source == "telegram_mtproto" else "gifts_available_to_authbot",
             "currency": "telegram_stars",
             "synced_at": synced_at,
             "stale": int(time.time()) - synced_at >= 60,
@@ -1184,25 +1313,44 @@ def build_messenger_router(
     ) -> Response:
         await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT sticker_file_id,sticker_mime_type
-                   FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1""",
-                (gift_id,),
+                "SELECT source FROM telegram_gift_sync_state WHERE id=1"
             )
-            row = await cur.fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Подарок Telegram не найден")
-        bot = bot_provider()
-        if bot is None:
-            raise HTTPException(status_code=503, detail="Telegram Bot API недоступен")
-        try:
-            content, media_type = await fetch_telegram_sticker(
-                bot,
-                str(row[0]),
-                str(row[1] or ""),
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram") from exc
+            state = await cur.fetchone()
+        source = str(state["source"]) if state else "telegram_bot_api"
+
+        if source == "telegram_mtproto":
+            provider = mtproto_gift_provider() if mtproto_gift_provider else None
+            if provider is None:
+                raise HTTPException(status_code=503, detail="Telegram MTProto is not connected")
+            try:
+                content, media_type = await provider.download_sticker(gift_id)
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail="Подарок Telegram не найден в MTProto-каталоге") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram через MTProto") from exc
+        else:
+            async with aiosqlite.connect(db_path()) as db:
+                cur = await db.execute(
+                    """SELECT sticker_file_id,sticker_mime_type
+                       FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1""",
+                    (gift_id,),
+                )
+                row = await cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Подарок Telegram не найден")
+            bot = bot_provider()
+            if bot is None:
+                raise HTTPException(status_code=503, detail="Telegram Bot API недоступен")
+            try:
+                content, media_type = await fetch_telegram_sticker(
+                    bot,
+                    str(row[0]),
+                    str(row[1] or ""),
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram") from exc
         return Response(
             content=content,
             media_type=media_type,
