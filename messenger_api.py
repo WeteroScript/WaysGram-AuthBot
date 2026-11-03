@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 from io import BytesIO
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +26,7 @@ CHANNEL_POSTS_PER_MINUTE = 20
 LOGIN_REQUESTS_PER_IP_PER_HOUR = 100
 MAX_MESSAGE_LENGTH = 4000
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
@@ -77,6 +78,32 @@ def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
     return normalized, mime_type, extension
 
 
+def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str, str, str]:
+    """Validate a small passive document and return safe storage metadata."""
+    safe_name = str(filename or "document").replace("\\", "/").rsplit("/", 1)[-1]
+    safe_name = re.sub(r"[\x00-\x1f\x7f]", "", safe_name).strip(" .")[:120]
+    if not safe_name:
+        safe_name = "document"
+    extension = Path(safe_name).suffix.lower()
+    if extension == ".pdf":
+        if len(raw) < 16 or not raw.startswith(b"%PDF-") or b"%%EOF" not in raw[-2048:]:
+            raise ValueError("Файл не является корректным PDF")
+        return raw, "application/pdf", ".pdf", safe_name
+    if extension in {".txt", ".csv"}:
+        try:
+            decoded = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Текстовые документы должны быть в UTF-8") from exc
+        if "\x00" in decoded or any(
+            ord(char) < 32 and char not in "\t\n\r" for char in decoded
+        ):
+            raise ValueError("Текстовый документ содержит недопустимые управляющие символы")
+        normalized = decoded.encode("utf-8")
+        mime_type = "text/csv" if extension == ".csv" else "text/plain"
+        return normalized, mime_type, extension, safe_name
+    raise ValueError("Разрешены только документы PDF, TXT и CSV")
+
+
 async def init_messenger_storage(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(database_path) as db:
@@ -94,7 +121,8 @@ async def init_messenger_storage(database_path: Path) -> None:
                 storage_name TEXT NOT NULL UNIQUE,
                 mime_type TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                original_name TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_media_assets_owner_time
                 ON media_assets(owner_telegram_id,created_at);
@@ -311,6 +339,10 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON bot_messages(bot_id,sender_type,id);
             """
         )
+        cur = await db.execute("PRAGMA table_info(media_assets)")
+        media_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "original_name" not in media_columns:
+            await db.execute("ALTER TABLE media_assets ADD COLUMN original_name TEXT")
         for table_name in ("messages", "group_messages", "channel_messages"):
             cur = await db.execute(f"PRAGMA table_info({table_name})")
             columns = {str(row[1]) for row in await cur.fetchall()}
@@ -644,6 +676,18 @@ def build_messenger_router(
             raise HTTPException(status_code=404, detail="Изображение не найдено или принадлежит другому аккаунту")
         return value
 
+    async def default_media_message_body(db: Any, media_id: str) -> str:
+        cur = await db.execute(
+            "SELECT mime_type,original_name FROM media_assets WHERE id=?",
+            (media_id,),
+        )
+        media = await cur.fetchone()
+        if media is None:
+            raise HTTPException(status_code=404, detail="Вложение не найдено")
+        if str(media[0]).startswith("image/"):
+            return "Изображение"
+        return "Документ: " + str(media[1] or "document")
+
     def media_storage_dir() -> Path:
         directory = Path(db_path()).parent / "waysgram_media"
         directory.mkdir(parents=True, exist_ok=True)
@@ -707,9 +751,9 @@ def build_messenger_router(
                 await asyncio.to_thread(file_path.write_bytes, normalized)
                 await db.execute(
                     """INSERT INTO media_assets
-                       (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at)
-                       VALUES(?,?,?,?,?,?)""",
-                    (media_id, uid, storage_name, mime_type, len(normalized), now),
+                       (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at,original_name)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (media_id, uid, storage_name, mime_type, len(normalized), now, "image" + extension),
                 )
                 await db.commit()
         except Exception:
@@ -718,6 +762,85 @@ def build_messenger_router(
         return {
             "id": media_id,
             "mime_type": mime_type,
+            "size_bytes": len(normalized),
+            "url": f"/api/media/{media_id}",
+        }
+
+    @router.post("/api/media/documents", status_code=201)
+    async def upload_document(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
+        allowed_types = {"application/pdf", "text/plain", "text/csv", "application/octet-stream"}
+        if declared_type not in allowed_types:
+            raise HTTPException(status_code=415, detail="Разрешены документы PDF, TXT и CSV")
+        declared_length = request.headers.get("content-length")
+        if declared_length:
+            try:
+                if int(declared_length) > MAX_DOCUMENT_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Размер документа превышает 10 МБ")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Некорректный Content-Length") from exc
+
+        incoming = bytearray()
+        async for chunk in request.stream():
+            if len(incoming) + len(chunk) > MAX_DOCUMENT_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Размер документа превышает 10 МБ")
+            incoming.extend(chunk)
+        if not incoming:
+            raise HTTPException(status_code=400, detail="Файл документа пуст")
+
+        raw_filename = request.headers.get("x-filename", "document")
+        try:
+            filename = unquote(raw_filename, errors="strict")
+            normalized, mime_type, extension, safe_name = await asyncio.to_thread(
+                _normalize_uploaded_document, bytes(incoming), filename
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise HTTPException(status_code=415, detail=str(exc)) from exc
+        if declared_type not in {mime_type, "application/octet-stream"}:
+            raise HTTPException(status_code=415, detail="Заголовок Content-Type не совпадает с документом")
+
+        now = int(time.time())
+        media_id = secrets.token_hex(16)
+        storage_name = media_id + extension
+        file_path = media_storage_dir() / storage_name
+        try:
+            async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+                cur = await db.execute(
+                    """SELECT COALESCE(SUM(size_bytes),0) AS total_bytes,
+                              SUM(CASE WHEN created_at>? THEN 1 ELSE 0 END) AS recent_uploads
+                       FROM media_assets WHERE owner_telegram_id=?""",
+                    (now - 3600, uid),
+                )
+                quota = await cur.fetchone()
+                if int(quota["total_bytes"] or 0) + len(normalized) > MAX_USER_MEDIA_BYTES:
+                    await db.rollback()
+                    raise HTTPException(status_code=413, detail="Достигнут лимит хранилища файлов аккаунта")
+                if int(quota["recent_uploads"] or 0) >= MAX_USER_IMAGE_UPLOADS_PER_HOUR:
+                    await db.rollback()
+                    raise HTTPException(status_code=429, detail="Слишком много загрузок. Повторите позже.")
+
+                await asyncio.to_thread(file_path.write_bytes, normalized)
+                await db.execute(
+                    """INSERT INTO media_assets
+                       (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at,original_name)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (media_id, uid, storage_name, mime_type, len(normalized), now, safe_name),
+                )
+                await db.commit()
+        except Exception:
+            await asyncio.to_thread(file_path.unlink, missing_ok=True)
+            raise
+        return {
+            "id": media_id,
+            "mime_type": mime_type,
+            "name": safe_name,
             "size_bytes": len(normalized),
             "url": f"/api/media/{media_id}",
         }
@@ -780,7 +903,10 @@ def build_messenger_router(
             headers={
                 "Cache-Control": "private, max-age=3600",
                 "X-Content-Type-Options": "nosniff",
-                "Content-Disposition": "inline",
+                "Content-Disposition": (
+                    "inline" if str(media["mime_type"]).startswith("image/") else
+                    "attachment; filename=\"" + re.sub(r"[^A-Za-z0-9._-]", "_", str(media["original_name"] or "document")) + "\"; filename*=UTF-8''" + quote(str(media["original_name"] or "document"), safe="")
+                ),
             },
         )
 
@@ -1909,7 +2035,7 @@ def build_messenger_router(
         uid = int(user["telegram_id"])
         media_id = str(payload.get("media_id") or "").strip() or None
         body_value = str(payload.get("body") or "")
-        body = _message_body(body_value if body_value.strip() else ("Изображение" if media_id else body_value))
+        body = _message_body(body_value) if body_value.strip() or not media_id else ""
         if not await can_manage_channel(channel_id, uid):
             raise HTTPException(status_code=403, detail="Публиковать в канале может только владелец или администратор")
         now = int(time.time())
@@ -1922,6 +2048,8 @@ def build_messenger_router(
                 await db.rollback()
                 return previous
             media_id = await require_owned_media(db, media_id, uid)
+            if not body:
+                body = _message_body(await default_media_message_body(db, media_id))
             cur = await db.execute(
                 "SELECT COUNT(*) FROM channel_messages WHERE author_telegram_id=? AND created_at>?",
                 (uid, now - 60),
@@ -2088,7 +2216,7 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="Укажите корректного получателя")
         media_id = str(payload.get("media_id") or "").strip() or None
         body_value = str(payload.get("body") or "")
-        body = _message_body(body_value if body_value.strip() else ("Изображение" if media_id else body_value))
+        body = _message_body(body_value) if body_value.strip() or not media_id else ""
         now = int(time.time())
         descriptor = idempotency_descriptor("/api/messages", payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
@@ -2098,6 +2226,8 @@ def build_messenger_router(
                 await db.rollback()
                 return previous
             media_id = await require_owned_media(db, media_id, uid)
+            if not body:
+                body = _message_body(await default_media_message_body(db, media_id))
             cur = await db.execute(
                 "SELECT is_banned FROM accounts WHERE telegram_id=?",
                 (recipient_id,),
@@ -2430,12 +2560,14 @@ def build_messenger_router(
         uid = int(user["telegram_id"])
         media_id = str(payload.get("media_id") or "").strip() or None
         body_value = str(payload.get("body") or "")
-        body = _message_body(body_value if body_value.strip() else ("Изображение" if media_id else body_value))
+        body = _message_body(body_value) if body_value.strip() or not media_id else ""
         now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             await require_group_member(db, group_id, uid)
             media_id = await require_owned_media(db, media_id, uid)
+            if not body:
+                body = _message_body(await default_media_message_body(db, media_id))
             cur = await db.execute(
                 "SELECT COUNT(*) FROM group_messages WHERE sender_telegram_id=? AND created_at>?",
                 (uid, now - 60),
