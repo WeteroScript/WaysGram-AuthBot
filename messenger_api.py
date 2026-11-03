@@ -70,7 +70,7 @@ def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
             normalized = output.getvalue()
     except ValueError:
         raise
-    except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+    except Exception as exc:
         raise ValueError("Файл не является корректным изображением") from exc
     if not normalized or len(normalized) > MAX_IMAGE_UPLOAD_BYTES:
         raise ValueError("После обработки изображение превышает лимит 10 МБ")
@@ -657,7 +657,7 @@ def build_messenger_router(
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
-        if not declared_type.startswith("image/"):
+        if not declared_type.startswith("image/") and declared_type != "application/octet-stream":
             raise HTTPException(status_code=415, detail="Загрузите файл изображения JPEG, PNG или WebP")
         declared_length = request.headers.get("content-length")
         if declared_length:
