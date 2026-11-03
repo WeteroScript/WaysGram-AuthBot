@@ -551,6 +551,88 @@ def test_image_attachments_in_group_and_channel_messages(api_env) -> None:
     run(scenario())
 
 
+
+
+def test_document_upload_attachment_and_private_download(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89201, "document_sender")
+    add_account(api_env, 89202, "document_recipient")
+    add_account(api_env, 89203, "document_intruder")
+    add_session(path, 89201, "document-sender-session")
+    add_session(path, 89202, "document-recipient-session")
+    add_session(path, 89203, "document-intruder-session")
+
+    pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
+    text_bytes = "WaysGram document\nsecond line\n".encode("utf-8")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer document-sender-session"}
+            recipient = {"Authorization": "Bearer document-recipient-session"}
+            intruder = {"Authorization": "Bearer document-intruder-session"}
+
+            rejected_type = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "application/octet-stream", "X-Filename": "payload.exe"},
+                content=b"MZ\\x00fake executable",
+            )
+            assert rejected_type.status_code == 415
+
+            rejected_pdf = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "application/pdf", "X-Filename": "fake.pdf"},
+                content=b"not a PDF document",
+            )
+            assert rejected_pdf.status_code == 415
+
+            uploaded = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "application/pdf", "X-Filename": "project%20notes.pdf"},
+                content=pdf_bytes,
+            )
+            assert uploaded.status_code == 201
+            media = uploaded.json()
+            assert media["mime_type"] == "application/pdf"
+            assert media["name"] == "project notes.pdf"
+            assert media["size_bytes"] == len(pdf_bytes)
+
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 89202, "media_id": media["id"]},
+            )
+            assert sent.status_code == 201
+            assert sent.json()["body"] == "Документ: project notes.pdf"
+            assert sent.json()["media_id"] == media["id"]
+
+            history = await client.get("/api/messages?with=89201", headers=recipient)
+            assert history.status_code == 200
+            assert history.json()["messages"][0]["media_id"] == media["id"]
+
+            downloaded = await client.get(media["url"], headers=recipient)
+            assert downloaded.status_code == 200
+            assert downloaded.headers["content-type"].startswith("application/pdf")
+            assert downloaded.headers["content-disposition"].startswith("attachment;")
+            assert "filename*=UTF-8''project%20notes.pdf" in downloaded.headers["content-disposition"]
+            assert downloaded.content == pdf_bytes
+
+            denied = await client.get(media["url"], headers=intruder)
+            assert denied.status_code == 404
+
+            text_upload = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "text/plain", "X-Filename": "summary.txt"},
+                content=text_bytes,
+            )
+            assert text_upload.status_code == 201
+            assert text_upload.json()["mime_type"] == "text/plain"
+            text_download = await client.get(text_upload.json()["url"], headers=sender)
+            assert text_download.status_code == 200
+            assert text_download.headers["content-disposition"].startswith("attachment;")
+            assert text_download.content == text_bytes
+
+    run(scenario())
+
 def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 83001, "buyer")
