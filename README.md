@@ -104,6 +104,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 - `GET /api/channels`, `GET /api/channels/{id}` — список и карточка канала.
 - `POST /api/channels` — создать канал; JSON содержит `username` и `title`.
 - `GET /api/channels/{id}/messages?after_id=...` — получить публикации.
+  Для ленты в открытом экране поддерживается `wait_seconds=20` вместе с `after_id`; максимальное ожидание — 20 секунд.
 - `POST /api/channels/{id}/messages` — опубликовать сообщение; доступ владельцу или администратору канала. Поддерживает `Idempotency-Key`.
 - `POST /api/channels/{id}/admins` и `DELETE /api/channels/{id}/admins/{telegram_id}` — управление администраторами канала его владельцем.
 - `DELETE /api/channels/{id}` — удалить собственный канал.
