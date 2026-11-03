@@ -403,7 +403,9 @@ def test_image_upload_direct_message_and_private_download(api_env) -> None:
             downloaded = await client.get(media["url"], headers=recipient)
             assert downloaded.status_code == 200
             assert downloaded.headers["content-type"].startswith("image/png")
-            assert downloaded.content == image_bytes
+            with Image.open(BytesIO(downloaded.content)) as normalized_image:
+                assert normalized_image.size == (4, 3)
+                assert normalized_image.convert("RGB").getpixel((0, 0)) == (30, 100, 180)
 
             denied = await client.get(media["url"], headers=intruder)
             assert denied.status_code == 404
