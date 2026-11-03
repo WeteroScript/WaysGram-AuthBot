@@ -1869,14 +1869,14 @@ def build_messenger_router(
             db.row_factory = aiosqlite.Row
             if after_id:
                 cur = await db.execute(
-                    """SELECT id,channel_id,author_telegram_id AS author_id,body,created_at
+                    """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
                        FROM channel_messages WHERE channel_id=? AND id>?
                        ORDER BY id ASC LIMIT 100""",
                     (channel_id, after_id),
                 )
             else:
                 cur = await db.execute(
-                    """SELECT id,channel_id,author_telegram_id AS author_id,body,created_at
+                    """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
                        FROM channel_messages WHERE channel_id=?
                        ORDER BY id DESC LIMIT 100""",
                     (channel_id,),
@@ -1896,7 +1896,9 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        body = _message_body(payload.get("body", ""))
+        media_id = str(payload.get("media_id") or "").strip() or None
+        body_value = str(payload.get("body") or "")
+        body = _message_body(body_value if body_value.strip() else ("Изображение" if media_id else body_value))
         if not await can_manage_channel(channel_id, uid):
             raise HTTPException(status_code=403, detail="Публиковать в канале может только владелец или администратор")
         now = int(time.time())
@@ -1908,6 +1910,7 @@ def build_messenger_router(
             if previous is not None:
                 await db.rollback()
                 return previous
+            media_id = await require_owned_media(db, media_id, uid)
             cur = await db.execute(
                 "SELECT COUNT(*) FROM channel_messages WHERE author_telegram_id=? AND created_at>?",
                 (uid, now - 60),
@@ -1916,12 +1919,13 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=429, detail="Превышен лимит публикаций")
             cur = await db.execute(
-                """INSERT INTO channel_messages(channel_id,author_telegram_id,body,created_at)
-                   VALUES(?,?,?,?)""",
-                (channel_id, uid, body, now),
+                """INSERT INTO channel_messages
+                   (channel_id,author_telegram_id,body,media_id,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (channel_id, uid, body, media_id, now),
             )
             message_id = int(cur.lastrowid)
-            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "created_at": now}
+            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
         return result
@@ -2015,7 +2019,7 @@ def build_messenger_router(
                 raise HTTPException(status_code=404, detail="Собеседник не найден")
             base = """
                 SELECT id,sender_telegram_id AS sender_id,
-                       recipient_telegram_id AS recipient_id,body,created_at
+                       recipient_telegram_id AS recipient_id,body,media_id,created_at
                 FROM messages WHERE
                 ((sender_telegram_id=? AND recipient_telegram_id=?) OR
                  (sender_telegram_id=? AND recipient_telegram_id=?))
@@ -2061,7 +2065,9 @@ def build_messenger_router(
             recipient_id = 0
         if recipient_id <= 0 or recipient_id == uid:
             raise HTTPException(status_code=400, detail="Укажите корректного получателя")
-        body = _message_body(payload.get("body", ""))
+        media_id = str(payload.get("media_id") or "").strip() or None
+        body_value = str(payload.get("body") or "")
+        body = _message_body(body_value if body_value.strip() else ("Изображение" if media_id else body_value))
         now = int(time.time())
         descriptor = idempotency_descriptor("/api/messages", payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
@@ -2070,6 +2076,7 @@ def build_messenger_router(
             if previous is not None:
                 await db.rollback()
                 return previous
+            media_id = await require_owned_media(db, media_id, uid)
             cur = await db.execute(
                 "SELECT is_banned FROM accounts WHERE telegram_id=?",
                 (recipient_id,),
@@ -2089,9 +2096,10 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
             cur = await db.execute(
-                """INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at)
-                   VALUES(?,?,?,?)""",
-                (uid, recipient_id, body, now),
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,media_id,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (uid, recipient_id, body, media_id, now),
             )
             message_id = int(cur.lastrowid)
             result = {
@@ -2100,6 +2108,7 @@ def build_messenger_router(
                 "sender_id": uid,
                 "recipient_id": recipient_id,
                 "body": body,
+                "media_id": media_id,
                 "created_at": now,
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
@@ -2367,13 +2376,13 @@ def build_messenger_router(
             db.row_factory = aiosqlite.Row
             if after_id:
                 cur = await db.execute(
-                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,created_at
+                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
                        FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
                     (group_id, after_id),
                 )
             else:
                 cur = await db.execute(
-                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,created_at
+                    """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
                        FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
                     (group_id,),
                 )
@@ -2391,11 +2400,14 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        body = _message_body(payload.get("body", ""))
+        media_id = str(payload.get("media_id") or "").strip() or None
+        body_value = str(payload.get("body") or "")
+        body = _message_body(body_value if body_value.strip() else ("Изображение" if media_id else body_value))
         now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             await require_group_member(db, group_id, uid)
+            media_id = await require_owned_media(db, media_id, uid)
             cur = await db.execute(
                 "SELECT COUNT(*) FROM group_messages WHERE sender_telegram_id=? AND created_at>?",
                 (uid, now - 60),
@@ -2404,9 +2416,10 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
             cur = await db.execute(
-                """INSERT INTO group_messages(group_id,sender_telegram_id,body,created_at)
-                   VALUES(?,?,?,?)""",
-                (group_id, uid, body, now),
+                """INSERT INTO group_messages
+                   (group_id,sender_telegram_id,body,media_id,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (group_id, uid, body, media_id, now),
             )
             message_id = int(cur.lastrowid)
             await db.commit()
@@ -2415,6 +2428,7 @@ def build_messenger_router(
             "group_id": group_id,
             "sender_id": uid,
             "body": body,
+            "media_id": media_id,
             "created_at": now,
         }
 
