@@ -10,6 +10,8 @@ on:
       - "requirements.txt"
       - "bot.py"
       - "messenger_api.py"
+      - "otp_webhook.py"
+      - "tests/test_otp_webhook.py"
       - ".github/workflows/container.yml"
   pull_request:
     paths:
@@ -46,7 +48,7 @@ jobs:
       - name: Compile server modules inside the image
         run: |
           docker run --rm --entrypoint python waysgram-authbot:test \
-            -m compileall -q bot.py messenger_api.py tests
+            -m compileall -q bot.py messenger_api.py otp_webhook.py tests
 
       - name: Verify healthcheck configuration
         run: |
