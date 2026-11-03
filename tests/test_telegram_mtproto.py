@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+
+import aiosqlite
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +86,15 @@ class FakeMTProtoClient:
 def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Path) -> None:
     async def scenario() -> None:
         database = tmp_path / "waysgram.sqlite3"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        # init_messenger_storage is normally called after Store.init() in bot.py.
+        # These two base tables satisfy its legacy gift-serial migration in isolation.
+        async with aiosqlite.connect(database) as db:
+            await db.execute(
+                "CREATE TABLE user_gifts (id INTEGER PRIMARY KEY, serial_number TEXT)"
+            )
+            await db.execute("CREATE TABLE gift_transactions (serial_number TEXT)")
+            await db.commit()
         await init_messenger_storage(database)
         client = FakeMTProtoClient()
         provider = TelegramMTProtoGiftCatalog(client)
