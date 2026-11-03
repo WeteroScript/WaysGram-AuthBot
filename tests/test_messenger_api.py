@@ -151,6 +151,56 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
     run(scenario())
 
 
+def test_direct_message_long_poll_returns_new_message(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89201, "longpoll_sender")
+    add_account(api_env, 89202, "longpoll_recipient")
+    add_session(path, 89201, "longpoll-sender-session")
+    add_session(path, 89202, "longpoll-recipient-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer longpoll-sender-session"}
+            recipient = {"Authorization": "Bearer longpoll-recipient-session"}
+
+            initial = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 89202, "body": "initial"},
+            )
+            assert initial.status_code == 201
+            initial_id = initial.json()["id"]
+
+            pending = asyncio.create_task(
+                client.get(
+                    f"/api/messages?with=89201&after_id={initial_id}&wait_seconds=5",
+                    headers=recipient,
+                )
+            )
+            await asyncio.sleep(0.2)
+            next_message = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 89202, "body": "arrived during long poll"},
+            )
+            assert next_message.status_code == 201
+
+            response = await asyncio.wait_for(pending, timeout=3)
+            assert response.status_code == 200
+            messages = response.json()["messages"]
+            assert len(messages) == 1
+            assert messages[0]["id"] == next_message.json()["id"]
+            assert messages[0]["body"] == "arrived during long poll"
+
+            invalid_wait = await client.get(
+                f"/api/messages?with=89201&after_id={next_message.json()['id']}&wait_seconds=21",
+                headers=recipient,
+            )
+            assert invalid_wait.status_code == 422
+
+    run(scenario())
+
+
 def test_direct_messages_and_channel_permissions(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 82001, "sender")
