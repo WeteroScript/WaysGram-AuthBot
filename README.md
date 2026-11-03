@@ -73,7 +73,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 | `ADMIN_ID` | Telegram ID администратора; по умолчанию 8888957702 |
 | `DATABASE_PATH` | Путь к SQLite; по умолчанию `data/waysgram_authbot.sqlite3` |
 | `INTERNAL_API_TOKEN` | Секрет для внутренних серверных маршрутов |
-| `OTP_FERNET_KEY` | Постоянный ключ шифрования одноразовых кодов |
+| `OTP_FERNET_KEY` | Постоянный ключ шифрования одноразовых кодов WaysGram |
+| `TELESRV_OTP_WEBHOOK_SECRET` | Отдельный HMAC-секрет для кодов входа от MTProto-сервера |
 | `INTERNAL_API_HOST` | Адрес привязки API; по умолчанию `0.0.0.0` |
 | `INTERNAL_API_PORT` | Порт API; по умолчанию используется `PORT`, затем 8081 |
 | `LOG_LEVEL` | Уровень логирования; по умолчанию `INFO` |
@@ -82,9 +83,26 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 При первом создании аккаунта WaysGram сервер одной SQL-транзакцией начисляет 5 000 внутренних Stars и 15 внутренних Gram. Повторное обновление профиля или повторная синхронизация номера не выдают бонус повторно. Обе операции записываются в `economy_transactions` как `welcome_bonus`.
 
+## Доставка кодов в MTProto-сервер
+
+Для подключения оригинального Telegram Android-клиента к совместимому собственному MTProto-серверу используется отдельный поток доставки. MTProto-сервер сам создаёт и проверяет код входа, а AuthWaysGram_bot только доставляет его владельцу виртуального номера.
+
+На стороне AuthBot:
+
+- Задай `TELESRV_OTP_WEBHOOK_SECRET` в окружении.
+- MTProto-сервер должен отправлять подписанные запросы на `POST /internal/v1/telesrv/otp`.
+- Поддерживается только `purpose=login_sms`, `channel=sms` и номер, ранее выданный и подтверждённый через AuthWaysGram_bot.
+- Запрос подписывается HMAC-SHA256: `X-Telesrv-Timestamp` и `X-Telesrv-Signature`; `Idempotency-Key` должен совпадать с `delivery_id`.
+- Код шифруется перед сохранением в SQLite и не возвращается в ответе webhook. Пользователь получает уведомление от бота и забирает код кнопкой «Получить код».
+- Повторная доставка с тем же `delivery_id` идемпотентна. Повтор с другим телом отклоняется.
+
+На стороне MTProto-сервера установи тот же секрет в `TELESRV_OTP_WEBHOOK_SECRET`, укажи URL этого маршрута в `TELESRV_OTP_WEBHOOK_URL`, включи `TELESRV_PHONE_CODE_DELIVERY_PROVIDER=webhook` и задай `TELESRV_PHONE_CODE_LENGTH=6`. Код MTProto-сервера остаётся единственным источником истины для `auth.signIn`; REST-маршруты WaysGram не проверяют эту сессию и не заменяют MTProto.
+
+Это не превращает текущий FastAPI AuthBot в MTProto-сервер. Он остаётся отдельным сервисом авторизации и доставки.
+
 ## API приложения WaysGram
 
-Клиентские маршруты используют Bearer-сессию. Для получения сессии пользователь должен иметь виртуальный номер и пройти CAPTCHA в AuthWaysGram_bot. Все идентификаторы пользователей в API — это реальные Telegram ID соответствующих аккаунтов WaysGram; отдельная таблица пользователей для второго backend не создаётся.
+Клиентские маршруты используют Bearer-сессию. Для получения REST-сессии пользователь должен иметь виртуальный номер и пройти CAPTCHA в AuthWaysGram_bot. Все идентификаторы пользователей в API — это Telegram ID соответствующих аккаунтов WaysGram; эта REST-идентичность отделена от пользовательских аккаунтов и авторизаций MTProto-сервера.
 
 ### Авторизация и профиль
 
