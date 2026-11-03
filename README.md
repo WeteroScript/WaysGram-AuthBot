@@ -120,6 +120,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 - `DELETE /api/groups/{id}/members/{telegram_id}` — покинуть группу или удалить участника с проверкой роли.
 - `POST /api/groups/{id}/admins` / `DELETE /api/groups/{id}/admins/{telegram_id}` — назначение и снятие администраторов владельцем.
 - `GET /api/groups/{id}/messages?after_id=...` и `POST /api/groups/{id}/messages` — история и отправка текста.
+  Для открытого экрана группы чтение с `after_id` поддерживает `wait_seconds=20`.
 
 Создатель получает роль владельца. Проверка членства выполняется для каждой операции чтения и отправки.
 
