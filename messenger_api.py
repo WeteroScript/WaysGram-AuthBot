@@ -630,6 +630,20 @@ def build_messenger_router(
             raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
         return user
 
+    async def require_owned_media(db: Any, media_id: str | None, owner_id: int) -> str | None:
+        value = str(media_id or "").strip()
+        if not value:
+            return None
+        if not re.fullmatch(r"[a-f0-9]{32}", value):
+            raise HTTPException(status_code=400, detail="Некорректный идентификатор изображения")
+        cur = await db.execute(
+            "SELECT 1 FROM media_assets WHERE id=? AND owner_telegram_id=?",
+            (value, owner_id),
+        )
+        if await cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Изображение не найдено или принадлежит другому аккаунту")
+        return value
+
     def media_storage_dir() -> Path:
         directory = Path(db_path()).parent / "waysgram_media"
         directory.mkdir(parents=True, exist_ok=True)
