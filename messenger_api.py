@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import time
+from io import BytesIO
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +16,7 @@ from typing import Any, Callable
 import aiosqlite
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 
@@ -23,8 +25,56 @@ DM_MESSAGES_PER_MINUTE = 30
 CHANNEL_POSTS_PER_MINUTE = 20
 LOGIN_REQUESTS_PER_IP_PER_HOUR = 100
 MAX_MESSAGE_LENGTH = 4000
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
+MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
 PHONE_RE = re.compile(r"^\+1[0-9]{10}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
+
+
+def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
+    """Decode, validate and re-encode a static raster image without metadata."""
+    try:
+        with Image.open(BytesIO(raw)) as source:
+            image_format = str(source.format or "").upper()
+            if image_format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("Поддерживаются только JPEG, PNG и WebP")
+            width, height = source.size
+            if width <= 0 or height <= 0 or width > 8192 or height > 8192:
+                raise ValueError("Размер изображения не поддерживается")
+            if width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("Изображение слишком большое по разрешению")
+            if getattr(source, "is_animated", False) or getattr(source, "n_frames", 1) != 1:
+                raise ValueError("Анимированные изображения пока не поддерживаются")
+            source.verify()
+
+        with Image.open(BytesIO(raw)) as source:
+            source.load()
+            image = ImageOps.exif_transpose(source)
+            has_alpha = "A" in image.getbands() or "transparency" in image.info
+            output = BytesIO()
+            if image_format == "JPEG":
+                image.convert("RGB").save(output, format="JPEG", quality=88, optimize=True)
+                mime_type, extension = "image/jpeg", ".jpg"
+            elif image_format == "PNG":
+                image.convert("RGBA" if has_alpha else "RGB").save(
+                    output, format="PNG", optimize=True
+                )
+                mime_type, extension = "image/png", ".png"
+            else:
+                image.convert("RGBA" if has_alpha else "RGB").save(
+                    output, format="WEBP", quality=88, method=4
+                )
+                mime_type, extension = "image/webp", ".webp"
+            normalized = output.getvalue()
+    except ValueError:
+        raise
+    except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+        raise ValueError("Файл не является корректным изображением") from exc
+    if not normalized or len(normalized) > MAX_IMAGE_UPLOAD_BYTES:
+        raise ValueError("После обработки изображение превышает лимит 10 МБ")
+    return normalized, mime_type, extension
 
 
 async def init_messenger_storage(database_path: Path) -> None:
@@ -38,6 +88,16 @@ async def init_messenger_storage(database_path: Path) -> None:
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS media_assets (
+                id TEXT PRIMARY KEY,
+                owner_telegram_id INTEGER NOT NULL,
+                storage_name TEXT NOT NULL UNIQUE,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_assets_owner_time
+                ON media_assets(owner_telegram_id,created_at);
             CREATE INDEX IF NOT EXISTS idx_api_sessions_user
                 ON api_sessions(telegram_id, expires_at);
             CREATE TABLE IF NOT EXISTS api_login_request_log (
@@ -251,6 +311,11 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON bot_messages(bot_id,sender_type,id);
             """
         )
+        for table_name in ("messages", "group_messages", "channel_messages"):
+            cur = await db.execute(f"PRAGMA table_info({table_name})")
+            columns = {str(row[1]) for row in await cur.fetchall()}
+            if "media_id" not in columns:
+                await db.execute(f"ALTER TABLE {table_name} ADD COLUMN media_id TEXT")
         # Older Telegram admin grants used WG- plus 8 hex digits. Expand them
         # once so the Android client can validate every existing gift serial.
         cur = await db.execute(
