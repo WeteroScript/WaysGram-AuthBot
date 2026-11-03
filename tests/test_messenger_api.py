@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import hashlib
 import sqlite3
 import time
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
+from PIL import Image
 
 import sys
 ROOT = Path(__file__).resolve().parents[1]
@@ -337,6 +339,74 @@ def test_direct_messages_and_channel_permissions(api_env) -> None:
                 headers=sender,
             )
             assert remaining.status_code == 404
+
+    run(scenario())
+
+
+def test_image_upload_direct_message_and_private_download(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89001, "image_sender")
+    add_account(api_env, 89002, "image_recipient")
+    add_account(api_env, 89003, "image_intruder")
+    add_session(path, 89001, "image-sender-session")
+    add_session(path, 89002, "image-recipient-session")
+    add_session(path, 89003, "image-intruder-session")
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (4, 3), (30, 100, 180)).save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer image-sender-session"}
+            recipient = {"Authorization": "Bearer image-recipient-session"}
+            intruder = {"Authorization": "Bearer image-intruder-session"}
+
+            invalid = await client.post(
+                "/api/media/images",
+                headers={**sender, "Content-Type": "image/png"},
+                content=b"not an image",
+            )
+            assert invalid.status_code == 415
+
+            uploaded = await client.post(
+                "/api/media/images",
+                headers={**sender, "Content-Type": "image/png"},
+                content=image_bytes,
+            )
+            assert uploaded.status_code == 201
+            media = uploaded.json()
+            assert len(media["id"]) == 32
+            assert media["mime_type"] == "image/png"
+            assert media["size_bytes"] > 0
+
+            wrong_owner = await client.post(
+                "/api/messages",
+                headers=recipient,
+                json={"recipient_id": 89001, "media_id": media["id"]},
+            )
+            assert wrong_owner.status_code == 404
+
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 89002, "media_id": media["id"]},
+            )
+            assert sent.status_code == 201
+            assert sent.json()["body"] == "Изображение"
+            assert sent.json()["media_id"] == media["id"]
+
+            history = await client.get("/api/messages?with=89002", headers=recipient)
+            assert history.status_code == 200
+            assert history.json()["messages"][0]["media_id"] == media["id"]
+
+            downloaded = await client.get(media["url"], headers=recipient)
+            assert downloaded.status_code == 200
+            assert downloaded.headers["content-type"].startswith("image/png")
+            assert downloaded.content == image_bytes
+
+            denied = await client.get(media["url"], headers=intruder)
+            assert denied.status_code == 404
 
     run(scenario())
 
