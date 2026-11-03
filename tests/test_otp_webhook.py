@@ -75,7 +75,8 @@ def signed_request(number: str, code: str, delivery_id: str, secret: str, now: i
 
 
 def test_parser_accepts_signed_login_sms_delivery() -> None:
-    body, headers = signed_request("+11234567890", "482601", "otp_test_1", "shared-secret", now=1_800_000_000)
+    # OwpenGram/telesrv sends normalized digits without the leading plus.
+    body, headers = signed_request("11234567890", "482601", "otp_test_1", "shared-secret", now=1_800_000_000)
     delivery = parse_telesrv_delivery(body, headers, "shared-secret", now=1_800_000_000)
     assert delivery.delivery_id == "otp_test_1"
     assert delivery.number == "+11234567890"
@@ -129,7 +130,7 @@ def test_telesrv_webhook_delivers_code_and_deduplicates(
     fake_bot = FakeBot()
     monkeypatch.setattr(bot_module, "bot", fake_bot)
     monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", "test-webhook-secret")
-    body, headers = signed_request(number, "510246", "otp_delivery_808", "test-webhook-secret")
+    body, headers = signed_request(number[1:], "510246", "otp_delivery_808", "test-webhook-secret")
 
     async def scenario() -> None:
         transport = httpx.ASGITransport(app=bot_module.app)
@@ -202,7 +203,7 @@ def test_telesrv_webhook_retries_bot_delivery_without_replacing_code(
     monkeypatch.setattr(bot_module, "bot", fake_bot)
     monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", "retry-webhook-secret")
     body, headers = signed_request(
-        number, "771204", "otp_delivery_retry_909", "retry-webhook-secret"
+        number[1:], "771204", "otp_delivery_retry_909", "retry-webhook-secret"
     )
 
     async def scenario() -> None:
@@ -243,7 +244,7 @@ def test_telesrv_webhook_retries_rate_limited_delivery_after_cooldown(
     monkeypatch.setattr(bot_module, "bot", fake_bot)
     monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", "rate-webhook-secret")
     body, headers = signed_request(
-        number, "661903", "otp_delivery_rate_910", "rate-webhook-secret"
+        number[1:], "661903", "otp_delivery_rate_910", "rate-webhook-secret"
     )
 
     async def scenario() -> None:
@@ -273,3 +274,12 @@ def test_telesrv_webhook_retries_rate_limited_delivery_after_cooldown(
             assert "661903" in fake_bot.messages[0][1]
 
     run(scenario())
+
+
+
+def test_parser_rejects_non_us_virtual_number_even_without_plus() -> None:
+    body, headers = signed_request("441234567890", "482601", "otp_test_bad_number", "shared-secret")
+    with pytest.raises(OtpWebhookError) as error:
+        parse_telesrv_delivery(body, headers, "shared-secret")
+    assert error.value.status_code == 422
+    assert error.value.error_code == "RECIPIENT_INVALID"
