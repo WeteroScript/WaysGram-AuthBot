@@ -1610,6 +1610,36 @@ def build_messenger_router(
         await current_user(authorization)
         return await channel_row(channel_id)
 
+    @router.get("/api/channels/{channel_id}/admins")
+    async def list_channel_admins(
+        channel_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        channel = await channel_row(channel_id)
+        uid = int(user["telegram_id"])
+        owner_id = int(channel["owner_telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT ca.telegram_id,a.username,a.display_name,ca.created_at
+                   FROM channel_admins ca
+                   LEFT JOIN accounts a ON a.telegram_id=ca.telegram_id
+                   WHERE ca.channel_id=?
+                   ORDER BY ca.created_at,ca.telegram_id""",
+                (channel_id,),
+            )
+            rows = await cur.fetchall()
+        role = "owner" if uid == owner_id else (
+            "admin" if any(int(row["telegram_id"]) == uid for row in rows) else "member"
+        )
+        return {
+            "channel_id": channel_id,
+            "owner_telegram_id": owner_id,
+            "my_role": role,
+            "admins": [dict(row) for row in rows],
+        }
+
     @router.get("/api/channels/{channel_id}/messages")
     async def list_channel_messages(
         channel_id: int,
