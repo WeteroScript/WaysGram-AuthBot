@@ -141,7 +141,8 @@ def test_telesrv_webhook_delivers_code_and_deduplicates(
             assert len(fake_bot.messages) == 1
             assert fake_bot.messages[0][0] == 9008
             assert "510246" in fake_bot.messages[0][1]
-            assert run(store.latest_code(number))[0] == "510246"
+            latest_code = await store.latest_code(number)
+            assert latest_code[0] == "510246"
 
             duplicate = await client.post("/v1/otp/deliveries", content=body, headers=headers)
             assert duplicate.status_code == 200
