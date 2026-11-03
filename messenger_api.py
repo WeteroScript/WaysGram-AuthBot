@@ -630,6 +630,144 @@ def build_messenger_router(
             raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
         return user
 
+    def media_storage_dir() -> Path:
+        directory = Path(db_path()).parent / "waysgram_media"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    @router.post("/api/media/images", status_code=201)
+    async def upload_image(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
+        if not declared_type.startswith("image/"):
+            raise HTTPException(status_code=415, detail="Загрузите файл изображения JPEG, PNG или WebP")
+        declared_length = request.headers.get("content-length")
+        if declared_length:
+            try:
+                if int(declared_length) > MAX_IMAGE_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Размер изображения превышает 10 МБ")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Некорректный Content-Length") from exc
+
+        incoming = bytearray()
+        async for chunk in request.stream():
+            if len(incoming) + len(chunk) > MAX_IMAGE_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Размер изображения превышает 10 МБ")
+            incoming.extend(chunk)
+        if not incoming:
+            raise HTTPException(status_code=400, detail="Файл изображения пуст")
+
+        try:
+            normalized, mime_type, extension = await asyncio.to_thread(
+                _normalize_uploaded_image, bytes(incoming)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=415, detail=str(exc)) from exc
+
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT COALESCE(SUM(size_bytes),0) AS total_bytes,
+                          SUM(CASE WHEN created_at>? THEN 1 ELSE 0 END) AS recent_uploads
+                   FROM media_assets WHERE owner_telegram_id=?""",
+                (now - 3600, uid),
+            )
+            quota = await cur.fetchone()
+            if int(quota["total_bytes"] or 0) + len(normalized) > MAX_USER_MEDIA_BYTES:
+                raise HTTPException(status_code=413, detail="Достигнут лимит хранилища изображений аккаунта")
+            if int(quota["recent_uploads"] or 0) >= MAX_USER_IMAGE_UPLOADS_PER_HOUR:
+                raise HTTPException(status_code=429, detail="Слишком много загрузок. Повторите позже.")
+
+        media_id = secrets.token_hex(16)
+        storage_name = media_id + extension
+        file_path = media_storage_dir() / storage_name
+        await asyncio.to_thread(file_path.write_bytes, normalized)
+        try:
+            async with aiosqlite.connect(db_path()) as db:
+                await db.execute(
+                    """INSERT INTO media_assets
+                       (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (media_id, uid, storage_name, mime_type, len(normalized), now),
+                )
+                await db.commit()
+        except Exception:
+            await asyncio.to_thread(file_path.unlink, missing_ok=True)
+            raise
+        return {
+            "id": media_id,
+            "mime_type": mime_type,
+            "size_bytes": len(normalized),
+            "url": f"/api/media/{media_id}",
+        }
+
+    @router.get("/api/media/{media_id}")
+    async def download_media(
+        media_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if not re.fullmatch(r"[a-f0-9]{32}", media_id):
+            raise HTTPException(status_code=404, detail="Изображение не найдено")
+
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM media_assets WHERE id=?",
+                (media_id,),
+            )
+            media = await cur.fetchone()
+            if media is None:
+                raise HTTPException(status_code=404, detail="Изображение не найдено")
+
+            allowed = int(media["owner_telegram_id"]) == uid
+            if not allowed:
+                cur = await db.execute(
+                    """SELECT 1 FROM messages
+                       WHERE media_id=? AND
+                       (sender_telegram_id=? OR recipient_telegram_id=?) LIMIT 1""",
+                    (media_id, uid, uid),
+                )
+                allowed = await cur.fetchone() is not None
+            if not allowed:
+                cur = await db.execute(
+                    """SELECT 1 FROM group_messages gm
+                       JOIN group_members member ON member.group_id=gm.group_id
+                       WHERE gm.media_id=? AND member.telegram_id=? LIMIT 1""",
+                    (media_id, uid),
+                )
+                allowed = await cur.fetchone() is not None
+            if not allowed:
+                cur = await db.execute(
+                    """SELECT 1 FROM channel_messages
+                       WHERE media_id=? LIMIT 1""",
+                    (media_id,),
+                )
+                allowed = await cur.fetchone() is not None
+            if not allowed:
+                raise HTTPException(status_code=404, detail="Изображение не найдено")
+
+        file_path = media_storage_dir() / str(media["storage_name"])
+        try:
+            content = await asyncio.to_thread(file_path.read_bytes)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Файл изображения отсутствует на сервере") from exc
+        return Response(
+            content=content,
+            media_type=str(media["mime_type"]),
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": "inline",
+            },
+        )
+
     def idempotency_descriptor(path: str, body: dict[str, Any], key: str | None):
         value = (key or "").strip()
         if not value:
