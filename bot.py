@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 from cryptography.fernet import Fernet, InvalidToken
 from messenger_api import build_messenger_router, init_messenger_storage, sync_telegram_gifts
+from telegram_mtproto import TelegramMTProtoGiftCatalog
 
 # All secrets are read only from hosting environment variables.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -36,6 +37,11 @@ INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 OTP_FERNET_KEY = os.getenv("OTP_FERNET_KEY", "").strip()
 INTERNAL_API_HOST = os.getenv("INTERNAL_API_HOST", "0.0.0.0")
 INTERNAL_API_PORT = int(os.getenv("INTERNAL_API_PORT") or os.getenv("PORT") or "8081")
+try:
+    TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
+except ValueError:
+    TELEGRAM_API_ID = 0
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 
 PHONE_RE = re.compile(r"^\+1\d{10}$")
 OTP_RE = re.compile(r"^\d{6}$")
@@ -407,6 +413,8 @@ class Store:
 
 store = Store(DATABASE_PATH)
 bot: Bot | None = None
+mtproto_client: Any | None = None
+mtproto_gift_catalog: TelegramMTProtoGiftCatalog | None = None
 router = Router()
 app = FastAPI(title="WaysGram AuthBot internal API", docs_url=None, redoc_url=None)
 CHALLENGES: dict[str, tuple[int, str, list[str], float]] = {}
@@ -708,6 +716,7 @@ app.include_router(
         store,
         lambda: bot,
         account_is_banned,
+        lambda: mtproto_gift_catalog,
     )
 )
 
@@ -1704,7 +1713,10 @@ async def sync_telegram_gifts_internal(
     if bot is None:
         raise HTTPException(status_code=503, detail="Telegram bot is not ready")
     try:
-        result = await sync_telegram_gifts(DATABASE_PATH, bot)
+        if mtproto_gift_catalog is not None:
+            result = await mtproto_gift_catalog.sync(DATABASE_PATH)
+        else:
+            result = await sync_telegram_gifts(DATABASE_PATH, bot)
     except Exception as exc:
         log.warning("Telegram gift catalog sync failed (%s)", type(exc).__name__)
         raise HTTPException(
@@ -1780,7 +1792,7 @@ async def verify_auth_code(
 
 
 async def main() -> None:
-    global bot
+    global bot, mtproto_client, mtproto_gift_catalog
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is required")
     if not OTP_FERNET_KEY:
@@ -1795,9 +1807,48 @@ async def main() -> None:
     await init_admin_storage()
     await init_messenger_storage(DATABASE_PATH)
     bot = Bot(token=BOT_TOKEN)
+    if TELEGRAM_API_ID > 0 and TELEGRAM_API_HASH:
+        try:
+            from telethon import TelegramClient
+
+            DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            session_base = DATABASE_PATH.parent / "waysgram_mtproto"
+            mtproto_client = TelegramClient(
+                str(session_base),
+                TELEGRAM_API_ID,
+                TELEGRAM_API_HASH,
+            )
+            await mtproto_client.start(bot_token=BOT_TOKEN)
+            identity = await mtproto_client.get_me()
+            if identity is None or not bool(getattr(identity, "bot", False)):
+                raise RuntimeError("MTProto identity is not an authorized bot")
+            session_file = Path(str(session_base) + ".session")
+            if session_file.exists():
+                os.chmod(session_file, 0o600)
+            mtproto_gift_catalog = TelegramMTProtoGiftCatalog(mtproto_client)
+            sync_result = await mtproto_gift_catalog.sync(DATABASE_PATH)
+            log.info(
+                "Loaded %s Telegram gifts through MTProto",
+                sync_result["gift_count"],
+            )
+        except Exception as exc:
+            log.warning("MTProto gift catalog unavailable (%s); using Bot API fallback", type(exc).__name__)
+            mtproto_gift_catalog = None
+            if mtproto_client is not None:
+                try:
+                    await mtproto_client.disconnect()
+                except Exception:
+                    pass
+                mtproto_client = None
+    elif TELEGRAM_API_ID or TELEGRAM_API_HASH:
+        log.warning("Both TELEGRAM_API_ID and TELEGRAM_API_HASH are required for MTProto; using Bot API fallback")
+    else:
+        log.info("Telegram MTProto catalog is disabled; configure TELEGRAM_API_ID and TELEGRAM_API_HASH to enable it")
+
     try:
-        sync_result = await sync_telegram_gifts(DATABASE_PATH, bot)
-        log.info("Loaded %s Telegram gifts into catalog", sync_result["gift_count"])
+        if mtproto_gift_catalog is None:
+            sync_result = await sync_telegram_gifts(DATABASE_PATH, bot)
+            log.info("Loaded %s Telegram gifts through Bot API fallback", sync_result["gift_count"])
     except Exception as exc:
         # Keep login and the rest of the API online if Telegram's catalog is temporarily unavailable.
         log.warning("Initial Telegram gift catalog sync failed (%s)", type(exc).__name__)
@@ -1817,6 +1868,11 @@ async def main() -> None:
     try:
         await asyncio.gather(dispatcher.start_polling(bot), server.serve())
     finally:
+        if mtproto_client is not None:
+            try:
+                await mtproto_client.disconnect()
+            except Exception as exc:
+                log.warning("Could not disconnect MTProto client (%s)", type(exc).__name__)
         await bot.session.close()
 
 
