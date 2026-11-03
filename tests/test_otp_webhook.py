@@ -176,3 +176,100 @@ def test_telesrv_webhook_requires_configured_secret(
             assert response.status_code == 503
 
     run(scenario())
+
+
+
+def test_telesrv_webhook_retries_bot_delivery_without_replacing_code(
+    store: bot_module.Store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run(store.upsert_user(909, 9009))
+    run(store.set_verified(909, True))
+    number = run(store.allocate_number(909))
+
+    class FailOnceBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def send_message(self, chat_id: int, text: str):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary Telegram delivery failure")
+            return await super().send_message(chat_id, text)
+
+    fake_bot = FailOnceBot()
+    monkeypatch.setattr(bot_module, "bot", fake_bot)
+    monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", "retry-webhook-secret")
+    body, headers = signed_request(
+        number, "771204", "otp_delivery_retry_909", "retry-webhook-secret"
+    )
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=bot_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = await client.post("/v1/otp/deliveries", content=body, headers=headers)
+            assert first.status_code == 502
+            assert first.json()["detail"]["error_code"] == "BOT_DELIVERY_FAILED"
+            assert first.json()["detail"]["retryable"] is True
+            assert (await store.latest_code(number))[0] == "771204"
+
+            retry = await client.post("/v1/otp/deliveries", content=body, headers=headers)
+            assert retry.status_code == 200
+            assert retry.json()["accepted"] is True
+            assert retry.json()["message_id"] == "authwaysgram:1"
+            assert len(fake_bot.messages) == 1
+            assert "771204" in fake_bot.messages[0][1]
+            assert fake_bot.attempts == 2
+            assert (await store.latest_code(number))[0] == "771204"
+
+            duplicate = await client.post("/v1/otp/deliveries", content=body, headers=headers)
+            assert duplicate.status_code == 200
+            assert duplicate.json()["duplicate"] is True
+            assert len(fake_bot.messages) == 1
+            assert fake_bot.attempts == 2
+
+    run(scenario())
+
+
+def test_telesrv_webhook_retries_rate_limited_delivery_after_cooldown(
+    store: bot_module.Store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run(store.upsert_user(910, 9010))
+    run(store.set_verified(910, True))
+    number = run(store.allocate_number(910))
+    fake_bot = FakeBot()
+    monkeypatch.setattr(bot_module, "bot", fake_bot)
+    monkeypatch.setattr(bot_module, "TELESRV_OTP_WEBHOOK_SECRET", "rate-webhook-secret")
+    body, headers = signed_request(
+        number, "661903", "otp_delivery_rate_910", "rate-webhook-secret"
+    )
+
+    async def scenario() -> None:
+        with __import__("sqlite3").connect(store.path) as conn:
+            conn.execute(
+                "UPDATE numbers SET last_code_requested_at=? WHERE number=?",
+                (int(time.time()), number),
+            )
+
+        transport = httpx.ASGITransport(app=bot_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            limited = await client.post("/v1/otp/deliveries", content=body, headers=headers)
+            assert limited.status_code == 429
+            assert limited.json()["detail"]["retryable"] is True
+            assert fake_bot.messages == []
+
+            with __import__("sqlite3").connect(store.path) as conn:
+                conn.execute(
+                    "UPDATE numbers SET last_code_requested_at=? WHERE number=?",
+                    (int(time.time()) - 31, number),
+                )
+
+            retry = await client.post("/v1/otp/deliveries", content=body, headers=headers)
+            assert retry.status_code == 200
+            assert retry.json()["accepted"] is True
+            assert len(fake_bot.messages) == 1
+            assert "661903" in fake_bot.messages[0][1]
+
+    run(scenario())

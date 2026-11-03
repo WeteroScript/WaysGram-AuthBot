@@ -1742,8 +1742,8 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
     if await account_is_banned(telegram_id):
         raise HTTPException(status_code=403, detail="WaysGram account is suspended")
 
-    # Persist an idempotency receipt before sending. If the process restarts
-    # during delivery, a repeated webhook cannot silently send the same OTP twice.
+    # Persist an idempotency receipt before delivery. A failed notification or
+    # a transient rate limit must remain retryable with the same delivery_id.
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
@@ -1766,36 +1766,56 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
                     "message_id": str(old_message_id),
                     "duplicate": True,
                 }
-            raise HTTPException(
-                status_code=409,
-                detail={"error_code": "DELIVERY_ALREADY_PROCESSED", "status": str(old_status)},
-            )
-
-        await db.execute(
-            """INSERT INTO otp_webhook_receipts
-               (delivery_id,payload_sha256,number,status,message_id,expires_at,created_at)
-               VALUES(?,?,?,'pending','',?,?)""",
-            (
-                delivery.delivery_id,
-                delivery.payload_sha256,
-                delivery.number,
-                delivery.expires_at,
-                int(time.time()),
-            ),
-        )
-        await db.commit()
-
-    if not await store.save_code(delivery.number, delivery.code, delivery.expires_in):
-        async with aiosqlite.connect(DATABASE_PATH) as db:
+            if old_status not in {"pending", "failed", "code_stored"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error_code": "DELIVERY_ALREADY_PROCESSED", "status": str(old_status)},
+                )
+        else:
             await db.execute(
-                "UPDATE otp_webhook_receipts SET status='failed' WHERE delivery_id=?",
-                (delivery.delivery_id,),
+                """INSERT INTO otp_webhook_receipts
+                   (delivery_id,payload_sha256,number,status,message_id,expires_at,created_at)
+                   VALUES(?,?,?,'pending','',?,?)""",
+                (
+                    delivery.delivery_id,
+                    delivery.payload_sha256,
+                    delivery.number,
+                    delivery.expires_at,
+                    int(time.time()),
+                ),
             )
             await db.commit()
-        raise HTTPException(
-            status_code=429,
-            detail={"error_code": "RECIPIENT_RATE_LIMITED", "retryable": True},
+
+    # A retry after a process interruption may arrive after save_code committed
+    # but before the receipt status changed. Reuse the active identical OTP
+    # instead of attempting a second write (which the per-number cooldown blocks).
+    latest_code = await store.latest_code(delivery.number)
+    code_already_stored = bool(
+        latest_code
+        and latest_code[0] == delivery.code
+        and latest_code[1] > 0
+    )
+    if not code_already_stored:
+        if not await store.save_code(delivery.number, delivery.code, delivery.expires_in):
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute(
+                    """UPDATE otp_webhook_receipts SET status='failed'
+                       WHERE delivery_id=? AND status IN ('pending','failed')""",
+                    (delivery.delivery_id,),
+                )
+                await db.commit()
+            raise HTTPException(
+                status_code=429,
+                detail={"error_code": "RECIPIENT_RATE_LIMITED", "retryable": True},
+            )
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            """UPDATE otp_webhook_receipts SET status='code_stored'
+               WHERE delivery_id=? AND status != 'delivered'""",
+            (delivery.delivery_id,),
         )
+        await db.commit()
 
     language = str(owner.get("language") or "en")
     minutes = max(1, (delivery.expires_in + 59) // 60)
@@ -1810,12 +1830,8 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
             delivery.delivery_id,
             type(exc).__name__,
         )
-        async with aiosqlite.connect(DATABASE_PATH) as db:
-            await db.execute(
-                "UPDATE otp_webhook_receipts SET status='failed' WHERE delivery_id=?",
-                (delivery.delivery_id,),
-            )
-            await db.commit()
+        # Keep status=code_stored so the same signed request can retry the
+        # notification without rotating the OTP or tripping the send cooldown.
         raise HTTPException(
             status_code=502,
             detail={"error_code": "BOT_DELIVERY_FAILED", "retryable": True},
