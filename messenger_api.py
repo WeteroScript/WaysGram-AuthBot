@@ -676,7 +676,9 @@ def build_messenger_router(
             raise HTTPException(status_code=404, detail="Изображение не найдено или принадлежит другому аккаунту")
         return value
 
-    async def default_media_message_body(db: Any, media_id: str) -> str:
+    async def media_message_fields(db: Any, media_id: str | None) -> dict[str, str | None]:
+        if not media_id:
+            return {"media_type": None, "media_name": None}
         cur = await db.execute(
             "SELECT mime_type,original_name FROM media_assets WHERE id=?",
             (media_id,),
@@ -684,9 +686,16 @@ def build_messenger_router(
         media = await cur.fetchone()
         if media is None:
             raise HTTPException(status_code=404, detail="Вложение не найдено")
-        if str(media[0]).startswith("image/"):
+        return {
+            "media_type": str(media[0]),
+            "media_name": str(media[1] or "document"),
+        }
+
+    async def default_media_message_body(db: Any, media_id: str) -> str:
+        fields = await media_message_fields(db, media_id)
+        if str(fields["media_type"] or "").startswith("image/"):
             return "Изображение"
-        return "Документ: " + str(media[1] or "document")
+        return "Документ: " + str(fields["media_name"] or "document")
 
     def media_storage_dir() -> Path:
         directory = Path(db_path()).parent / "waysgram_media"
@@ -2003,14 +2012,18 @@ def build_messenger_router(
                 db.row_factory = aiosqlite.Row
                 if after_id:
                     cur = await db.execute(
-                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
+                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at,
+                                  (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
+                                  (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                            FROM channel_messages WHERE channel_id=? AND id>?
                            ORDER BY id ASC LIMIT 100""",
                         (channel_id, after_id),
                     )
                 else:
                     cur = await db.execute(
-                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at
+                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,created_at,
+                                  (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
+                                  (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                            FROM channel_messages WHERE channel_id=?
                            ORDER BY id DESC LIMIT 100""",
                         (channel_id,),
@@ -2050,6 +2063,7 @@ def build_messenger_router(
             media_id = await require_owned_media(db, media_id, uid)
             if not body:
                 body = _message_body(await default_media_message_body(db, media_id))
+            media_fields = await media_message_fields(db, media_id)
             cur = await db.execute(
                 "SELECT COUNT(*) FROM channel_messages WHERE author_telegram_id=? AND created_at>?",
                 (uid, now - 60),
@@ -2064,7 +2078,7 @@ def build_messenger_router(
                 (channel_id, uid, body, media_id, now),
             )
             message_id = int(cur.lastrowid)
-            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "created_at": now}
+            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, **media_fields, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
         return result
@@ -2160,7 +2174,9 @@ def build_messenger_router(
         params: tuple[Any, ...] = (uid, peer, peer, uid)
         base = """
             SELECT id,sender_telegram_id AS sender_id,
-                   recipient_telegram_id AS recipient_id,body,media_id,created_at
+                   recipient_telegram_id AS recipient_id,body,media_id,created_at,
+                   (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
+                   (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
             FROM messages WHERE
             ((sender_telegram_id=? AND recipient_telegram_id=?) OR
              (sender_telegram_id=? AND recipient_telegram_id=?))
@@ -2228,6 +2244,7 @@ def build_messenger_router(
             media_id = await require_owned_media(db, media_id, uid)
             if not body:
                 body = _message_body(await default_media_message_body(db, media_id))
+            media_fields = await media_message_fields(db, media_id)
             cur = await db.execute(
                 "SELECT is_banned FROM accounts WHERE telegram_id=?",
                 (recipient_id,),
@@ -2260,6 +2277,7 @@ def build_messenger_router(
                 "recipient_id": recipient_id,
                 "body": body,
                 "media_id": media_id,
+                **media_fields,
                 "created_at": now,
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
@@ -2531,13 +2549,17 @@ def build_messenger_router(
                 db.row_factory = aiosqlite.Row
                 if after_id:
                     cur = await db.execute(
-                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
+                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at,
+                                  (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
+                                  (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                            FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
                         (group_id, after_id),
                     )
                 else:
                     cur = await db.execute(
-                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at
+                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,created_at,
+                                  (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
+                                  (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                            FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
                         (group_id,),
                     )
@@ -2568,6 +2590,7 @@ def build_messenger_router(
             media_id = await require_owned_media(db, media_id, uid)
             if not body:
                 body = _message_body(await default_media_message_body(db, media_id))
+            media_fields = await media_message_fields(db, media_id)
             cur = await db.execute(
                 "SELECT COUNT(*) FROM group_messages WHERE sender_telegram_id=? AND created_at>?",
                 (uid, now - 60),
@@ -2589,6 +2612,7 @@ def build_messenger_router(
             "sender_id": uid,
             "body": body,
             "media_id": media_id,
+            **media_fields,
             "created_at": now,
         }
 
