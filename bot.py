@@ -1744,7 +1744,7 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
 
     # Persist an idempotency receipt before sending. If the process restarts
     # during delivery, a repeated webhook cannot silently send the same OTP twice.
-    async with aiosqlite.connect(db_path()) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute(
             "DELETE FROM otp_webhook_receipts WHERE expires_at < ?",
@@ -1786,7 +1786,7 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
         await db.commit()
 
     if not await store.save_code(delivery.number, delivery.code, delivery.expires_in):
-        async with aiosqlite.connect(db_path()) as db:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute(
                 "UPDATE otp_webhook_receipts SET status='failed' WHERE delivery_id=?",
                 (delivery.delivery_id,),
@@ -1810,7 +1810,7 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
             delivery.delivery_id,
             type(exc).__name__,
         )
-        async with aiosqlite.connect(db_path()) as db:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute(
                 "UPDATE otp_webhook_receipts SET status='failed' WHERE delivery_id=?",
                 (delivery.delivery_id,),
@@ -1825,7 +1825,7 @@ async def receive_telesrv_otp(request: Request) -> dict[str, Any]:
     message_id = f"authwaysgram:{telegram_message_id}" if telegram_message_id else (
         "authwaysgram:" + delivery.delivery_id[:48]
     )
-    async with aiosqlite.connect(db_path()) as db:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
             "UPDATE otp_webhook_receipts SET status='delivered',message_id=? WHERE delivery_id=?",
             (message_id, delivery.delivery_id),
