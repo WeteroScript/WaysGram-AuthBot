@@ -579,6 +579,8 @@ def test_group_creation_roles_membership_and_messages(api_env) -> None:
 
             member_list = await client.get(f"/api/groups/{group_id}", headers=owner)
             assert member_list.status_code == 200
+            assert member_list.json()["my_telegram_id"] == 85001
+            assert member_list.json()["my_role"] == "owner"
             roles = {row["telegram_id"]: row["role"] for row in member_list.json()["members"]}
             assert roles == {85001: "owner", 85002: "admin", 85003: "member"}
 
