@@ -413,6 +413,94 @@ def test_image_upload_direct_message_and_private_download(api_env) -> None:
     run(scenario())
 
 
+def test_image_attachments_in_group_and_channel_messages(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89101, "media_owner")
+    add_account(api_env, 89102, "media_member")
+    add_account(api_env, 89103, "media_observer")
+    add_session(path, 89101, "media-owner-session")
+    add_session(path, 89102, "media-member-session")
+    add_session(path, 89103, "media-observer-session")
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (5, 4), (80, 140, 40)).save(image_buffer, format="JPEG")
+    image_bytes = image_buffer.getvalue()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer media-owner-session"}
+            member = {"Authorization": "Bearer media-member-session"}
+            observer = {"Authorization": "Bearer media-observer-session"}
+
+            uploaded = await client.post(
+                "/api/media/images",
+                headers={**owner, "Content-Type": "image/jpeg"},
+                content=image_bytes,
+            )
+            assert uploaded.status_code == 201
+            media_id = uploaded.json()["id"]
+            media_url = uploaded.json()["url"]
+
+            group = await client.post(
+                "/api/groups",
+                headers=owner,
+                json={"title": "Image group", "username": "image_group"},
+            )
+            assert group.status_code == 201
+            group_id = group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=owner,
+                json={"telegram_id": 89102},
+            )
+            assert joined.status_code == 201
+
+            group_post = await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=owner,
+                json={"media_id": media_id},
+            )
+            assert group_post.status_code == 201
+            group_history = await client.get(
+                f"/api/groups/{group_id}/messages",
+                headers=member,
+            )
+            assert group_history.status_code == 200
+            assert group_history.json()["messages"][0]["media_id"] == media_id
+
+            member_download = await client.get(media_url, headers=member)
+            assert member_download.status_code == 200
+            with Image.open(BytesIO(member_download.content)) as decoded:
+                assert decoded.size == (5, 4)
+
+            group_denied = await client.get(media_url, headers=observer)
+            assert group_denied.status_code == 404
+
+            channel = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"username": "image_channel", "title": "Image channel"},
+            )
+            assert channel.status_code == 201
+            channel_id = channel.json()["id"]
+            channel_post = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+                json={"media_id": media_id},
+            )
+            assert channel_post.status_code == 201
+            channel_history = await client.get(
+                f"/api/channels/{channel_id}/messages",
+                headers=observer,
+            )
+            assert channel_history.status_code == 200
+            assert channel_history.json()["messages"][0]["media_id"] == media_id
+            channel_download = await client.get(media_url, headers=observer)
+            assert channel_download.status_code == 200
+
+    run(scenario())
+
+
 def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 83001, "buyer")
