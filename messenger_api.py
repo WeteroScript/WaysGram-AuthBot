@@ -683,26 +683,28 @@ def build_messenger_router(
             raise HTTPException(status_code=415, detail=str(exc)) from exc
 
         now = int(time.time())
-        async with aiosqlite.connect(db_path()) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                """SELECT COALESCE(SUM(size_bytes),0) AS total_bytes,
-                          SUM(CASE WHEN created_at>? THEN 1 ELSE 0 END) AS recent_uploads
-                   FROM media_assets WHERE owner_telegram_id=?""",
-                (now - 3600, uid),
-            )
-            quota = await cur.fetchone()
-            if int(quota["total_bytes"] or 0) + len(normalized) > MAX_USER_MEDIA_BYTES:
-                raise HTTPException(status_code=413, detail="Достигнут лимит хранилища изображений аккаунта")
-            if int(quota["recent_uploads"] or 0) >= MAX_USER_IMAGE_UPLOADS_PER_HOUR:
-                raise HTTPException(status_code=429, detail="Слишком много загрузок. Повторите позже.")
-
         media_id = secrets.token_hex(16)
         storage_name = media_id + extension
         file_path = media_storage_dir() / storage_name
-        await asyncio.to_thread(file_path.write_bytes, normalized)
         try:
             async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+                cur = await db.execute(
+                    """SELECT COALESCE(SUM(size_bytes),0) AS total_bytes,
+                              SUM(CASE WHEN created_at>? THEN 1 ELSE 0 END) AS recent_uploads
+                       FROM media_assets WHERE owner_telegram_id=?""",
+                    (now - 3600, uid),
+                )
+                quota = await cur.fetchone()
+                if int(quota["total_bytes"] or 0) + len(normalized) > MAX_USER_MEDIA_BYTES:
+                    await db.rollback()
+                    raise HTTPException(status_code=413, detail="Достигнут лимит хранилища изображений аккаунта")
+                if int(quota["recent_uploads"] or 0) >= MAX_USER_IMAGE_UPLOADS_PER_HOUR:
+                    await db.rollback()
+                    raise HTTPException(status_code=429, detail="Слишком много загрузок. Повторите позже.")
+
+                await asyncio.to_thread(file_path.write_bytes, normalized)
                 await db.execute(
                     """INSERT INTO media_assets
                        (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at)
