@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import db_split
 
 import aiosqlite
 from pathlib import Path
@@ -106,7 +107,7 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
         assert type(client.requests[0]).__name__ == "GetStarGiftsRequest"
         assert client.requests[0].hash == 0
 
-        with sqlite3.connect(database) as db:
+        with db_split.sqlite_connect(database) as db:
             row = db.execute(
                 """SELECT gift_id,title,stars,limited,sold_out,require_premium,
                           limited_per_user,auction,availability_remains,availability_total,
