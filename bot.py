@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -170,6 +171,13 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_auth_codes_number_expiry
                     ON auth_codes(number, expires_at DESC);
+                CREATE TABLE IF NOT EXISTS captcha_challenges (
+                    challenge_id TEXT PRIMARY KEY,
+                    telegram_id INTEGER NOT NULL,
+                    target TEXT NOT NULL,
+                    choices TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS otp_webhook_receipts (
                     delivery_id TEXT PRIMARY KEY,
                     payload_sha256 TEXT NOT NULL,
@@ -238,6 +246,31 @@ class Store:
                 (1 if verified else 0, telegram_id),
             )
             await db.commit()
+
+    async def save_challenge(self, challenge_id: str, telegram_id: int, target: str, choices: list[str], expires_at: float) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM captcha_challenges WHERE expires_at<=?", (time.time(),))
+            await db.execute(
+                "INSERT OR REPLACE INTO captcha_challenges(challenge_id,telegram_id,target,choices,expires_at) VALUES(?,?,?,?,?)",
+                (challenge_id, telegram_id, target, json.dumps(choices, ensure_ascii=False), expires_at),
+            )
+            await db.commit()
+
+    async def take_challenge(self, challenge_id: str, telegram_id: int) -> tuple[str, dict[str, Any] | None]:
+        """Returns ("ok", challenge) and forgets it, ("other", None) for someone else's challenge, ("missing", None)."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT telegram_id,target,choices,expires_at FROM captcha_challenges WHERE challenge_id=?",
+                (challenge_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return "missing", None
+            if int(row[0]) != telegram_id:
+                return "other", None
+            await db.execute("DELETE FROM captcha_challenges WHERE challenge_id=?", (challenge_id,))
+            await db.commit()
+            return "ok", {"target": str(row[1]), "choices": json.loads(row[2]), "expires_at": float(row[3])}
 
     async def get_user(self, telegram_id: int) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.path) as db:
@@ -429,7 +462,6 @@ mtproto_client: Any | None = None
 mtproto_gift_catalog: TelegramMTProtoGiftCatalog | None = None
 router = Router()
 app = FastAPI(title="WaysGram AuthBot internal API", docs_url=None, redoc_url=None)
-CHALLENGES: dict[str, tuple[int, str, list[str], float]] = {}
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 
 
@@ -454,19 +486,25 @@ def language_keyboard(include_back: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def safe_callback_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
+    """Answering a button press can fail when Telegram already considers it too old; that must not stop the flow."""
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except Exception as exc:
+        log.info("Could not answer callback (%s)", type(exc).__name__)
+
+
 async def ask_captcha(message: Message, telegram_id: int, lang: str) -> None:
     now = time.time()
-    for old_id, challenge in list(CHALLENGES.items()):
-        if challenge[3] <= now:
-            CHALLENGES.pop(old_id, None)
-
     target = random.choice(EMOJI)
     choices = random.sample(EMOJI, 9)
     if target not in choices:
         choices[random.randrange(len(choices))] = target
     random.shuffle(choices)
     challenge_id = secrets.token_urlsafe(8).replace("-", "a").replace("_", "b")[:12]
-    CHALLENGES[challenge_id] = (telegram_id, target, choices, now + 180)
+    # Stored in the database, so a restart of the bot does not invalidate the buttons already on screen.
+    await store.save_challenge(challenge_id, telegram_id, target, choices, now + 600)
+    log.info("Captcha issued to user %s", telegram_id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=choices[i], callback_data=f"cap:{challenge_id}:{i}")
@@ -513,31 +551,34 @@ async def captcha_handler(callback: CallbackQuery) -> None:
         return
     parts = callback.data.split(":")
     if len(parts) != 3:
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
-    challenge = CHALLENGES.get(parts[1])
     user = await store.get_user(callback.from_user.id)
     lang = str(user.get("language") if user else "en")
-    if challenge and challenge[0] != callback.from_user.id:
-        await callback.answer("This check belongs to another user.", show_alert=True)
+    status, challenge = await store.take_challenge(parts[1], callback.from_user.id)
+    if status == "other":
+        await safe_callback_answer(callback, "This check belongs to another user.", True)
         return
-    CHALLENGES.pop(parts[1], None)
-    if not challenge or challenge[3] < time.time():
-        await callback.answer("Expired", show_alert=True)
+    if status == "missing" or not challenge or challenge["expires_at"] < time.time():
+        log.info("Captcha expired or unknown for user %s", callback.from_user.id)
+        await safe_callback_answer(callback, "Expired", True)
         await ask_captcha(callback.message, callback.from_user.id, lang)
         return
     try:
-        selected = challenge[2][int(parts[2])]
+        selected = challenge["choices"][int(parts[2])]
     except (ValueError, IndexError):
-        await callback.answer()
+        await safe_callback_answer(callback)
         return
-    if selected != challenge[1]:
-        await callback.answer(tr(lang, "captcha_failed"), show_alert=True)
+    if selected != challenge["target"]:
+        log.info("Captcha answered wrongly by user %s", callback.from_user.id)
+        await safe_callback_answer(callback, tr(lang, "captcha_failed"), True)
         await ask_captcha(callback.message, callback.from_user.id, lang)
         return
     await store.set_verified(callback.from_user.id, True)
-    await callback.answer()
+    log.info("Captcha passed by user %s", callback.from_user.id)
+    # Show the menu first; the button press is acknowledged afterwards and its failure is harmless.
     await callback.message.answer(tr(lang, "welcome"), reply_markup=main_keyboard(lang))
+    await safe_callback_answer(callback)
 
 
 @router.message(F.text.in_(["Получить номер", "Get number"]))
