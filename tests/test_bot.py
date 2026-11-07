@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import db_split
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,7 +66,7 @@ def test_otp_is_encrypted_and_consumed_once(store: bot_module.Store, tmp_path: P
 
     assert run(store.save_code(number, "482601", 300)) is True
 
-    with sqlite3.connect(store.path) as conn:
+    with db_split.sqlite_connect(store.path) as conn:
         stored_code, encrypted = conn.execute(
             "SELECT code, encrypted FROM auth_codes WHERE number=?", (number,)
         ).fetchone()
@@ -86,7 +87,7 @@ def test_otp_request_cooldown_and_attempt_limit(store: bot_module.Store) -> None
     assert run(store.save_code(number, "100002", 300)) is False
 
     # Exercise the five-attempt limit without waiting for the cooldown.
-    with sqlite3.connect(store.path) as conn:
+    with db_split.sqlite_connect(store.path) as conn:
         conn.execute(
             "UPDATE numbers SET last_code_requested_at=? WHERE number=?",
             (int(time.time()) - 31, number),
@@ -160,7 +161,7 @@ def test_internal_api_requires_secret_and_delivers_otp(store: bot_module.Store, 
 def test_legacy_plaintext_codes_are_encrypted_during_migration(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     now = int(time.time())
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         conn.executescript(
             """
             CREATE TABLE users (
@@ -204,7 +205,7 @@ def test_legacy_plaintext_codes_are_encrypted_during_migration(tmp_path: Path) -
     instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
     run(instance.init())
 
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         stored_code, encrypted = conn.execute(
             "SELECT code, encrypted FROM auth_codes"
         ).fetchone()
@@ -237,11 +238,11 @@ def test_admin_account_storage_and_suspension(tmp_path: Path, monkeypatch: pytes
     number = run(instance.allocate_number(707))
     run(bot_module.init_admin_storage())
     assert run(bot_module.account_is_banned(707)) is False
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         saved = conn.execute("SELECT virtual_number FROM accounts WHERE telegram_id=707").fetchone()
     assert saved == (number,)
 
-    with sqlite3.connect(bot_module.DATABASE_PATH) as conn:
+    with db_split.sqlite_connect(bot_module.DATABASE_PATH) as conn:
         conn.execute("UPDATE accounts SET is_banned=1 WHERE telegram_id=707")
 
     assert run(bot_module.account_is_banned(707)) is True
@@ -286,7 +287,7 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
     run(bot_module.ensure_account(90099, moderator_number, "moderator", "Moderator"))
 
     now = int(time.time())
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         cur = conn.execute(
             "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Test Gift',5,2,?)",
             (now,),
@@ -310,14 +311,14 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
     edit_message = FakeAdminMessage("9")
     run(bot_module.admin_text_input(edit_message))
     assert edit_message.responses
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         supply = conn.execute("SELECT supply FROM gift_catalog WHERE id=?", (gift_id,)).fetchone()[0]
     assert supply == 9
 
     grant_callback = FakeAdminCallback(f"wgadm:grantgift:{bot_module.ADMIN_ID}:{gift_id}")
     run(bot_module.admin_callback(grant_callback))
     assert grant_callback.answered
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         serial = conn.execute(
             "SELECT serial_number FROM user_gifts WHERE owner_telegram_id=?",
             (bot_module.ADMIN_ID,),
@@ -328,7 +329,7 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
     remove_admin_callback = FakeAdminCallback(f"wgadm:channeladminremove:{channel_id}:90099")
     run(bot_module.admin_callback(remove_admin_callback))
     assert remove_admin_callback.answered
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         assert conn.execute(
             "SELECT 1 FROM channel_admins WHERE channel_id=? AND telegram_id=90099",
             (channel_id,),
@@ -337,7 +338,7 @@ def test_admin_can_edit_gift_catalog_and_moderate_channels(tmp_path: Path, monke
     callback = FakeAdminCallback(f"wgadm:channeldelete:{channel_id}")
     run(bot_module.admin_callback(callback))
     assert callback.answered
-    with sqlite3.connect(path) as conn:
+    with db_split.sqlite_connect(path) as conn:
         assert conn.execute("SELECT 1 FROM channels WHERE id=?", (channel_id,)).fetchone() is None
         assert conn.execute("SELECT 1 FROM channel_messages WHERE channel_id=?", (channel_id,)).fetchone() is None
         assert conn.execute("SELECT 1 FROM channel_admins WHERE channel_id=?", (channel_id,)).fetchone() is None
@@ -355,7 +356,7 @@ def test_new_account_receives_one_time_welcome_balances(
 
     run(bot_module.ensure_account(user_id, number, "starter", "Starter User"))
 
-    with sqlite3.connect(store.path) as conn:
+    with db_split.sqlite_connect(store.path) as conn:
         stars, grams = conn.execute(
             "SELECT stars, grams FROM accounts WHERE telegram_id=?", (user_id,)
         ).fetchone()
@@ -372,14 +373,14 @@ def test_new_account_receives_one_time_welcome_balances(
     ]
 
     # A repeated number/account sync must not issue the welcome balance twice.
-    with sqlite3.connect(store.path) as conn:
+    with db_split.sqlite_connect(store.path) as conn:
         conn.execute(
             "UPDATE accounts SET stars=4900, grams=14 WHERE telegram_id=?",
             (user_id,),
         )
     run(bot_module.ensure_account(user_id, number, "starter", "Starter User"))
 
-    with sqlite3.connect(store.path) as conn:
+    with db_split.sqlite_connect(store.path) as conn:
         stars, grams = conn.execute(
             "SELECT stars, grams FROM accounts WHERE telegram_id=?", (user_id,)
         ).fetchone()
