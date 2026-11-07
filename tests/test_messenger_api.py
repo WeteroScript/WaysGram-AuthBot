@@ -4,6 +4,7 @@ import asyncio
 from io import BytesIO
 import hashlib
 import sqlite3
+import db_split
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,7 +71,7 @@ def add_account(api_env, telegram_id: int, username: str = "") -> str:
 
 def add_session(path: Path, telegram_id: int, token: str) -> None:
     now = int(time.time())
-    with sqlite3.connect(path) as db:
+    with db_split.sqlite_connect(path) as db:
         db.execute(
             "INSERT INTO api_sessions(token_hash,telegram_id,expires_at,created_at) VALUES(?,?,?,?)",
             (hashlib.sha256(token.encode()).hexdigest(), telegram_id, now + 3600, now),
@@ -135,7 +136,7 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
             )
             assert refreshed.status_code == 200
 
-            with sqlite3.connect(path) as db:
+            with db_split.sqlite_connect(path) as db:
                 saved_hash = db.execute("SELECT token_hash FROM api_sessions").fetchone()[0]
             assert saved_hash == hashlib.sha256(token.encode()).hexdigest()
             assert saved_hash != token
@@ -643,7 +644,7 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
     add_account(api_env, 83002, "receiver")
     add_session(path, 83001, "buyer-session")
     add_session(path, 83002, "receiver-session")
-    with sqlite3.connect(path) as db:
+    with db_split.sqlite_connect(path) as db:
         db.execute("UPDATE accounts SET grams=100 WHERE telegram_id=83001")
         db.execute(
             "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Test Gift',50,1,?)",
@@ -700,7 +701,7 @@ def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> 
             assert history.status_code == 200
             assert history.json()["transactions"][0]["to_username"] == "receiver"
 
-            with sqlite3.connect(path) as db:
+            with db_split.sqlite_connect(path) as db:
                 supply = db.execute("SELECT supply FROM gift_catalog WHERE id=1").fetchone()[0]
                 transaction_count = db.execute("SELECT COUNT(*) FROM economy_transactions WHERE reason='gift_purchase:1'").fetchone()[0]
                 gift_history_count = db.execute("SELECT COUNT(*) FROM gift_transactions WHERE serial_number=?", (serial,)).fetchone()[0]
@@ -719,7 +720,7 @@ def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> 
     add_session(path, 84001, "first-bidder-session")
     add_session(path, 84002, "second-bidder-session")
     now = int(time.time())
-    with sqlite3.connect(path) as db:
+    with db_split.sqlite_connect(path) as db:
         db.execute("UPDATE accounts SET stars=200 WHERE telegram_id IN (84001,84002)")
         db.execute(
             "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Auction Gift',40,0,?)",
@@ -761,7 +762,7 @@ def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> 
             assert too_low.status_code == 409
             assert "Минимальная следующая ставка" in too_low.json()["detail"]
 
-            with sqlite3.connect(path) as db:
+            with db_split.sqlite_connect(path) as db:
                 first_balance = db.execute(
                     "SELECT stars FROM accounts WHERE telegram_id=84001"
                 ).fetchone()[0]
@@ -780,7 +781,7 @@ def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> 
             assert third_bid.status_code == 201
             assert third_bid.json()["stars_balance"] == 100
 
-            with sqlite3.connect(path) as db:
+            with db_split.sqlite_connect(path) as db:
                 db.execute(
                     "UPDATE gift_auctions SET ends_at=? WHERE id=1",
                     (int(time.time()) - 1,),
@@ -790,7 +791,7 @@ def test_system_gift_auction_refunds_outbid_user_and_settles_winner(api_env) -> 
             assert auctions.status_code == 200
             assert auctions.json()["auctions"][0]["status"] == "ended"
 
-            with sqlite3.connect(path) as db:
+            with db_split.sqlite_connect(path) as db:
                 first_balance = db.execute(
                     "SELECT stars FROM accounts WHERE telegram_id=84001"
                 ).fetchone()[0]
@@ -1156,7 +1157,7 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert second.status_code == 200
             assert len(fetch_calls) == 1
 
-            with sqlite3.connect(path) as db:
+            with db_split.sqlite_connect(path) as db:
                 row = db.execute(
                     "SELECT gift_id,star_count,sticker_file_id,is_available "
                     "FROM telegram_gift_catalog"
@@ -1275,7 +1276,7 @@ def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
 def test_legacy_admin_gift_serials_are_migrated(api_env) -> None:
     path, _auth_store, _fake_bot, _app = api_env
     now = int(time.time())
-    with sqlite3.connect(path) as db:
+    with db_split.sqlite_connect(path) as db:
         cur = db.execute(
             "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Legacy Gift',0,0,?)",
             (now,),
@@ -1294,7 +1295,7 @@ def test_legacy_admin_gift_serials_are_migrated(api_env) -> None:
         )
 
     run(init_messenger_storage(path))
-    with sqlite3.connect(path) as db:
+    with db_split.sqlite_connect(path) as db:
         serial = db.execute(
             "SELECT serial_number FROM user_gifts WHERE gift_id=?",
             (gift_id,),
