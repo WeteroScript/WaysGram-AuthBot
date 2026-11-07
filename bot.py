@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import db_split  # noqa: F401  # installs the two-file database layout
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -621,7 +622,7 @@ ADMIN_INPUT: dict[int, tuple[str, Any]] = {}
 
 async def init_admin_storage() -> None:
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.executescript("""
+        await db.executescript(db_split.qualify_ddl("""
         CREATE TABLE IF NOT EXISTS accounts (
             telegram_id INTEGER PRIMARY KEY,
             virtual_number TEXT UNIQUE,
@@ -701,7 +702,7 @@ async def init_admin_storage() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_auction_bids_auction
             ON auction_bids(auction_id, id DESC);
-        """)
+        """))
         # Backfill account records for users who received virtual numbers before this panel update.
         await db.execute("""INSERT OR IGNORE INTO accounts
             (telegram_id,virtual_number,created_at,updated_at)
