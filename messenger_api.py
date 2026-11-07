@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import aiosqlite
+import db_split  # noqa: F401  # two-file database layout
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -108,6 +109,7 @@ async def init_messenger_storage(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(database_path) as db:
         await db.executescript(
+            db_split.qualify_ddl(
             """
             CREATE TABLE IF NOT EXISTS api_sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -338,16 +340,20 @@ async def init_messenger_storage(database_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_bot_messages_updates
                 ON bot_messages(bot_id,sender_type,id);
             """
+            )
         )
-        cur = await db.execute("PRAGMA table_info(media_assets)")
+        # A database from an older version keeps everything in one file: move the messenger tables out first,
+        # because a table left in the main file would hide the one in the messenger file.
+        await db_split.migrate_legacy_with(db, database_path)
+        cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(media_assets)")
         media_columns = {str(row[1]) for row in await cur.fetchall()}
         if "original_name" not in media_columns:
-            await db.execute("ALTER TABLE media_assets ADD COLUMN original_name TEXT")
+            await db.execute(f"ALTER TABLE {db_split.SCHEMA}.media_assets ADD COLUMN original_name TEXT")
         for table_name in ("messages", "group_messages", "channel_messages"):
-            cur = await db.execute(f"PRAGMA table_info({table_name})")
+            cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info({table_name})")
             columns = {str(row[1]) for row in await cur.fetchall()}
             if "media_id" not in columns:
-                await db.execute(f"ALTER TABLE {table_name} ADD COLUMN media_id TEXT")
+                await db.execute(f"ALTER TABLE {db_split.SCHEMA}.{table_name} ADD COLUMN media_id TEXT")
         # Older Telegram admin grants used WG- plus 8 hex digits. Expand them
         # once so the Android client can validate every existing gift serial.
         cur = await db.execute(
