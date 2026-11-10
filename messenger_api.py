@@ -1170,8 +1170,9 @@ def build_messenger_router(
                 "message_characters": MAX_MESSAGE_LENGTH,
             },
             "features": [
-                "profiles", "direct_messages", "incremental_messages",
-                "channels", "incremental_channel_posts", "idempotent_writes",
+                "profiles", "direct_messages", "saved_messages", "incremental_messages",
+                "channels", "private_channels", "channel_invites",
+                "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
                 "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages",
@@ -2747,7 +2748,7 @@ def build_messenger_router(
             recipient_id = int(payload.get("recipient_id", payload.get("to", 0)))
         except (TypeError, ValueError):
             recipient_id = 0
-        if recipient_id <= 0 or recipient_id == uid:
+        if recipient_id <= 0:
             raise HTTPException(status_code=400, detail="Укажите корректного получателя")
         media_id = str(payload.get("media_id") or "").strip() or None
         body_value = str(payload.get("body") or "")
@@ -3099,6 +3100,7 @@ def build_messenger_router(
                                  WHERE rm.telegram_id=peer.telegram_id AND rm.scope='dm' AND rm.peer_id=?),0) AS peer_read_id,
                        (SELECT COUNT(*) FROM messages um
                         WHERE um.sender_telegram_id=peer.telegram_id AND um.recipient_telegram_id=?
+                          AND um.sender_telegram_id<>um.recipient_telegram_id
                           AND um.id>COALESCE((SELECT rm.last_read_id FROM read_markers rm
                                               WHERE rm.telegram_id=? AND rm.scope='dm'
                                                 AND rm.peer_id=peer.telegram_id),0)) AS unread_count
