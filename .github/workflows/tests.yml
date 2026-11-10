@@ -33,4 +33,4 @@ jobs:
       - name: Compile Python files
         run: python -m compileall -q bot.py messenger_api.py tests
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q
