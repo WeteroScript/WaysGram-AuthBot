@@ -669,6 +669,8 @@ async def init_admin_storage() -> None:
             virtual_number TEXT UNIQUE,
             username TEXT NOT NULL DEFAULT '',
             display_name TEXT NOT NULL DEFAULT '',
+            avatar_media_id TEXT NOT NULL DEFAULT '',
+            bio TEXT NOT NULL DEFAULT '',
             stars INTEGER NOT NULL DEFAULT 0 CHECK(stars >= 0),
             grams INTEGER NOT NULL DEFAULT 0 CHECK(grams >= 0),
             is_banned INTEGER NOT NULL DEFAULT 0,
@@ -754,6 +756,10 @@ async def init_admin_storage() -> None:
             await db.execute("ALTER TABLE accounts ADD COLUMN username TEXT NOT NULL DEFAULT ''")
         if "display_name" not in account_columns:
             await db.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+        if "avatar_media_id" not in account_columns:
+            await db.execute("ALTER TABLE accounts ADD COLUMN avatar_media_id TEXT NOT NULL DEFAULT ''")
+        if "bio" not in account_columns:
+            await db.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
         await db.commit()
 
 async def account_is_banned(telegram_id: int) -> bool:
@@ -770,6 +776,7 @@ app.include_router(
         lambda: bot,
         account_is_banned,
         lambda: mtproto_gift_catalog,
+        admin_id=ADMIN_ID,
     )
 )
 
@@ -821,6 +828,8 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
     return admin_keyboard([
         [("📊 Статистика", "wgadm:stats")],
         [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Подарки", "wgadm:gifts")],
+        [("🎁 Подарки Telegram (цены и остатки)", "wgadm:tggifts")],
+        [("➕ Создать аккаунт", "wgadm:newacct"), ("🏷 Создать юзернейм", "wgadm:newuname")],
         [("📦 Инвентарь", "wgadm:inventory"), ("🧾 Операции", "wgadm:transactions")],
         [("🎟 Аукционы подарков", "wgadm:auctions")],
         [("🎟 История подарков", "wgadm:gifthistory")],
@@ -906,6 +915,203 @@ async def admin_channel_card(channel_id: int) -> tuple[str, InlineKeyboardMarkup
         [("Удалить канал", f"wgadm:channeldeleteask:{channel_id}")],
         [("⬅️ К списку каналов", "wgadm:channels")],
     ])
+
+
+
+SYNTHETIC_ACCOUNT_BASE = 9_000_000_000_000  # ids of accounts created by the administrator; far above real Telegram ids
+TG_GIFTS_PAGE_SIZE = 10
+USERNAME_RE = re.compile(r"[a-z][a-z0-9_]{1,31}")
+
+
+def normalize_admin_number(value: str) -> str | None:
+    """+1 and ten digits; ten digits alone or eleven starting with 1 are accepted too."""
+    digits = re.sub(r"\D", "", value)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return None
+
+
+async def telegram_gift_rows() -> list[dict[str, Any]]:
+    """Every gift of the Telegram catalog with the price and stock the administrator has set (0 by default)."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
+        state = await cur.fetchone()
+        source = str(state["source"]) if state else ""
+    if not source:
+        # The catalog has not been downloaded yet.
+        try:
+            from messenger_api import sync_telegram_gifts
+
+            await sync_telegram_gifts(DATABASE_PATH, bot)
+        except Exception as exc:
+            log.warning("Telegram gift catalog sync failed (%s)", type(exc).__name__)
+            return []
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
+            state = await cur.fetchone()
+            source = str(state["source"]) if state else ""
+    table = "telegram_mtproto_gift_catalog" if source == "telegram_mtproto" else "telegram_gift_catalog"
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            f"""SELECT g.gift_id AS id,g.title AS title,
+                       COALESCE(p.price_stars,0) AS price_stars,COALESCE(p.supply,0) AS supply,COALESCE(p.sold,0) AS sold
+                FROM {table} g LEFT JOIN telegram_gift_prices p ON p.gift_id=g.gift_id
+                ORDER BY (COALESCE(p.price_stars,0)>0 AND COALESCE(p.supply,0)>COALESCE(p.sold,0)) DESC, g.gift_id"""
+        )
+        return [dict(row) for row in await cur.fetchall()]
+
+
+def telegram_gift_label(row: dict[str, Any]) -> str:
+    remaining = max(int(row["supply"]) - int(row["sold"]), 0)
+    on_sale = int(row["price_stars"]) > 0 and remaining > 0
+    return f"{'✅' if on_sale else '⛔'} {row['title']} · {row['price_stars']}★ · осталось {remaining}"
+
+
+async def admin_telegram_gifts_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await telegram_gift_rows()
+    total = len(rows)
+    last_page = max((total - 1) // TG_GIFTS_PAGE_SIZE, 0)
+    page = min(max(page, 0), last_page)
+    chunk = rows[page * TG_GIFTS_PAGE_SIZE:(page + 1) * TG_GIFTS_PAGE_SIZE]
+    body = (
+        f"Подарки Telegram · страница {page + 1} из {last_page + 1} · всего {total}\n"
+        "Пока админ не задал цену и остаток, подарок не показывается в магазине приложения (⛔)."
+    )
+    if not rows:
+        body += "\n\nКаталог пока не загружен. Проверьте BOT_TOKEN и повторите."
+    keyboard = [[(telegram_gift_label(row), f"wgadm:tggift:{row['id']}")] for row in chunk]
+    navigation = []
+    if page > 0:
+        navigation.append(("⬅️ Назад", f"wgadm:tggifts:{page - 1}"))
+    if page < last_page:
+        navigation.append(("Вперёд ➡️", f"wgadm:tggifts:{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([("⬅️ В меню", "wgadm:home")])
+    return body, admin_keyboard(keyboard)
+
+
+async def admin_telegram_gift_card(gift_id: str) -> tuple[str, InlineKeyboardMarkup] | None:
+    row = next((r for r in await telegram_gift_rows() if str(r["id"]) == gift_id), None)    if not row:
+        return None
+    remaining = max(int(row["supply"]) - int(row["sold"]), 0)
+    body = (
+        f"Подарок {row['title']}\n\nID: {row['id']}\nЦена: {row['price_stars']} Stars\n"
+        f"Всего в продаже: {row['supply']}\nПродано: {row['sold']}\nОсталось: {remaining}\n"
+        f"Статус: {'в магазине' if int(row['price_stars']) > 0 and remaining > 0 else 'скрыт'}"
+    )
+    return body, admin_keyboard([
+        [("Цена (Stars)", f"wgadm:tgprice:{gift_id}"), ("Остаток (шт.)", f"wgadm:tgsupply:{gift_id}")],
+        [("Скрыть (цена 0, остаток 0)", f"wgadm:tghide:{gift_id}")],
+        [("⬅️ К списку", "wgadm:tggifts")],
+    ])
+
+
+async def set_telegram_gift_values(gift_id: str, price: int | None = None, supply: int | None = None) -> None:
+    now = int(time.time())
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id=?", (gift_id,))
+        row = await cur.fetchone()
+        new_price = price if price is not None else (int(row[0]) if row else 0)
+        new_supply = supply if supply is not None else (int(row[1]) if row else 0)
+        sold = int(row[2]) if row else 0
+        await db.execute(
+            """INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES(?,?,?,?,?)
+               ON CONFLICT(gift_id) DO UPDATE SET price_stars=excluded.price_stars,supply=excluded.supply,
+                   updated_at=excluded.updated_at""",
+            (gift_id, new_price, new_supply, sold, now),
+        )
+        await db.execute(
+            "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+            (ADMIN_ID, "telegram_gift_price", gift_id[:120], f"price={new_price}; supply={new_supply}", now),
+        )
+        await db.commit()
+
+
+async def admin_create_account(number: str, stars: int, grams: int) -> int:
+    """An account that no Telegram user owns. Login codes for its number are delivered to the administrator."""
+    now = int(time.time())
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT COALESCE(MAX(telegram_id),?) FROM users WHERE telegram_id>=?",
+                               (SYNTHETIC_ACCOUNT_BASE, SYNTHETIC_ACCOUNT_BASE))
+        account_id = int((await cur.fetchone())[0]) + 1
+        await db.execute(
+            "INSERT INTO users(telegram_id,chat_id,language,verified,created_at) VALUES(?,?,?,?,?)",
+            (account_id, ADMIN_ID, "ru", 1, now),
+        )
+        await db.execute(
+            "INSERT INTO numbers(telegram_id,number,provider_ref,created_at) VALUES(?,?,?,?)",
+            (account_id, number, "admin", now),
+        )
+        await db.execute(
+            """INSERT INTO accounts(telegram_id,virtual_number,username,display_name,stars,grams,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (account_id, number, "", number, stars, grams, now, now),
+        )
+        for asset, amount in (("stars", stars), ("grams", grams)):
+            if amount:
+                await db.execute(
+                    """INSERT INTO economy_transactions(telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (account_id, asset, amount, amount, "admin_create_account", ADMIN_ID, now),
+                )
+        await db.execute(
+            "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+            (ADMIN_ID, "create_account", str(account_id), f"{number}; stars={stars}; grams={grams}", now),
+        )
+        await db.commit()
+    return account_id
+
+
+async def find_account_id(value: str) -> int | None:
+    """Telegram ID or virtual number of an account."""
+    value = value.strip()
+    number = normalize_admin_number(value) if re.fullmatch(r"[+\d\s()-]+", value) else None
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if value.isdigit() and len(value) <= 15:
+            cur = await db.execute("SELECT telegram_id FROM accounts WHERE telegram_id=?", (int(value),))
+            row = await cur.fetchone()
+            if row:
+                return int(row[0])
+        if number:
+            cur = await db.execute("SELECT telegram_id FROM accounts WHERE virtual_number=?", (number,))
+            row = await cur.fetchone()
+            if row:
+                return int(row[0])
+    return None
+
+
+async def admin_create_username_channel(username: str, owner_id: int) -> int:
+    """A channel that holds the username, owned by the given account."""
+    now = int(time.time())
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT 1 FROM accounts WHERE lower(username)=?", (username,))
+        if await cur.fetchone():
+            await db.rollback()
+            raise ValueError("taken")
+        try:
+            cur = await db.execute(
+                "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES(?,?,?,?)",
+                (username, username, owner_id, now),
+            )
+        except aiosqlite.IntegrityError as exc:
+            await db.rollback()
+            raise ValueError("taken") from exc
+        channel_id = int(cur.lastrowid)
+        await db.execute(
+            "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+            (ADMIN_ID, "create_username", username, f"owner={owner_id}; channel={channel_id}", now),
+        )
+        await db.commit()
+    return channel_id
 
 
 @router.message(Command("admin"))
@@ -1276,6 +1482,38 @@ async def admin_callback(callback: CallbackQuery) -> None:
     elif action == "giftadd":
         ADMIN_INPUT[ADMIN_ID] = ("gift_name", {})
         await callback.message.answer("Введите название подарка (до 80 символов).")
+    elif action == "tggifts":
+        page = int(parts[2]) if len(parts) >= 3 and parts[2].lstrip("-").isdigit() else 0
+        body, keyboard = await admin_telegram_gifts_page(page)
+        await callback.message.answer(body, reply_markup=keyboard)
+    elif action == "tggift" and len(parts) == 3:
+        card = await admin_telegram_gift_card(parts[2])
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+        else:
+            await callback.message.answer("Подарок не найден.")
+    elif action == "tgprice" and len(parts) == 3:
+        ADMIN_INPUT[ADMIN_ID] = ("tgprice", parts[2])
+        await callback.message.answer("Введите цену в Stars (целое число от 0 до 1000000000). 0 — скрыть подарок.")
+    elif action == "tgsupply" and len(parts) == 3:
+        ADMIN_INPUT[ADMIN_ID] = ("tgsupply", parts[2])
+        await callback.message.answer("Введите, сколько штук продать (целое число от 0 до 1000000000). Уже проданные не считаются.")
+    elif action == "tghide" and len(parts) == 3:
+        await set_telegram_gift_values(parts[2], 0, 0)
+        card = await admin_telegram_gift_card(parts[2])
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+    elif action == "newacct":
+        ADMIN_INPUT[ADMIN_ID] = ("newacct_number", None)
+        await callback.message.answer(
+            "Создание аккаунта. Введите номер: +1 и 10 цифр (можно только 10 цифр).\n"
+            "Коды входа для этого номера будут приходить вам в этот чат."
+        )
+    elif action == "newuname":
+        ADMIN_INPUT[ADMIN_ID] = ("newuname_name", None)
+        await callback.message.answer(
+            "Введите юзернейм от 2 до 32 символов: латиница, цифры и _, первый символ — буква (без @)."
+        )
     elif action == "channels":
         async with aiosqlite.connect(DATABASE_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -1548,6 +1786,96 @@ async def admin_text_input(message: Message) -> None:
         if card:
             await message.answer(card[0], reply_markup=card[1])
 
+    elif kind in ("tgprice", "tgsupply"):
+        try:
+            amount = int(value)
+        except ValueError:
+            await message.answer("Введите целое число от 0 до 1000000000.")
+            return
+        if not 0 <= amount <= 1_000_000_000:
+            await message.answer("Допустимый диапазон: 0–1000000000.")
+            return
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        if kind == "tgprice":
+            await set_telegram_gift_values(str(payload), price=amount)
+        else:
+            await set_telegram_gift_values(str(payload), supply=amount)
+        card = await admin_telegram_gift_card(str(payload))
+        if card:
+            await message.answer("Сохранено.\n\n" + card[0], reply_markup=card[1])
+
+    elif kind == "newacct_number":
+        number = normalize_admin_number(value)
+        if not number:
+            await message.answer("Нужен номер вида +1 и 10 цифр. Попробуйте ещё раз.")
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute("SELECT 1 FROM numbers WHERE number=?", (number,))
+            taken = await cur.fetchone()
+        if taken:
+            await message.answer("Этот номер уже занят. Введите другой.")
+            return
+        ADMIN_INPUT[ADMIN_ID] = ("newacct_stars", number)
+        await message.answer("Сколько Stars на аккаунте? (целое число от 0 до 1000000000)")
+
+    elif kind in ("newacct_stars", "newacct_grams"):
+        try:
+            amount = int(value)
+        except ValueError:
+            await message.answer("Введите целое число от 0 до 1000000000.")
+            return
+        if not 0 <= amount <= 1_000_000_000:
+            await message.answer("Допустимый диапазон: 0–1000000000.")
+            return
+        if kind == "newacct_stars":
+            ADMIN_INPUT[ADMIN_ID] = ("newacct_grams", (payload, amount))
+            await message.answer("Сколько Gram на аккаунте? (целое число от 0 до 1000000000)")
+            return
+        number, stars = payload
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        try:
+            account_id = await admin_create_account(number, int(stars), amount)
+        except aiosqlite.IntegrityError:
+            await message.answer("Не удалось создать аккаунт: номер уже занят.")
+            return
+        await message.answer(f"Аккаунт создан: {number}, Stars {stars}, Gram {amount}.")
+        card = await admin_account_card(account_id)
+        if card:
+            await message.answer(card[0], reply_markup=card[1])
+
+    elif kind == "newuname_name":
+        username = value.lstrip("@").lower()
+        if not USERNAME_RE.fullmatch(username):
+            await message.answer("Юзернейм: от 2 до 32 символов, латиница, цифры и _, первый символ — буква. Попробуйте ещё раз.")
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM channels WHERE username=? UNION ALL SELECT 1 FROM accounts WHERE lower(username)=?",
+                (username, username),
+            )
+            taken = await cur.fetchone()
+        if taken:
+            await message.answer("Этот юзернейм уже занят. Введите другой.")
+            return
+        ADMIN_INPUT[ADMIN_ID] = ("newuname_owner", username)
+        await message.answer("Введите Telegram ID или номер аккаунта, на котором создать канал с этим юзернеймом.")
+
+    elif kind == "newuname_owner":
+        owner_id = await find_account_id(value)
+        if owner_id is None:
+            await message.answer("Аккаунт не найден. Введите Telegram ID или номер аккаунта ещё раз.")
+            return
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        try:
+            channel_id = await admin_create_username_channel(str(payload), owner_id)
+        except ValueError:
+            await message.answer("Этот юзернейм уже занят.")
+            return
+        await message.answer(f"Готово: на аккаунте {owner_id} создан канал @{payload}.")
+        card = await admin_channel_card(channel_id)
+        if card:
+            await message.answer(card[0], reply_markup=card[1])
+
     elif kind == "transfer_serial":
         user_id = int(payload)
         async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -1668,8 +1996,7 @@ async def admin_text_input(message: Message) -> None:
                     now,
                     now + minutes * 60,
                     ADMIN_ID,
-                    now,
-                ),
+                    now,                ),
             )
             auction_id = int(cur.lastrowid)
             await db.execute(
