@@ -997,8 +997,7 @@ def test_internal_botfather_create_commands_and_message_runtime(api_env) -> None
                 json={
                     "name": "WaysGram Helper",
                     "username": "waysgram_helper_bot",
-                    "about": "A test bot",
-                    "description": "Internal bot API test",
+                    "about": "A test bot",                    "description": "Internal bot API test",
                 },
             )
             assert created.status_code == 201
@@ -1132,10 +1131,21 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             payload = catalog.json()
             assert payload["source"] == "telegram_bot_api"
             assert payload["scope"] == "gifts_available_to_authbot"
-            assert payload["currency"] == "telegram_stars"
+            assert payload["currency"] == "stars"
+            # Nothing is for sale until the administrator sets a price and a stock.
+            assert payload["count"] == 0
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('gift_123',40,3,0,1)"
+                )
+            catalog = await client.get("/api/telegram/gifts", headers=auth)
+            payload = catalog.json()
             assert payload["count"] == 1
 
             gift = payload["gifts"][0]
+            assert gift["price_stars"] == 40
+            assert gift["remaining"] == 3
+            assert gift["telegram_star_count"] == 25
             assert gift["id"] == "gift_123"
             assert gift["title"] == "🎁"
             assert gift["star_count"] == 25
@@ -1252,7 +1262,13 @@ def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
             payload = catalog.json()
             assert payload["source"] == "telegram_mtproto"
             assert payload["scope"] == "telegram_full_mtproto_catalog"
-            assert payload["currency"] == "telegram_stars"
+            assert payload["currency"] == "stars"
+            assert payload["count"] == 0  # hidden until the administrator prices it
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('987654321',60,5,0,1)"
+                )
+            payload = (await client.get("/api/telegram/gifts", headers=auth)).json()
             assert payload["count"] == 1
 
             gift = payload["gifts"][0]
@@ -1307,3 +1323,34 @@ def test_legacy_admin_gift_serials_are_migrated(api_env) -> None:
     assert serial.startswith("WG-")
     assert all(char in "0123456789ABCDEF" for char in serial[3:])
     assert history_serial == serial
+
+
+def test_channel_owner_can_change_title_and_username(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 83001, "chowner")
+    add_account(api_env, 83002, "chother")
+    add_session(path, 83001, "chowner-session")
+    add_session(path, 83002, "chother-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer chowner-session"}
+            other = {"Authorization": "Bearer chother-session"}
+            created = await client.post("/api/channels", headers=owner, json={"title": "First", "username": "first_chan"})
+            taken = await client.post("/api/channels", headers=other, json={"title": "Taken", "username": "taken_chan"})
+            assert created.status_code == 201 and taken.status_code == 201
+            channel_id = created.json()["id"]
+
+            changed = await client.patch(
+                f"/api/channels/{channel_id}", headers=owner, json={"title": "Renamed", "username": "renamed_chan"}
+            )
+            assert changed.status_code == 200
+            assert changed.json()["title"] == "Renamed"
+            assert changed.json()["username"] == "renamed_chan"
+
+            assert (await client.patch(f"/api/channels/{channel_id}", headers=other, json={"title": "Nope"})).status_code == 403
+            assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={"username": "taken_chan"})).status_code == 409
+            assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={"username": "1bad"})).status_code == 400
+            assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={})).status_code == 400
+
+    run(scenario())
