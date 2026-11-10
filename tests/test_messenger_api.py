@@ -1438,3 +1438,71 @@ def test_channel_owner_can_change_title_and_username(api_env) -> None:
             assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={})).status_code == 400
 
     run(scenario())
+
+
+def test_private_channels_hide_content_until_invite_join(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 82101, "private_owner")
+    add_account(api_env, 82102, "private_guest")
+    add_session(path, 82101, "private-owner-session")
+    add_session(path, 82102, "private-guest-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer private-owner-session"}
+            guest = {"Authorization": "Bearer private-guest-session"}
+            created = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"title": "Private Room", "is_public": False},
+            )
+            assert created.status_code == 201
+            private = created.json()
+            assert private["is_public"] is False
+            assert private["username"] == ""
+            assert private["invite_link"].startswith("http://test/api/channels/invites/")
+            channel_id = private["id"]
+
+            preview = await client.get(private["invite_link"])
+            assert preview.status_code == 200
+            assert preview.json()["channel_id"] == channel_id
+            assert preview.json()["is_public"] is False
+
+            hidden = await client.get("/api/channels", headers=guest)
+            assert hidden.status_code == 200
+            assert all(item["id"] != channel_id for item in hidden.json()["channels"])
+
+            denied_details = await client.get(f"/api/channels/{channel_id}", headers=guest)
+            denied_messages = await client.get(
+                f"/api/channels/{channel_id}/messages",
+                headers=guest,
+            )
+            assert denied_details.status_code == 403
+            assert denied_messages.status_code == 403
+
+            joined = await client.post(
+                "/api/channels/join",
+                headers=guest,
+                json={"invite_link": private["invite_link"]},
+            )
+            assert joined.status_code == 200
+            assert joined.json()["joined"] is True
+            assert joined.json()["id"] == channel_id
+
+            visible = await client.get("/api/channels", headers=guest)
+            assert any(item["id"] == channel_id and item["is_public"] == 0
+                       for item in visible.json()["channels"])
+            details = await client.get(f"/api/channels/{channel_id}", headers=guest)
+            history = await client.get(f"/api/channels/{channel_id}/messages", headers=guest)
+            assert details.status_code == 200
+            assert details.json()["is_public"] == 0
+            assert history.status_code == 200
+
+            invalid = await client.post(
+                "/api/channels/join",
+                headers=guest,
+                json={"invite_token": "not-a-valid-invite"},
+            )
+            assert invalid.status_code == 400
+
+    run(scenario())
