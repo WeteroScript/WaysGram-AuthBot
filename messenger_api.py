@@ -1996,7 +1996,8 @@ def build_messenger_router(
                     """SELECT sticker_file_id,sticker_mime_type
                        FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1""",
                     (gift_id,),
-                )                row = await cur.fetchone()
+                )
+                row = await cur.fetchone()
             if row is None:
                 raise HTTPException(status_code=404, detail="Подарок Telegram не найден")
             bot = bot_provider()
