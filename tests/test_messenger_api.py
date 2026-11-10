@@ -154,6 +154,7 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
 
 def test_new_account_gets_system_welcome_and_balance_notifications(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
+    run(bot_module.ensure_system_account())
     user_id = 81234
     number = add_account(api_env, user_id, "newbie")
     add_session(path, user_id, "system-welcome-session")
