@@ -152,6 +152,89 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
     run(scenario())
 
 
+def test_new_account_gets_system_welcome_and_balance_notifications(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    user_id = 81234
+    number = add_account(api_env, user_id, "newbie")
+    add_session(path, user_id, "system-welcome-session")
+
+    with db_split.sqlite_connect(path) as db:
+        system_account = db.execute(
+            "SELECT virtual_number,username,display_name FROM accounts WHERE telegram_id=?",
+            (bot_module.SYSTEM_ACCOUNT_ID,),
+        ).fetchone()
+        welcome = db.execute(
+            """SELECT sender_telegram_id,recipient_telegram_id,body FROM messages
+               WHERE sender_telegram_id=? AND recipient_telegram_id=?""",
+            (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+        ).fetchall()
+
+    assert system_account == ("+4277", "waysgram", "WaysGram")
+    assert len(welcome) == 1
+    assert welcome[0][0:2] == (bot_module.SYSTEM_ACCOUNT_ID, user_id)
+    assert welcome[0][2].startswith("Привет 👋")
+    assert "Добро пожаловать в WaysGram!" in welcome[0][2]
+    assert "—" not in welcome[0][2]
+
+    class FakeAdminMessage:
+        def __init__(self, text: str):
+            self.text = text
+            self.from_user = SimpleNamespace(id=bot_module.ADMIN_ID)
+
+        async def answer(self, *_args, **_kwargs):
+            return None
+
+    async def apply_credit(asset: str, amount: int) -> None:
+        bot_module.ADMIN_INPUT[bot_module.ADMIN_ID] = ("credit", (asset, user_id))
+        await bot_module.admin_text_input(FakeAdminMessage(str(amount)))
+
+    try:
+        run(apply_credit("stars", 125))
+        run(apply_credit("grams", 7))
+    finally:
+        bot_module.ADMIN_INPUT.pop(bot_module.ADMIN_ID, None)
+
+    with db_split.sqlite_connect(path) as db:
+        notices = db.execute(
+            """SELECT body FROM messages WHERE sender_telegram_id=? AND recipient_telegram_id=?
+               ORDER BY id ASC""",
+            (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+        ).fetchall()
+        balances = db.execute(
+            "SELECT stars,grams FROM accounts WHERE telegram_id=?",
+            (user_id,),
+        ).fetchone()
+
+    assert len(notices) == 3
+    assert "Начислено: +125 Stars" in notices[1][0]
+    assert "Текущий баланс: 5125 Stars" in notices[1][0]
+    assert "Начислено: +7 Gram" in notices[2][0]
+    assert "Текущий баланс: 22 Gram" in notices[2][0]
+    assert balances == (5125, 22)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.get(
+                "/api/conversations",
+                headers={"Authorization": "Bearer system-welcome-session"},
+            )
+            assert response.status_code == 200
+            conversations = response.json()["conversations"]
+            system_chat = next(item for item in conversations if item["id"] == bot_module.SYSTEM_ACCOUNT_ID)
+            assert system_chat["display_name"] == "WaysGram"
+            assert system_chat["last_message"].startswith("Баланс пополнен!")
+
+    run(scenario())
+
+    run(bot_module.ensure_account(user_id, number, "newbie", "User 81234"))
+    with db_split.sqlite_connect(path) as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND recipient_telegram_id=?",
+            (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+        ).fetchone()[0]
+    assert count == 3
+
+
 def test_direct_message_long_poll_returns_new_message(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89201, "longpoll_sender")
