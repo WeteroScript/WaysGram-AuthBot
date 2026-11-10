@@ -41,6 +41,7 @@ MESSENGER_TABLES = frozenset(
         "api_idempotency_records",
         "channels",
         "channel_admins",
+        "channel_members",
         "channel_messages",
         "chat_groups",
         "group_members",
