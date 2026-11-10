@@ -1109,6 +1109,7 @@ def build_messenger_router(
             return await cur.fetchone() is not None
 
     async def require_channel_access(channel_id: int, telegram_id: int) -> None:
+        await channel_row(channel_id)
         if not await can_view_channel(channel_id, telegram_id):
             raise HTTPException(status_code=403, detail="Это приватный канал. Нужна ссылка-приглашение.")
 
