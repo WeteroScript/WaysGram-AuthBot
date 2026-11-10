@@ -1506,3 +1506,38 @@ def test_private_channels_hide_content_until_invite_join(api_env) -> None:
             assert invalid.status_code == 400
 
     run(scenario())
+
+
+
+def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    user_id = 82301
+    add_account(api_env, user_id, "saved_user")
+    add_session(path, user_id, "saved-messages-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            headers = {"Authorization": "Bearer saved-messages-session"}
+            sent = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={"recipient_id": user_id, "body": "Note to myself"},
+            )
+            assert sent.status_code == 201
+            assert sent.json()["sender_id"] == user_id
+            assert sent.json()["recipient_id"] == user_id
+
+            history = await client.get(
+                f"/api/messages?with={user_id}",
+                headers=headers,
+            )
+            assert history.status_code == 200
+            assert [item["body"] for item in history.json()["messages"]] == ["Note to myself"]
+
+            conversations = await client.get("/api/conversations", headers=headers)
+            assert conversations.status_code == 200
+            saved = next(item for item in conversations.json()["conversations"] if item["id"] == user_id)
+            assert saved["last_message"] == "Note to myself"
+            assert saved["unread_count"] == 0
+
+    run(scenario())
