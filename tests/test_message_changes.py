@@ -1,0 +1,237 @@
+import asyncio
+
+from test_messenger_api import client_for, run
+from test_star_gifts import ADMIN, env, headers  # noqa: F401  (env is a pytest fixture)
+
+
+def test_replies_are_validated_and_returned(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            first = (await client.post("/api/messages", headers=headers(101), json={"recipient_id": 102, "body": "hi"})).json()
+            reply = await client.post(
+                "/api/messages", headers=headers(102),
+                json={"recipient_id": 101, "body": "hello", "reply_to_id": first["id"]},
+            )
+            assert reply.status_code == 201 and reply.json()["reply_to_id"] == first["id"]
+            listed = (await client.get("/api/messages?with=102", headers=headers(101))).json()["messages"]
+            assert listed[-1]["reply_to_id"] == first["id"] and listed[0]["reply_to_id"] is None
+
+            # A message of another conversation cannot be replied to.
+            other = (await client.post("/api/messages", headers=headers(101), json={"recipient_id": ADMIN, "body": "x"})).json()
+            bad = await client.post(
+                "/api/messages", headers=headers(101),
+                json={"recipient_id": 102, "body": "no", "reply_to_id": other["id"]},
+            )
+            assert bad.status_code == 404
+            assert (await client.post(
+                "/api/messages", headers=headers(101), json={"recipient_id": 102, "body": "no", "reply_to_id": "x"}
+            )).status_code == 400
+
+    run(scenario())
+
+
+def test_edit_and_delete_private_messages_with_events(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            cursor = (await client.get("/api/events", headers=headers(102))).json()["latest_id"]
+            sent = (await client.post("/api/messages", headers=headers(101), json={"recipient_id": 102, "body": "typo"})).json()
+            mid = sent["id"]
+
+            assert (await client.patch(f"/api/messages/{mid}", headers=headers(102), json={"body": "x"})).status_code == 403
+            assert (await client.patch(f"/api/messages/{mid}", headers=headers(101), json={"body": "  "})).status_code == 400
+            edited = await client.patch(f"/api/messages/{mid}", headers=headers(101), json={"body": "fixed"})
+            assert edited.status_code == 200
+            listed = (await client.get("/api/messages?with=101", headers=headers(102))).json()["messages"]
+            assert listed[-1]["body"] == "fixed" and listed[-1]["edited_at"]
+
+            events = (await client.get(f"/api/events?after_id={cursor}", headers=headers(102))).json()
+            assert [(e["kind"], e["message_id"], e["scope"]) for e in events["events"]] == [("edit", mid, "dm")]
+            # The author does not get an event for their own action.
+            assert (await client.get(f"/api/events?after_id={cursor}", headers=headers(101))).json()["events"] == []
+            # Someone outside the conversation sees nothing.
+            assert (await client.get(f"/api/events?after_id={cursor}", headers=headers(ADMIN))).json()["events"] == []
+
+            assert (await client.delete(f"/api/messages/{mid}", headers=headers(102))).status_code == 403
+            assert (await client.delete(f"/api/messages/{mid}", headers=headers(101))).status_code == 200
+            assert (await client.delete(f"/api/messages/{mid}", headers=headers(101))).status_code == 404
+            assert (await client.get("/api/messages?with=101", headers=headers(102))).json()["messages"] == []
+            events = (await client.get(f"/api/events?after_id={events['latest_id']}", headers=headers(102))).json()
+            assert [(e["kind"], e["message_id"]) for e in events["events"]] == [("delete", mid)]
+
+    run(scenario())
+
+
+def test_group_edit_delete_and_admin_rights(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            group = (await client.post("/api/groups", headers=headers(101), json={"title": "Team"})).json()
+            gid = group["id"]
+            assert (await client.post(f"/api/groups/{gid}/members", headers=headers(101), json={"telegram_id": 102})).status_code in (200, 201)
+            m1 = (await client.post(f"/api/groups/{gid}/messages", headers=headers(102), json={"body": "from member"})).json()
+            m2 = (await client.post(f"/api/groups/{gid}/messages", headers=headers(101), json={"body": "from owner", "reply_to_id": m1["id"]})).json()
+            assert m2["reply_to_id"] == m1["id"]
+            assert (await client.post(f"/api/groups/{gid}/messages", headers=headers(101), json={"body": "x", "reply_to_id": 99999})).status_code == 404
+
+            # Only the author edits.
+            assert (await client.patch(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(101), json={"body": "hack"})).status_code == 403
+            assert (await client.patch(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(102), json={"body": "edited"})).status_code == 200
+            # A member cannot delete the owner's message, the owner can delete anybody's.
+            assert (await client.delete(f"/api/groups/{gid}/messages/{m2['id']}", headers=headers(102))).status_code == 403
+            assert (await client.delete(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(101))).status_code == 200
+            # Outsiders are refused.
+            assert (await client.delete(f"/api/groups/{gid}/messages/{m2['id']}", headers=headers(ADMIN))).status_code == 403
+
+            remaining = (await client.get(f"/api/groups/{gid}/messages", headers=headers(102))).json()["messages"]
+            assert [m["id"] for m in remaining] == [m2["id"]]
+
+    run(scenario())
+
+
+def test_channel_posts_can_be_edited_and_deleted_by_the_owner_only(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            channel = (await client.post("/api/channels", headers=headers(101), json={"title": "News", "username": "news_ch"})).json()
+            cid = channel["id"]
+            post = (await client.post(f"/api/channels/{cid}/messages", headers=headers(101), json={"body": "first"})).json()
+            assert (await client.patch(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102), json={"body": "x"})).status_code == 403
+            assert (await client.patch(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101), json={"body": "second"})).status_code == 200
+            listed = (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"]
+            assert listed[0]["body"] == "second" and listed[0]["edited_at"]
+            assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102))).status_code == 403
+            assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101))).status_code == 200
+            assert (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"] == []
+
+    run(scenario())
+
+
+def test_read_markers_and_unread_counters(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            ids = []
+            for text in ("a", "b", "c"):
+                ids.append((await client.post("/api/messages", headers=headers(101), json={"recipient_id": 102, "body": text})).json()["id"])
+
+            conv = (await client.get("/api/conversations", headers=headers(102))).json()["conversations"][0]
+            assert conv["unread_count"] == 3 and conv["my_read_id"] == 0
+            # The sender has nothing unread and sees that nothing was read yet.
+            mine = (await client.get("/api/conversations", headers=headers(101))).json()["conversations"][0]
+            assert mine["unread_count"] == 0 and mine["peer_read_id"] == 0
+
+            cursor = (await client.get("/api/events", headers=headers(101))).json()["latest_id"]
+            read = await client.put("/api/read", headers=headers(102), json={"scope": "dm", "peer_id": 101, "last_read_id": ids[1]})
+            assert read.status_code == 200 and read.json()["last_read_id"] == ids[1]
+            conv = (await client.get("/api/conversations", headers=headers(102))).json()["conversations"][0]
+            assert conv["unread_count"] == 1
+            mine = (await client.get("/api/conversations", headers=headers(101))).json()["conversations"][0]
+            assert mine["peer_read_id"] == ids[1]
+            history = (await client.get("/api/messages?with=102", headers=headers(101))).json()
+            assert history["peer_read_id"] == ids[1]
+
+            # The sender is told that the messages were read; the marker never moves back.
+            events = (await client.get(f"/api/events?after_id={cursor}", headers=headers(101))).json()["events"]
+            assert [(e["kind"], e["message_id"]) for e in events] == [("read", ids[1])]
+            back = await client.put("/api/read", headers=headers(102), json={"scope": "dm", "peer_id": 101, "last_read_id": 1})
+            assert back.json()["last_read_id"] == ids[1]
+
+            assert (await client.put("/api/read", headers=headers(102), json={"scope": "x", "peer_id": 1, "last_read_id": 1})).status_code == 400
+            assert (await client.put("/api/read", headers=headers(102), json={"scope": "dm", "peer_id": 424242, "last_read_id": 1})).status_code == 404
+
+    run(scenario())
+
+
+def test_group_and_channel_unread_counters(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            gid = (await client.post("/api/groups", headers=headers(101), json={"title": "G"})).json()["id"]
+            await client.post(f"/api/groups/{gid}/members", headers=headers(101), json={"telegram_id": 102})
+            g1 = (await client.post(f"/api/groups/{gid}/messages", headers=headers(101), json={"body": "1"})).json()["id"]
+            await client.post(f"/api/groups/{gid}/messages", headers=headers(101), json={"body": "2"})
+            await client.post(f"/api/groups/{gid}/messages", headers=headers(102), json={"body": "own"})
+            group = next(g for g in (await client.get("/api/groups", headers=headers(102))).json()["groups"] if g["id"] == gid)
+            assert group["unread_count"] == 2  # own messages do not count
+            await client.put("/api/read", headers=headers(102), json={"scope": "group", "peer_id": gid, "last_read_id": g1})
+            group = next(g for g in (await client.get("/api/groups", headers=headers(102))).json()["groups"] if g["id"] == gid)
+            assert group["unread_count"] == 1 and group["last_read_id"] == g1
+            # A non-member cannot set a marker for the group.
+            assert (await client.put("/api/read", headers=headers(ADMIN), json={"scope": "group", "peer_id": gid, "last_read_id": 1})).status_code == 403
+
+            cid = (await client.post("/api/channels", headers=headers(101), json={"title": "C", "username": "c_chan"})).json()["id"]
+            await client.post(f"/api/channels/{cid}/messages", headers=headers(101), json={"body": "p1"})
+            p2 = (await client.post(f"/api/channels/{cid}/messages", headers=headers(101), json={"body": "p2"})).json()["id"]
+            channel = next(c for c in (await client.get("/api/channels", headers=headers(102))).json()["channels"] if c["id"] == cid)
+            assert channel["unread_count"] == 2
+            await client.put("/api/read", headers=headers(102), json={"scope": "channel", "peer_id": cid, "last_read_id": p2})
+            channel = next(c for c in (await client.get("/api/channels", headers=headers(102))).json()["channels"] if c["id"] == cid)
+            assert channel["unread_count"] == 0
+
+    run(scenario())
+
+
+def test_existing_messages_count_as_read_after_the_upgrade(tmp_path, monkeypatch) -> None:
+    """A database from before read marks must not show every old message as unread."""
+    import sqlite3
+
+    import db_split
+    from cryptography.fernet import Fernet
+
+    import bot as bot_module
+    from messenger_api import init_messenger_storage
+
+    path = tmp_path / "w.sqlite3"
+    monkeypatch.setattr(bot_module, "DATABASE_PATH", path)
+    store = bot_module.Store(path)
+    store.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
+    run(store.init())
+    run(bot_module.init_admin_storage())
+    run(init_messenger_storage(path))
+    conn = db_split.sqlite_connect(path)
+    conn.execute("INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at) VALUES(1,2,'old',1)")
+    conn.execute("INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at) VALUES(1,2,'older',2)")
+    conn.execute("PRAGMA messenger.user_version=0")  # as if the database predates read marks
+    conn.execute("DELETE FROM read_markers")
+    conn.commit()
+    conn.close()
+
+    run(init_messenger_storage(path))
+    conn = db_split.sqlite_connect(path)
+    marks = conn.execute("SELECT telegram_id,scope,peer_id,last_read_id FROM read_markers").fetchall()
+    conn.close()
+    assert marks == [(2, "dm", 1, 2)]
+
+    # Running it again must not hide messages that arrive later.
+    conn = db_split.sqlite_connect(path)
+    conn.execute("INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at) VALUES(1,2,'new',3)")
+    conn.execute("DELETE FROM read_markers")
+    conn.commit()
+    conn.close()
+    run(init_messenger_storage(path))
+    conn = db_split.sqlite_connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM read_markers").fetchone()[0] == 0
+    conn.close()
+
+
+def test_group_message_can_be_deleted_knowing_only_its_id(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            gid = (await client.post("/api/groups", headers=headers(101), json={"title": "ById"})).json()["id"]
+            await client.post(f"/api/groups/{gid}/members", headers=headers(101), json={"telegram_id": 102})
+            mid = (await client.post(f"/api/groups/{gid}/messages", headers=headers(102), json={"body": "bye"})).json()["id"]
+            assert (await client.delete(f"/api/group-messages/{mid}", headers=headers(ADMIN))).status_code == 403
+            assert (await client.delete(f"/api/group-messages/{mid}", headers=headers(102))).status_code == 200
+            assert (await client.delete(f"/api/group-messages/{mid}", headers=headers(102))).status_code == 404
+
+    run(scenario())
