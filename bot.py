@@ -1023,7 +1023,8 @@ async def admin_telegram_gifts_page(page: int) -> tuple[str, InlineKeyboardMarku
 
 
 async def admin_telegram_gift_card(gift_id: str) -> tuple[str, InlineKeyboardMarkup] | None:
-    row = next((r for r in await telegram_gift_rows() if str(r["id"]) == gift_id), None)    if not row:
+    row = next((r for r in await telegram_gift_rows() if str(r["id"]) == gift_id), None)
+    if not row:
         return None
     remaining = max(int(row["supply"]) - int(row["sold"]), 0)
     body = (
