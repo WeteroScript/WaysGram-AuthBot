@@ -773,14 +773,26 @@ async def init_admin_storage() -> None:
             await db.execute("ALTER TABLE accounts ADD COLUMN avatar_media_id TEXT NOT NULL DEFAULT ''")
         if "bio" not in account_columns:
             await db.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
-        now = int(time.time())
+        await db.commit()
+
+
+async def ensure_system_account() -> None:
+    """Create the reserved WaysGram sender identity after all account tables exist."""
+    now = int(time.time())
+    async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
-            """INSERT OR IGNORE INTO accounts
+            """INSERT INTO accounts
                (telegram_id,virtual_number,username,display_name,stars,grams,is_banned,created_at,updated_at)
-               VALUES(?,?,'waysgram','WaysGram',0,0,0,?,?)""",
+               VALUES(?,?,'waysgram','WaysGram',0,0,0,?,?)
+               ON CONFLICT(telegram_id) DO UPDATE SET
+                   virtual_number=excluded.virtual_number,
+                   username=excluded.username,
+                   display_name=excluded.display_name,
+                   updated_at=excluded.updated_at""",
             (SYSTEM_ACCOUNT_ID, SYSTEM_ACCOUNT_NUMBER, now, now),
         )
         await db.commit()
+
 
 async def account_is_banned(telegram_id: int) -> bool:
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -2368,6 +2380,7 @@ async def main() -> None:
     await store.init()
     await init_admin_storage()
     await init_messenger_storage(DATABASE_PATH)
+    await ensure_system_account()
     bot = Bot(token=BOT_TOKEN)
     if TELEGRAM_API_ID > 0 and TELEGRAM_API_HASH:
         try:
