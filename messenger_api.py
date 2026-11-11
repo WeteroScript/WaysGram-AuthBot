@@ -19,6 +19,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from waysgram_observability import track_event
 
 
 SESSION_TTL = 60 * 60 * 24 * 30
@@ -875,6 +876,7 @@ def build_messenger_router(
         except Exception:
             await asyncio.to_thread(file_path.unlink, missing_ok=True)
             raise
+        track_event("media_uploaded", {"media_type": "image"})
         return {
             "id": media_id,
             "mime_type": mime_type,
@@ -953,6 +955,7 @@ def build_messenger_router(
         except Exception:
             await asyncio.to_thread(file_path.unlink, missing_ok=True)
             raise
+        track_event("media_uploaded", {"media_type": "document"})
         return {
             "id": media_id,
             "mime_type": mime_type,
@@ -1282,6 +1285,7 @@ def build_messenger_router(
             cur = await db.execute("SELECT * FROM accounts WHERE telegram_id=?", (telegram_id,))
             account = await cur.fetchone()
             await db.commit()
+        track_event("user_logged_in", {"method": "authbot"})
         return {
             "token": token,
             "expires_at": now + SESSION_TTL,
@@ -1844,6 +1848,7 @@ def build_messenger_router(
                     (serial, title, uid, owner, now),
                 )
             await db.commit()
+        track_event("gift_purchased", {"catalog": "telegram"})
         return {
             "status": "purchased",
             "gift": {"serial_number": serial, "gift_name": title, "owner_id": owner},
@@ -2192,6 +2197,7 @@ def build_messenger_router(
                     (uid, key, request_hash, json.dumps(result, ensure_ascii=False, separators=(",", ":")), now),
                 )
             await db.commit()
+        track_event("gift_purchased", {"catalog": "waysgram"})
         return result
 
     @router.post("/api/gifts/transfer")
@@ -2339,6 +2345,7 @@ def build_messenger_router(
                 await db.commit()
         except aiosqlite.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="Username канала уже занят") from exc
+        track_event("channel_created", {"visibility": "public" if is_public else "private"})
         result = {
             "id": channel_id,
             "username": username if is_public else "",
@@ -2407,6 +2414,7 @@ def build_messenger_router(
                 (int(channel[0]), uid, now),
             )
             await db.commit()
+        track_event("channel_joined")
         return {"joined": True, "id": int(channel[0]), "title": str(channel[1]), "is_public": False}
 
     @router.get("/api/channels/{channel_id}")
@@ -2604,6 +2612,7 @@ def build_messenger_router(
             result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "reply_to_id": reply_to_id, **media_fields, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
+        track_event("message_sent", {"surface": "channel"})
         return result
 
     @router.post("/api/channels/{channel_id}/admins", status_code=201)
@@ -2830,6 +2839,7 @@ def build_messenger_router(
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
             await db.commit()
+        track_event("message_sent", {"surface": "direct"})
         return result
 
     async def record_event(
@@ -3212,6 +3222,7 @@ def build_messenger_router(
                 await db.commit()
         except aiosqlite.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="Username группы уже занят") from exc
+        track_event("group_created")
         return {
             "id": group_id,
             "username": username,
@@ -3457,6 +3468,7 @@ def build_messenger_router(
             )
             message_id = int(cur.lastrowid)
             await db.commit()
+        track_event("message_sent", {"surface": "group"})
         return {
             "id": message_id,
             "group_id": group_id,
@@ -3525,6 +3537,7 @@ def build_messenger_router(
                 await db.commit()
         except aiosqlite.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="Username бота уже занят") from exc
+        track_event("bot_created")
         return {
             "id": bot_id,
             "name": name.strip(),
