@@ -265,6 +265,19 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
             assert initial.status_code == 201
             initial_id = initial.json()["id"]
 
+            initial_conversations = await client.get("/api/conversations", headers=recipient)
+            assert initial_conversations.status_code == 200
+            assert initial_conversations.json()["conversations"][0]["unread_count"] == 1
+
+            event_cursor_response = await client.get("/api/events", headers=recipient)
+            assert event_cursor_response.status_code == 200
+            event_cursor = event_cursor_response.json()["latest_id"]
+            pending_events = asyncio.create_task(
+                client.get(
+                    f"/api/events?after_id={event_cursor}&wait_seconds=20",
+                    headers=recipient,
+                )
+            )
             pending = asyncio.create_task(
                 client.get(
                     f"/api/messages?with=89201&after_id={initial_id}&wait_seconds=5",
@@ -285,6 +298,17 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
             assert len(messages) == 1
             assert messages[0]["id"] == next_message.json()["id"]
             assert messages[0]["body"] == "arrived during long poll"
+
+            event_response = await asyncio.wait_for(pending_events, timeout=3)
+            assert event_response.status_code == 200
+            assert any(
+                event["kind"] == "new_message"
+                and event["scope"] == "dm"
+                and event["message_id"] == next_message.json()["id"]
+                for event in event_response.json()["events"]
+            )
+            refreshed_conversations = await client.get("/api/conversations", headers=recipient)
+            assert refreshed_conversations.json()["conversations"][0]["unread_count"] == 2
 
             invalid_wait = await client.get(
                 f"/api/messages?with=89201&after_id={next_message.json()['id']}&wait_seconds=21",
@@ -937,6 +961,15 @@ def test_group_and_channel_long_poll_return_incremental_messages(api_env) -> Non
                 json={"body": "group initial"},
             )
             assert group_initial.status_code == 201
+            group_event_cursor_response = await client.get("/api/events", headers=member)
+            assert group_event_cursor_response.status_code == 200
+            group_event_cursor = group_event_cursor_response.json()["latest_id"]
+            group_events_pending = asyncio.create_task(
+                client.get(
+                    f"/api/events?after_id={group_event_cursor}&wait_seconds=20",
+                    headers=member,
+                )
+            )
             group_pending = asyncio.create_task(
                 client.get(
                     f"/api/groups/{group_id}/messages?after_id={group_initial.json()['id']}&wait_seconds=5",
@@ -953,6 +986,15 @@ def test_group_and_channel_long_poll_return_incremental_messages(api_env) -> Non
             assert group_response.status_code == 200
             assert [item["body"] for item in group_response.json()["messages"]] == ["group arrived"]
             assert group_next.status_code == 201
+            group_event_response = await asyncio.wait_for(group_events_pending, timeout=3)
+            assert any(
+                event["kind"] == "new_message"
+                and event["scope"] == "group"
+                and event["chat_id"] == group_id
+                for event in group_event_response.json()["events"]
+            )
+            group_rows = await client.get("/api/groups", headers=member)
+            assert group_rows.json()["groups"][0]["unread_count"] == 2
 
             channel = await client.post(
                 "/api/channels",
@@ -968,6 +1010,15 @@ def test_group_and_channel_long_poll_return_incremental_messages(api_env) -> Non
                 json={"body": "channel initial"},
             )
             assert channel_initial.status_code == 201
+            channel_event_cursor_response = await client.get("/api/events", headers=member)
+            assert channel_event_cursor_response.status_code == 200
+            channel_event_cursor = channel_event_cursor_response.json()["latest_id"]
+            channel_events_pending = asyncio.create_task(
+                client.get(
+                    f"/api/events?after_id={channel_event_cursor}&wait_seconds=20",
+                    headers=member,
+                )
+            )
             channel_pending = asyncio.create_task(
                 client.get(
                     f"/api/channels/{channel_id}/messages?after_id={channel_initial.json()['id']}&wait_seconds=5",
@@ -984,6 +1035,13 @@ def test_group_and_channel_long_poll_return_incremental_messages(api_env) -> Non
             assert channel_response.status_code == 200
             assert [item["body"] for item in channel_response.json()["messages"]] == ["channel arrived"]
             assert channel_next.status_code == 201
+            channel_event_response = await asyncio.wait_for(channel_events_pending, timeout=3)
+            assert any(
+                event["kind"] == "new_message"
+                and event["scope"] == "channel"
+                and event["chat_id"] == channel_id
+                for event in channel_event_response.json()["events"]
+            )
 
     run(scenario())
 
