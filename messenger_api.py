@@ -1784,13 +1784,23 @@ def build_messenger_router(
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT telegram_id AS id,username,display_name,avatar_media_id,bio,created_at
-                   FROM accounts WHERE telegram_id=?""",
+                   FROM accounts WHERE telegram_id=? AND is_banned=0""",
                 (user_id,),
             )
             row = await cur.fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Пользователь не найден")
-        return dict(row)
+            if row is None:
+                raise HTTPException(status_code=404, detail="Пользователь не найден")
+            cur = await db.execute(
+                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at
+                   FROM user_gifts
+                   WHERE owner_telegram_id=?
+                   ORDER BY id DESC LIMIT 50""",
+                (user_id,),
+            )
+            gifts = [dict(item) for item in await cur.fetchall()]
+        profile = dict(row)
+        profile["gifts"] = gifts
+        return profile
 
     async def settle_due_auctions(db: Any, now: int) -> int:
         cur = await db.execute(
