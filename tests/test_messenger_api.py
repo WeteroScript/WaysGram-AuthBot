@@ -2189,3 +2189,111 @@ def test_pinned_messages_cover_direct_group_and_channel_permissions(api_env) -> 
             assert removed_channel_pin.status_code == 200
 
     run(scenario())
+
+
+
+def test_typing_indicators_expire_and_respect_chat_membership(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 95401, "typing_owner")
+    add_account(api_env, 95402, "typing_peer")
+    add_account(api_env, 95403, "typing_outsider")
+    add_session(path, 95401, "typing-owner-session")
+    add_session(path, 95402, "typing-peer-session")
+    add_session(path, 95403, "typing-outsider-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer typing-owner-session"}
+            peer = {"Authorization": "Bearer typing-peer-session"}
+            outsider = {"Authorization": "Bearer typing-outsider-session"}
+
+            started = await client.put(
+                "/api/typing", headers=peer,
+                json={"scope": "dm", "peer_id": 95401, "is_typing": True},
+            )
+            assert started.status_code == 200
+            assert started.json()["expires_at"] > 0
+            visible = await client.get(
+                "/api/typing", headers=owner,
+                params={"scope": "dm", "peer_id": 95402},
+            )
+            assert visible.status_code == 200
+            assert [item["id"] for item in visible.json()["typing_users"]] == [95402]
+            assert "phone" not in str(visible.json())
+
+            # The typing state is directional: the sender does not see their own indicator.
+            own = await client.get(
+                "/api/typing", headers=peer,
+                params={"scope": "dm", "peer_id": 95401},
+            )
+            assert own.status_code == 200 and own.json()["count"] == 0
+
+            stopped = await client.put(
+                "/api/typing", headers=peer,
+                json={"scope": "dm", "peer_id": 95401, "is_typing": False},
+            )
+            assert stopped.status_code == 200 and stopped.json()["expires_at"] is None
+            cleared = await client.get(
+                "/api/typing", headers=owner,
+                params={"scope": "dm", "peer_id": 95402},
+            )
+            assert cleared.status_code == 200 and cleared.json()["count"] == 0
+
+            invalid = await client.put(
+                "/api/typing", headers=peer,
+                json={"scope": "dm", "peer_id": 95401, "is_typing": "yes"},
+            )
+            assert invalid.status_code == 400
+
+            # Blocking either direction prevents typing state from being shared.
+            blocked = await client.post("/api/blocks", headers=owner, json={"user_id": 95402})
+            assert blocked.status_code == 201
+            denied_dm = await client.put(
+                "/api/typing", headers=peer,
+                json={"scope": "dm", "peer_id": 95401, "is_typing": True},
+            )
+            assert denied_dm.status_code == 403
+            await client.delete("/api/blocks/95402", headers=owner)
+
+            # Group typing is visible only to current members.
+            created = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Typing Group", "username": "typing_group", "description": ""},
+            )
+            assert created.status_code == 201
+            group_id = created.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members", headers=owner,
+                json={"username": "typing_peer"},
+            )
+            assert joined.status_code == 201
+            group_started = await client.put(
+                "/api/typing", headers=peer,
+                json={"scope": "group", "peer_id": group_id, "is_typing": True},
+            )
+            assert group_started.status_code == 200
+            group_visible = await client.get(
+                "/api/typing", headers=owner,
+                params={"scope": "group", "peer_id": group_id},
+            )
+            assert group_visible.status_code == 200
+            assert [item["id"] for item in group_visible.json()["typing_users"]] == [95402]
+            denied_group = await client.get(
+                "/api/typing", headers=outsider,
+                params={"scope": "group", "peer_id": group_id},
+            )
+            assert denied_group.status_code == 403
+
+            # Expired state is removed and never shown as current activity.
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    "UPDATE typing_indicators SET expires_at=? WHERE scope='group' AND chat_id=?",
+                    (int(time.time()) - 1, group_id),
+                )
+            expired = await client.get(
+                "/api/typing", headers=owner,
+                params={"scope": "group", "peer_id": group_id},
+            )
+            assert expired.status_code == 200 and expired.json()["count"] == 0
+
+    run(scenario())
