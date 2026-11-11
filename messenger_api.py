@@ -2064,7 +2064,10 @@ def build_messenger_router(
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at,
-                          upgrade_level,attributes_json
+                          upgrade_level,attributes_json,
+                          EXISTS(SELECT 1 FROM gift_market_listings l
+                                 WHERE l.serial_number=user_gifts.serial_number
+                                   AND l.status='active') AS is_listed
                    FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
                 (int(user["telegram_id"]),),
             )
