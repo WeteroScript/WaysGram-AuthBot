@@ -45,11 +45,15 @@ def test_edit_and_delete_private_messages_with_events(env) -> None:
             assert (await client.patch(f"/api/messages/{mid}", headers=headers(101), json={"body": "  "})).status_code == 400
             edited = await client.patch(f"/api/messages/{mid}", headers=headers(101), json={"body": "fixed"})
             assert edited.status_code == 200
+            put_edited = await client.put(f"/api/messages/{mid}", headers=headers(101), json={"body": "fixed via PUT"})
+            assert put_edited.status_code == 200
             listed = (await client.get("/api/messages?with=101", headers=headers(102))).json()["messages"]
-            assert listed[-1]["body"] == "fixed" and listed[-1]["edited_at"]
+            assert listed[-1]["body"] == "fixed via PUT" and listed[-1]["edited_at"]
 
             events = (await client.get(f"/api/events?after_id={cursor}", headers=headers(102))).json()
-            assert [(e["kind"], e["message_id"], e["scope"]) for e in events["events"]] == [("edit", mid, "dm")]
+            assert [(e["kind"], e["message_id"], e["scope"]) for e in events["events"]] == [
+                ("edit", mid, "dm"), ("edit", mid, "dm")
+            ]
             # The author does not get an event for their own action.
             assert (await client.get(f"/api/events?after_id={cursor}", headers=headers(101))).json()["events"] == []
             # Someone outside the conversation sees nothing.
@@ -81,6 +85,7 @@ def test_group_edit_delete_and_admin_rights(env) -> None:
             # Only the author edits.
             assert (await client.patch(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(101), json={"body": "hack"})).status_code == 403
             assert (await client.patch(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(102), json={"body": "edited"})).status_code == 200
+            assert (await client.put(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(102), json={"body": "edited via PUT"})).status_code == 200
             # A member cannot delete the owner's message, the owner can delete anybody's.
             assert (await client.delete(f"/api/groups/{gid}/messages/{m2['id']}", headers=headers(102))).status_code == 403
             assert (await client.delete(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(101))).status_code == 200
@@ -103,8 +108,9 @@ def test_channel_posts_can_be_edited_and_deleted_by_the_owner_only(env) -> None:
             post = (await client.post(f"/api/channels/{cid}/messages", headers=headers(101), json={"body": "first"})).json()
             assert (await client.patch(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102), json={"body": "x"})).status_code == 403
             assert (await client.patch(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101), json={"body": "second"})).status_code == 200
+            assert (await client.put(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101), json={"body": "second via PUT"})).status_code == 200
             listed = (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"]
-            assert listed[0]["body"] == "second" and listed[0]["edited_at"]
+            assert listed[0]["body"] == "second via PUT" and listed[0]["edited_at"]
             assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102))).status_code == 403
             assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101))).status_code == 200
             assert (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"] == []
