@@ -34,7 +34,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         return [
             {"id": "g1", "sticker": {"file_id": "f1", "file_unique_id": "u1", "type": "regular", "width": 512,
                                      "height": 512, "is_animated": False, "is_video": False, "emoji": "🎁",
-                                     "mime_type": "image/webp"}, "star_count": 25},
+                                     "mime_type": "image/webp"}, "star_count": 25, "upgrade_star_count": 10},
             {"id": "g2", "sticker": {"file_id": "f2", "file_unique_id": "u2", "type": "regular", "width": 512,
                                      "height": 512, "is_animated": False, "is_video": False, "emoji": "🧸",
                                      "mime_type": "image/webp"}, "star_count": 50},
@@ -412,5 +412,109 @@ def test_public_profile_includes_received_gifts(env) -> None:
             assert "phone" not in data
             assert "token" not in str(data)
             assert "stars" not in data
+
+    run(scenario())
+
+
+def test_gift_market_listing_purchase_and_cancellation(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=30, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+
+            listed = await client.post(
+                f"/api/gifts/{serial}/list",
+                headers=headers(101),
+                json={"price_grams": 7},
+            )
+            assert listed.status_code == 201
+            listing_id = listed.json()["listing_id"]
+            assert listed.json()["currency"] == "grams"
+
+            # A listed gift is locked against transfer and upgrade.
+            assert (await client.post(
+                "/api/gifts/transfer",
+                headers=headers(101),
+                json={"serial_number": serial, "recipient_id": 102},
+            )).status_code == 409
+            assert (await client.post(
+                f"/api/gifts/{serial}/upgrade",
+                headers=headers(101),
+            )).status_code == 409
+
+            market = await client.get("/api/gift-market", headers=headers(102))
+            assert market.status_code == 200
+            assert len(market.json()["listings"]) == 1
+            assert market.json()["listings"][0]["listing_id"] == listing_id
+            assert market.json()["listings"][0]["price_grams"] == 7
+
+            purchased = await client.post(
+                f"/api/gift-market/{listing_id}/purchase",
+                headers=headers(102),
+            )
+            assert purchased.status_code == 201
+            assert purchased.json()["grams_balance"] == 8
+            assert (await client.get("/api/me", headers=headers(101))).json()["grams"] == 22
+            assert (await client.get("/api/me", headers=headers(102))).json()["grams"] == 8
+            buyer_inventory = (await client.get("/api/me/gifts", headers=headers(102))).json()["gifts"]
+            assert len(buyer_inventory) == 1 and buyer_inventory[0]["serial_number"] == serial
+            assert (await client.get("/api/gift-market", headers=headers(101))).json()["count"] == 0
+
+            # A sold listing cannot be purchased a second time.
+            assert (await client.post(
+                f"/api/gift-market/{listing_id}/purchase",
+                headers=headers(102),
+            )).status_code == 404
+
+    run(scenario())
+
+
+def test_gift_market_listing_can_be_cancelled(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
+            serial = bought.json()["gift"]["serial_number"]
+            listed = await client.post(
+                f"/api/gifts/{serial}/list", headers=headers(101), json={"price_grams": 5}
+            )
+            assert listed.status_code == 201
+            assert (await client.delete(f"/api/gifts/{serial}/list", headers=headers(102))).status_code == 404
+            cancelled = await client.delete(f"/api/gifts/{serial}/list", headers=headers(101))
+            assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
+            assert (await client.get("/api/gift-market", headers=headers(102))).json()["count"] == 0
+            assert (await client.post(
+                f"/api/gifts/{serial}/list", headers=headers(101), json={"price_grams": 9}
+            )).status_code == 201
+
+    run(scenario())
+
+
+def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
+            serial = bought.json()["gift"]["serial_number"]
+            upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert upgraded.status_code == 200
+            assert upgraded.json()["upgrade_level"] == 1
+            assert upgraded.json()["price_stars"] == 10
+            assert upgraded.json()["stars_balance"] == 4970
+            mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert mine[0]["upgrade_level"] == 1
+            assert mine[0]["attributes"]["upgrade_source"] == "waysgram_internal"
 
     run(scenario())
