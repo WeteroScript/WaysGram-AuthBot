@@ -2494,3 +2494,141 @@ def test_shared_media_history_filters_and_enforces_access(api_env) -> None:
             assert channel_media.status_code == 200 and channel_media.json()["count"] == 1
 
     run(scenario())
+
+
+
+def test_group_invites_enforce_expiry_usage_limits_and_admin_permissions(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    for user_id, username in [
+        (95701, "invite_owner"),
+        (95702, "invite_admin"),
+        (95703, "invite_member"),
+        (95704, "invite_guest"),
+    ]:
+        add_account(api_env, user_id, username)
+        add_session(path, user_id, f"group-invite-session-{user_id}")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer group-invite-session-95701"}
+            admin = {"Authorization": "Bearer group-invite-session-95702"}
+            member = {"Authorization": "Bearer group-invite-session-95703"}
+            guest = {"Authorization": "Bearer group-invite-session-95704"}
+
+            created = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Invite Group", "username": "invite_group", "description": ""},
+            )
+            assert created.status_code == 201
+            group_id = created.json()["id"]
+
+            joined_admin = await client.post(
+                f"/api/groups/{group_id}/members", headers=owner,
+                json={"telegram_id": 95702},
+            )
+            assert joined_admin.status_code == 201
+            promoted = await client.post(
+                f"/api/groups/{group_id}/admins", headers=owner,
+                json={"telegram_id": 95702},
+            )
+            assert promoted.status_code == 201
+
+            denied_member_create = await client.post(
+                f"/api/groups/{group_id}/invites", headers=member,
+                json={"expires_in_hours": 24},
+            )
+            assert denied_member_create.status_code == 403
+
+            invalid_limit = await client.post(
+                f"/api/groups/{group_id}/invites", headers=admin,
+                json={"expires_in_hours": 24, "max_uses": 0},
+            )
+            assert invalid_limit.status_code == 400
+
+            invite = await client.post(
+                f"/api/groups/{group_id}/invites", headers=admin,
+                json={"expires_in_hours": 24, "max_uses": 1},
+            )
+            assert invite.status_code == 201
+            invite_link = invite.json()["invite_link"]
+            assert invite_link.startswith("/api/groups/invites/") is False
+            token = invite_link.rsplit("/", 1)[-1]
+            assert len(token) >= 20
+
+            with db_split.sqlite_connect(path) as db:
+                stored_hash = db.execute(
+                    "SELECT token_hash FROM group_invites WHERE group_id=?",
+                    (group_id,),
+                ).fetchone()[0]
+                assert stored_hash != token
+                assert stored_hash == hashlib.sha256(token.encode()).hexdigest()
+
+            preview = await client.get(invite_link)
+            assert preview.status_code == 200
+            assert preview.json()["group_id"] == group_id
+            assert preview.json()["title"] == "Invite Group"
+
+            joined = await client.post(
+                "/api/groups/join", headers=guest,
+                json={"invite_link": invite_link},
+            )
+            assert joined.status_code == 200
+            assert joined.json()["joined"] is True
+            assert joined.json()["already_member"] is False
+
+            repeated = await client.post(
+                "/api/groups/join", headers=guest,
+                json={"invite_token": token},
+            )
+            assert repeated.status_code == 200
+            assert repeated.json()["already_member"] is True
+
+            exhausted = await client.post(
+                "/api/groups/join", headers=member,
+                json={"invite_link": invite_link},
+            )
+            assert exhausted.status_code == 410
+
+            outsider_revoke = await client.delete(
+                f"/api/groups/{group_id}/invites/{token}", headers=member,
+            )
+            assert outsider_revoke.status_code == 403
+
+            second_invite = await client.post(
+                f"/api/groups/{group_id}/invites", headers=owner,
+                json={"expires_in_hours": 24},
+            )
+            assert second_invite.status_code == 201
+            second_token = second_invite.json()["invite_link"].rsplit("/", 1)[-1]
+            revoked = await client.delete(
+                f"/api/groups/{group_id}/invites/{second_token}", headers=admin,
+            )
+            assert revoked.status_code == 200
+            assert (await client.get(second_invite.json()["invite_link"])).status_code == 404
+            revoked_join = await client.post(
+                "/api/groups/join", headers=member,
+                json={"invite_token": second_token},
+            )
+            assert revoked_join.status_code == 404
+
+            # Expired links remain unusable even when a valid token is supplied.
+            expiring = await client.post(
+                f"/api/groups/{group_id}/invites", headers=owner,
+                json={"expires_in_hours": 1},
+            )
+            assert expiring.status_code == 201
+            expiring_token = expiring.json()["invite_link"].rsplit("/", 1)[-1]
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    "UPDATE group_invites SET expires_at=? WHERE token_hash=?",
+                    (int(time.time()) - 1, hashlib.sha256(expiring_token.encode()).hexdigest()),
+                )
+            expired_preview = await client.get(expiring.json()["invite_link"])
+            assert expired_preview.status_code == 404
+            expired_join = await client.post(
+                "/api/groups/join", headers=member,
+                json={"invite_token": expiring_token},
+            )
+            assert expired_join.status_code == 410
+
+    run(scenario())
