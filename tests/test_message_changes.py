@@ -453,3 +453,71 @@ def test_direct_messages_can_be_forwarded_with_original_attribution(env) -> None
             assert missing_target.status_code == 404
 
     run(scenario())
+
+
+
+def test_user_blocklist_prevents_direct_messages_both_directions(env) -> None:
+    _path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth_a = headers(101)
+            auth_b = headers(102)
+
+            invalid_self = await client.post("/api/blocks", headers=auth_a, json={"user_id": 101})
+            assert invalid_self.status_code == 400
+            invalid_id = await client.post("/api/blocks", headers=auth_a, json={"user_id": "102"})
+            assert invalid_id.status_code == 400
+
+            blocked = await client.post("/api/blocks", headers=auth_a, json={"user_id": 102})
+            assert blocked.status_code == 201
+            assert blocked.json()["status"] == "blocked"
+            assert blocked.json()["user"]["id"] == 102
+
+            duplicate = await client.post("/api/blocks", headers=auth_a, json={"user_id": 102})
+            assert duplicate.status_code == 201
+            assert duplicate.json()["status"] == "already_blocked"
+
+            listed = await client.get("/api/blocks", headers=auth_a)
+            assert listed.status_code == 200
+            assert listed.json()["count"] == 1
+            assert listed.json()["blocked_users"][0]["id"] == 102
+
+            outbound = await client.post(
+                "/api/messages", headers=auth_a,
+                json={"recipient_id": 102, "body": "This should be denied"},
+            )
+            assert outbound.status_code == 403
+
+            inbound = await client.post(
+                "/api/messages", headers=auth_b,
+                json={"recipient_id": 101, "body": "This should also be denied"},
+            )
+            assert inbound.status_code == 403
+
+            forwarded_source = await client.post(
+                "/api/messages", headers=auth_b,
+                json={"recipient_id": ADMIN, "body": "Forward source"},
+            )
+            assert forwarded_source.status_code == 201
+            forwarding = await client.post(
+                f"/api/messages/{forwarded_source.json()['id']}/forward",
+                headers=auth_b,
+                json={"recipient_id": 101},
+            )
+            assert forwarding.status_code == 403
+
+            unblocked = await client.delete("/api/blocks/102", headers=auth_a)
+            assert unblocked.status_code == 200
+            assert unblocked.json()["status"] == "unblocked"
+            assert (await client.get("/api/blocks", headers=auth_a)).json()["count"] == 0
+
+            allowed_after_unblock = await client.post(
+                "/api/messages", headers=auth_b,
+                json={"recipient_id": 101, "body": "Now it is allowed"},
+            )
+            assert allowed_after_unblock.status_code == 201
+            assert (await client.delete("/api/blocks/102", headers=auth_a)).status_code == 404
+            assert (await client.get("/api/blocks")).status_code == 401
+
+    run(scenario())
