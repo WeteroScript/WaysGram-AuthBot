@@ -25,7 +25,7 @@ Set:
 - `DD_VERSION` to the deployed release identifier.
 - `DD_LOGS_INJECTION=true`
 
-The `ddtrace` auto-instrumentation hooks FastAPI and supported Python integrations. Log records include Datadog trace/span correlation fields. The Agent or hosting platform must also collect the container's stdout/stderr logs and tag them with the same service/environment/version values. Without a reachable Agent and log collection, adding the SDK alone will not create APM traces or searchable logs.
+The `ddtrace` auto-instrumentation hooks FastAPI and supported Python integrations. Log records include Datadog trace/span correlation fields. Uvicorn access logs are disabled so raw request paths and query strings are not copied into log streams; AuthBot log messages avoid account identifiers and OTP delivery IDs. The Agent or hosting platform must also collect the container's stdout/stderr logs and tag them with the same service/environment/version values. Without a reachable Agent and log collection, adding the SDK alone will not create APM traces or searchable logs.
 
 ## Android client
 
