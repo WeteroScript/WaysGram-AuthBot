@@ -541,3 +541,136 @@ def test_user_blocklist_prevents_direct_messages_both_directions(env) -> None:
             assert (await client.get("/api/blocks")).status_code == 401
 
     run(scenario())
+
+
+
+def test_message_reactions_toggle_and_respect_chat_access(env) -> None:
+    _path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            dm = (await client.post(
+                "/api/messages", headers=headers(101),
+                json={"recipient_id": 102, "body": "React here"},
+            )).json()
+            dm_id = dm["id"]
+
+            first = await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                headers=headers(102),
+                json={"reaction": "👍"},
+            )
+            assert first.status_code == 200
+            assert first.json()["status"] == "added"
+            assert first.json()["reactions"] == [{"reaction": "👍", "count": 1}]
+            assert first.json()["my_reactions"] == ["👍"]
+
+            second = await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                headers=headers(101),
+                json={"reaction": "👍"},
+            )
+            assert second.status_code == 200
+            assert second.json()["reactions"] == [{"reaction": "👍", "count": 2}]
+
+            removed = await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                headers=headers(101),
+                json={"reaction": "👍"},
+            )
+            assert removed.status_code == 200 and removed.json()["status"] == "removed"
+            assert removed.json()["reactions"] == [{"reaction": "👍", "count": 1}]
+            assert removed.json()["my_reactions"] == []
+
+            for emoji in ("❤️", "😂", "😮"):
+                assert (await client.post(
+                    f"/api/messages/{dm_id}/reactions",
+                    headers=headers(101),
+                    json={"reaction": emoji},
+                )).status_code == 200
+            too_many = await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                headers=headers(101),
+                json={"reaction": "🎉"},
+            )
+            assert too_many.status_code == 409
+
+            invalid = await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                headers=headers(101),
+                json={"reaction": "not-an-emoji"},
+            )
+            assert invalid.status_code == 400
+
+            outsider = await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                headers=headers(ADMIN),
+                json={"reaction": "👍"},
+            )
+            assert outsider.status_code == 404
+
+            history = (await client.get(
+                "/api/messages?with=102", headers=headers(101),
+            )).json()["messages"]
+            assert history[0]["reaction_summary"]
+
+            group = (await client.post(
+                "/api/groups", headers=headers(101), json={"title": "Reaction Group"},
+            )).json()
+            group_id = group["id"]
+            await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=headers(101),
+                json={"telegram_id": 102},
+            )
+            group_message = (await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=headers(102),
+                json={"body": "Group reaction"},
+            )).json()
+            group_reaction = await client.post(
+                f"/api/groups/{group_id}/messages/{group_message['id']}/reactions",
+                headers=headers(101),
+                json={"reaction": "🎉"},
+            )
+            assert group_reaction.status_code == 200
+            assert group_reaction.json()["reactions"] == [{"reaction": "🎉", "count": 1}]
+            denied_group = await client.post(
+                f"/api/groups/{group_id}/messages/{group_message['id']}/reactions",
+                headers=headers(ADMIN),
+                json={"reaction": "👍"},
+            )
+            assert denied_group.status_code == 403
+            group_history = (await client.get(
+                f"/api/groups/{group_id}/messages", headers=headers(102),
+            )).json()["messages"]
+            assert group_history[0]["reaction_summary"] == "🎉:1"
+
+            channel = (await client.post(
+                "/api/channels",
+                headers=headers(101),
+                json={"title": "Reaction Channel", "username": "reaction_channel"},
+            )).json()
+            channel_id = channel["id"]
+            channel_post = (await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=headers(101),
+                json={"body": "Channel reaction"},
+            )).json()
+            channel_reaction = await client.post(
+                f"/api/channels/{channel_id}/messages/{channel_post['id']}/reactions",
+                headers=headers(101),
+                json={"reaction": "❤️"},
+            )
+            assert channel_reaction.status_code == 200
+            channel_history = (await client.get(
+                f"/api/channels/{channel_id}/messages", headers=headers(101),
+            )).json()["messages"]
+            assert channel_history[0]["reaction_summary"] == "❤️:1"
+
+            assert (await client.post(
+                f"/api/messages/{dm_id}/reactions",
+                json={"reaction": "👍"},
+            )).status_code == 401
+
+    run(scenario())
