@@ -1003,6 +1003,7 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
             f"""SELECT g.gift_id AS id,g.title AS title,
                        COALESCE(p.price_stars,0) AS price_stars,COALESCE(p.supply,0) AS supply,COALESCE(p.sold,0) AS sold
                 FROM {table} g LEFT JOIN telegram_gift_prices p ON p.gift_id=g.gift_id
+                WHERE g.is_available=1
                 ORDER BY (COALESCE(p.price_stars,0)>0 AND COALESCE(p.supply,0)>COALESCE(p.sold,0)) DESC, g.gift_id"""
         )
         return [dict(row) for row in await cur.fetchall()]
