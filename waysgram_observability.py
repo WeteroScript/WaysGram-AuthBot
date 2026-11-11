@@ -44,8 +44,12 @@ def install_datadog_log_context() -> None:
 _SENSITIVE_PROPERTY_NAMES = frozenset({
     "$ip", "ip", "$current_url", "$pathname", "$current_path", "$url",
     "url", "path", "http.url", "http.target", "$user_agent", "$raw_user_agent",
-    "authorization", "cookie", "token", "phone", "email", "user_id",
-    "telegram_id", "body", "message", "exception_message",
+    "authorization", "cookie", "token", "$token", "api_key", "secret", "password",
+    "phone", "$phone", "email", "$email", "user_id", "$user_id", "telegram_id",
+    "$telegram_id", "account_id", "recipient_id", "sender_id", "owner_id",
+    "message_id", "channel_id", "group_id", "gift_id", "serial_number",
+    "invite_token", "invite_link", "code", "otp", "filename", "original_name",
+    "request_body", "body", "message", "exception_message",
 })
 
 
