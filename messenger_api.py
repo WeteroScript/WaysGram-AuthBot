@@ -1460,7 +1460,7 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT id,serial_number,gift_id,gift_name,acquired_at
+                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at
                    FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
                 (int(user["telegram_id"]),),
             )
@@ -1742,71 +1742,53 @@ def build_messenger_router(
             for row in rows
         }
 
-    @router.patch("/api/admin/telegram-gifts/{gift_id}")
-    async def set_gift_price(
-        gift_id: str,
-        payload: dict[str, Any],
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        user = await current_user(authorization)
-        if not is_admin_user(user):
-            raise HTTPException(status_code=403, detail="Только для администратора")
-        if not payload or not ({"price_stars", "supply"} & payload.keys()):
-            raise HTTPException(status_code=400, detail="Нет полей для изменения")
-        values: dict[str, int] = {}
-        for field in ("price_stars", "supply"):
-            if field in payload:
-                value = payload[field]
-                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1_000_000_000:
-                    raise HTTPException(status_code=400, detail="Значение должно быть целым числом от 0 до 1000000000")
-                values[field] = value
-        now = int(time.time())
-        async with aiosqlite.connect(db_path()) as db:
-            await db.execute("BEGIN IMMEDIATE")
-            cur = await db.execute(
-                "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id=?", (gift_id,)
-            )
-            row = await cur.fetchone()
-            price = values.get("price_stars", int(row[0]) if row else 0)
-            supply = values.get("supply", int(row[1]) if row else 0)
-            sold = int(row[2]) if row else 0
-            await db.execute(
-                """INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(gift_id) DO UPDATE SET price_stars=excluded.price_stars,
-                       supply=excluded.supply,updated_at=excluded.updated_at""",
-                (gift_id, price, supply, sold, now),
-            )
-            await db.execute(
-                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
-                (int(user["telegram_id"]), "telegram_gift_price", gift_id[:120], f"price={price}; supply={supply}", now),
-            )
-            await db.commit()
-        return {
-            "id": gift_id,
-            "price_stars": price,
-            "supply": supply,
-            "sold": sold,
-            "remaining": max(supply - sold, 0),
-            "for_sale": price > 0 and supply - sold > 0,
-        }
-
     @router.post("/api/telegram/gifts/{gift_id}/purchase", status_code=201)
     async def purchase_telegram_gift(
         gift_id: str,
         payload: dict[str, Any],
         authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", gift_id):
+            raise HTTPException(status_code=400, detail="Некорректный Telegram Gift ID")
         recipient = payload.get("recipient_id")
-        await ensure_telegram_gifts_fresh()  # the catalog must exist before a title can be looked up
         if recipient is not None and (isinstance(recipient, bool) or not isinstance(recipient, int) or recipient <= 0):
             raise HTTPException(status_code=400, detail="Некорректный получатель")
+        key = (idempotency_key or "").strip()
+        if key and (len(key) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]{16,128}", key)):
+            raise HTTPException(status_code=400, detail="Некорректный Idempotency-Key")
+        canonical = json.dumps(
+            {"gift_id": gift_id, "payload": payload},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request_hash = hashlib.sha256(
+            ("/api/telegram/gifts/purchase\n" + canonical).encode("utf-8")
+        ).hexdigest()
+        await ensure_telegram_gifts_fresh()  # the catalog must exist before a title can be looked up
         now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            if key:
+                cur = await db.execute(
+                    """SELECT request_hash,response_json FROM api_idempotency_records
+                       WHERE telegram_id=? AND scope='telegram_gift_purchase'
+                         AND idempotency_key=? AND created_at>=?""",
+                    (uid, key, now - 7 * 86400),
+                )
+                prior = await cur.fetchone()
+                if prior:
+                    await db.rollback()
+                    if not hmac.compare_digest(str(prior["request_hash"]), request_hash):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Idempotency-Key уже использован для другого запроса",
+                        )
+                    return json.loads(prior["response_json"])
             cur = await db.execute(
                 "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id=?", (gift_id,)
             )
@@ -1847,9 +1829,10 @@ def build_messenger_router(
                 raise HTTPException(status_code=409, detail="Подарок закончился")
             serial = "WG-" + secrets.token_hex(6).upper()
             await db.execute(
-                """INSERT INTO user_gifts(serial_number,gift_id,gift_name,owner_telegram_id,acquired_at)
-                   VALUES(?,NULL,?,?,?)""",
-                (serial, title, owner, now),
+                """INSERT INTO user_gifts
+                   (serial_number,gift_id,telegram_gift_id,gift_name,owner_telegram_id,acquired_at)
+                   VALUES(?,NULL,?,?,?,?)""",
+                (serial, gift_id, title, owner, now),
             )
             balance = int(account["stars"]) - price
             await db.execute(
@@ -1868,13 +1851,26 @@ def build_messenger_router(
                        VALUES('transfer',?,?,?,?,?)""",
                     (serial, title, uid, owner, now),
                 )
+            result = {
+                "status": "purchased",
+                "gift": {
+                    "serial_number": serial,
+                    "telegram_gift_id": gift_id,
+                    "gift_name": title,
+                    "owner_id": owner,
+                },
+                "price_stars": price,
+                "stars": balance,
+            }
+            if key:
+                await db.execute(
+                    """INSERT INTO api_idempotency_records
+                       (telegram_id,scope,idempotency_key,request_hash,response_json,created_at)
+                       VALUES(?,'telegram_gift_purchase',?,?,?,?)""",
+                    (uid, key, request_hash, json.dumps(result, ensure_ascii=False, separators=(",", ":")), now),
+                )
             await db.commit()
-        return {
-            "status": "purchased",
-            "gift": {"serial_number": serial, "gift_name": title, "owner_id": owner},
-            "price_stars": price,
-            "stars": balance,
-        }
+        return result
 
     async def telegram_gift_title(db: Any, gift_id: str) -> str:
         cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
