@@ -2777,6 +2777,39 @@ def build_messenger_router(
             "next_after_id": items[-1]["id"] if items else 0,
         }
 
+    @router.get("/api/messages/search")
+    async def search_messages(
+        peer: int = Query(alias="with", gt=0),
+        q: str = Query(min_length=1, max_length=128),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        term = q.strip()
+        if not term:
+            raise HTTPException(status_code=400, detail="Введите текст для поиска")
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (peer,))
+            if not await cur.fetchone():
+                raise HTTPException(status_code=404, detail="Собеседник не найден")
+            cur = await db.execute(
+                """SELECT id,sender_telegram_id AS sender_id,
+                          recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
+                          (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
+                          (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
+                   FROM messages
+                   WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
+                          (sender_telegram_id=? AND recipient_telegram_id=?))
+                     AND body LIKE ? COLLATE NOCASE
+                   ORDER BY id DESC LIMIT 100""",
+                (uid, peer, peer, uid, f"%{term}%"),
+            )
+            rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        items.reverse()
+        return {"query": term, "messages": items, "count": len(items), "has_more": len(items) == 100}
+
     @router.post("/api/messages", status_code=201)
     async def send_message(
         payload: dict[str, Any],
