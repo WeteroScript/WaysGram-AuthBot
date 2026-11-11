@@ -3248,6 +3248,9 @@ def build_messenger_router(
                 (channel_id, uid, body, media_id, reply_to_id, now),
             )
             message_id = int(cur.lastrowid)
+            await record_event(
+                db, "channel", message_id, "new_message", uid, chat_id=channel_id,
+            )
             result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "reply_to_id": reply_to_id, **media_fields, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
@@ -3523,6 +3526,10 @@ def build_messenger_router(
                 (uid, recipient_id, body, media_id, reply_to_id, now),
             )
             message_id = int(cur.lastrowid)
+            await record_event(
+                db, "dm", message_id, "new_message", uid,
+                user_a=uid, user_b=recipient_id,
+            )
             result = {
                 "id": message_id,
                 "status": "sent",
@@ -3625,6 +3632,10 @@ def build_messenger_router(
                 ),
             )
             new_message_id = int(cur.lastrowid)
+            await record_event(
+                db, "dm", new_message_id, "new_message", uid,
+                user_a=uid, user_b=recipient_id,
+            )
             media_fields = await media_message_fields(db, source["media_id"])
             result = {
                 "id": new_message_id,
@@ -5192,6 +5203,9 @@ def build_messenger_router(
                 (group_id, uid, body, media_id, reply_to_id, now),
             )
             message_id = int(cur.lastrowid)
+            await record_event(
+                db, "group", message_id, "new_message", uid, chat_id=group_id,
+            )
             await db.commit()
         return {
             "id": message_id,
