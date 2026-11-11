@@ -367,6 +367,21 @@ async def init_messenger_storage(database_path: Path) -> None:
                 sold INTEGER NOT NULL DEFAULT 0 CHECK(sold >= 0),
                 updated_at INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS gift_market_listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                serial_number TEXT NOT NULL UNIQUE,
+                seller_telegram_id INTEGER NOT NULL,
+                price_grams INTEGER NOT NULL CHECK(price_grams > 0),
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active','sold','cancelled')),
+                buyer_telegram_id INTEGER,
+                created_at INTEGER NOT NULL,
+                sold_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_gift_market_status_time
+                ON gift_market_listings(status,created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_gift_market_seller
+                ON gift_market_listings(seller_telegram_id,status);
             CREATE TABLE IF NOT EXISTS telegram_gift_catalog (
                 gift_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -579,6 +594,18 @@ async def init_messenger_storage(database_path: Path) -> None:
         # A database from an older version keeps everything in one file: move the messenger tables out first,
         # because a table left in the main file would hide the one in the messenger file.
         await db_split.migrate_legacy_with(db, database_path)
+        cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(user_gifts)")
+        user_gift_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "upgrade_level" not in user_gift_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.user_gifts "
+                "ADD COLUMN upgrade_level INTEGER NOT NULL DEFAULT 0 CHECK(upgrade_level >= 0)"
+            )
+        if "attributes_json" not in user_gift_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.user_gifts "
+                "ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '{}'"
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(chat_groups)")
         chat_group_columns = {str(row[1]) for row in await cur.fetchall()}
         if "slow_mode_seconds" not in chat_group_columns:
@@ -3088,6 +3115,315 @@ def build_messenger_router(
             await idempotency_store(db, uid, "/api/gifts/transfer", descriptor, result, now)
             await db.commit()
         return result
+
+    @router.get("/api/gift-market")
+    async def list_gift_market(
+        limit: int = Query(default=50, ge=1, le=100),
+        before_id: int = Query(default=0, ge=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT l.id AS listing_id,l.serial_number,l.price_grams,l.created_at,
+                          g.gift_id,g.telegram_gift_id,g.gift_name,g.upgrade_level,g.attributes_json,
+                          a.telegram_id AS seller_id,a.username AS seller_username,
+                          a.display_name AS seller_display_name
+                   FROM gift_market_listings l
+                   JOIN user_gifts g ON g.serial_number=l.serial_number
+                   JOIN accounts a ON a.telegram_id=l.seller_telegram_id
+                   WHERE l.status='active' AND l.seller_telegram_id<>?
+                     AND (?=0 OR l.id<?)
+                   ORDER BY l.id DESC LIMIT ?""",
+                (int((await current_user(authorization))["telegram_id"]), before_id, before_id, limit),
+            )
+            rows = await cur.fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["attributes"] = json.loads(item.pop("attributes_json") or "{}")
+            except (TypeError, ValueError):
+                item["attributes"] = {}
+            items.append(item)
+        return {"currency": "grams", "listings": items, "count": len(items)}
+
+    @router.post("/api/gifts/{serial_number}/list", status_code=201)
+    async def create_gift_listing(
+        serial_number: str,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        serial = serial_number.strip().upper()
+        if not GIFT_SERIAL_RE.fullmatch(serial):
+            raise HTTPException(status_code=400, detail="Некорректный серийный номер подарка")
+        raw_price = payload.get("price_grams")
+        if isinstance(raw_price, bool):
+            raise HTTPException(status_code=400, detail="Цена должна быть целым числом Gram")
+        try:
+            price = int(raw_price)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Укажите цену в Gram")
+        if not 1 <= price <= 1_000_000_000:
+            raise HTTPException(status_code=400, detail="Цена должна быть от 1 до 1000000000 Gram")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id,gift_name FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?",
+                (serial, uid),
+            )
+            gift = await cur.fetchone()
+            if gift is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
+            cur = await db.execute(
+                "SELECT id FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Подарок уже выставлен на продажу")
+            cur = await db.execute(
+                """INSERT INTO gift_market_listings
+                   (serial_number,seller_telegram_id,price_grams,status,created_at)
+                   VALUES(?,?,?,'active',?)""",
+                (serial, uid, price, now),
+            )
+            listing_id = int(cur.lastrowid)
+            await db.commit()
+        return {
+            "status": "listed",
+            "listing_id": listing_id,
+            "serial_number": serial,
+            "gift_name": str(gift["gift_name"]),
+            "price_grams": price,
+            "currency": "grams",
+        }
+
+    @router.delete("/api/gifts/{serial_number}/list")
+    async def cancel_gift_listing(
+        serial_number: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        serial = serial_number.strip().upper()
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """UPDATE gift_market_listings SET status='cancelled'
+                   WHERE serial_number=? AND seller_telegram_id=? AND status='active'""",
+                (serial, uid),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Активное объявление не найдено")
+            await db.commit()
+        return {"status": "cancelled", "serial_number": serial}
+
+    @router.post("/api/gift-market/{listing_id}/purchase", status_code=201)
+    async def purchase_market_gift(
+        listing_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        buyer_id = int(user["telegram_id"])
+        if listing_id <= 0:
+            raise HTTPException(status_code=400, detail="Некорректный ID объявления")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT l.id,l.serial_number,l.seller_telegram_id,l.price_grams,
+                          g.id AS gift_instance_id,g.gift_name
+                   FROM gift_market_listings l
+                   JOIN user_gifts g ON g.serial_number=l.serial_number
+                   WHERE l.id=? AND l.status='active'
+                     AND g.owner_telegram_id=l.seller_telegram_id""",
+                (listing_id,),
+            )
+            listing = await cur.fetchone()
+            if listing is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Объявление недоступно")
+            seller_id = int(listing["seller_telegram_id"])
+            price = int(listing["price_grams"])
+            serial = str(listing["serial_number"])
+            if buyer_id == seller_id:
+                await db.rollback()
+                raise HTTPException(status_code=400, detail="Нельзя купить собственный подарок")
+            cur = await db.execute(
+                "SELECT grams,is_banned FROM accounts WHERE telegram_id=?",
+                (buyer_id,),
+            )
+            buyer = await cur.fetchone()
+            cur = await db.execute(
+                "SELECT grams,is_banned FROM accounts WHERE telegram_id=?",
+                (seller_id,),
+            )
+            seller = await cur.fetchone()
+            if not buyer or buyer["is_banned"] or not seller or seller["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Один из аккаунтов недоступен")
+            if int(buyer["grams"]) < price:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Недостаточно Gram")
+            buyer_balance = int(buyer["grams"]) - price
+            seller_balance = int(seller["grams"]) + price
+            cur = await db.execute(
+                "UPDATE gift_market_listings SET status='sold',buyer_telegram_id=?,sold_at=? WHERE id=? AND status='active'",
+                (buyer_id, now, listing_id),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Объявление уже куплено")
+            cur = await db.execute(
+                "UPDATE user_gifts SET owner_telegram_id=? WHERE id=? AND owner_telegram_id=?",
+                (buyer_id, int(listing["gift_instance_id"]), seller_id),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Владение подарком уже изменилось")
+            await db.execute(
+                "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                (buyer_balance, now, buyer_id),
+            )
+            await db.execute(
+                "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                (seller_balance, now, seller_id),
+            )
+            await db.executemany(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,'grams',?,?,?,NULL,?)""",
+                [
+                    (buyer_id, -price, buyer_balance, f"gift_market_purchase:{listing_id}", now),
+                    (seller_id, price, seller_balance, f"gift_market_sale:{listing_id}", now),
+                ],
+            )
+            await db.execute(
+                """INSERT INTO gift_transactions
+                   (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
+                   VALUES('market_sale',?,?,?,?,?)""",
+                (serial, str(listing["gift_name"]), seller_id, buyer_id, now),
+            )
+            await db.commit()
+        return {
+            "status": "purchased",
+            "listing_id": listing_id,
+            "serial_number": serial,
+            "gift_name": str(listing["gift_name"]),
+            "seller_id": seller_id,
+            "buyer_id": buyer_id,
+            "price_grams": price,
+            "grams_balance": buyer_balance,
+        }
+
+    @router.post("/api/gifts/{serial_number}/upgrade")
+    async def upgrade_gift(
+        serial_number: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        serial = serial_number.strip().upper()
+        if not GIFT_SERIAL_RE.fullmatch(serial):
+            raise HTTPException(status_code=400, detail="Некорректный серийный номер подарка")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT id,gift_name,telegram_gift_id,upgrade_level,attributes_json
+                   FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?""",
+                (serial, uid),
+            )
+            gift = await cur.fetchone()
+            if gift is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
+            if not str(gift["telegram_gift_id"] or ""):
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Этот подарок нельзя улучшить")
+            cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
+            state = await cur.fetchone()
+            source = str(state[0]) if state else "telegram_bot_api"
+            if source == "telegram_mtproto":
+                cur = await db.execute(
+                    "SELECT upgrade_stars FROM telegram_mtproto_gift_catalog WHERE gift_id=? AND is_available=1",
+                    (str(gift["telegram_gift_id"]),),
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT upgrade_star_count FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1",
+                    (str(gift["telegram_gift_id"]),),
+                )
+            catalog = await cur.fetchone()
+            if catalog is None or catalog[0] is None or int(catalog[0]) <= 0:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Для этого подарка нет доступного улучшения")
+            price = int(catalog[0])
+            cur = await db.execute(
+                "SELECT stars,is_banned FROM accounts WHERE telegram_id=?",
+                (uid,),
+            )
+            account = await cur.fetchone()
+            if not account or account["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Аккаунт недоступен")
+            if int(account["stars"]) < price:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Недостаточно Stars")
+            new_balance = int(account["stars"]) - price
+            new_level = int(gift["upgrade_level"]) + 1
+            try:
+                attributes = json.loads(str(gift["attributes_json"] or "{}"))
+            except (TypeError, ValueError):
+                attributes = {}
+            if not isinstance(attributes, dict):
+                attributes = {}
+            attributes.update({
+                "upgrade_level": new_level,
+                "last_upgraded_at": now,
+                "upgrade_source": "waysgram_internal",
+            })
+            await db.execute(
+                "UPDATE accounts SET stars=?,updated_at=? WHERE telegram_id=?",
+                (new_balance, now, uid),
+            )
+            await db.execute(
+                "UPDATE user_gifts SET upgrade_level=?,attributes_json=? WHERE id=? AND owner_telegram_id=?",
+                (new_level, json.dumps(attributes, ensure_ascii=False, separators=(",", ":")),
+                 int(gift["id"]), uid),
+            )
+            await db.execute(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,'stars',?,?,?,NULL,?)""",
+                (uid, -price, new_balance, f"gift_upgrade:{serial}:{new_level}", now),
+            )
+            await db.execute(
+                """INSERT INTO gift_transactions
+                   (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
+                   VALUES('upgrade',?,?,?, ?,?)""",
+                (serial, str(gift["gift_name"]), uid, uid, now),
+            )
+            await db.commit()
+        return {
+            "status": "upgraded",
+            "serial_number": serial,
+            "gift_name": str(gift["gift_name"]),
+            "upgrade_level": new_level,
+            "price_stars": price,
+            "stars_balance": new_balance,
+            "attributes": attributes,
+        }
 
     @router.get("/api/channels")
     async def list_channels(authorization: str | None = Header(default=None)) -> dict[str, Any]:
