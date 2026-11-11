@@ -17,6 +17,8 @@ def test_replies_are_validated_and_returned(env) -> None:
             assert reply.status_code == 201 and reply.json()["reply_to_id"] == first["id"]
             listed = (await client.get("/api/messages?with=102", headers=headers(101))).json()["messages"]
             assert listed[-1]["reply_to_id"] == first["id"] and listed[0]["reply_to_id"] is None
+            assert listed[-1]["reply_to_body"] == "hi"
+            assert listed[-1]["reply_to_sender_id"] == 101
 
             # A message of another conversation cannot be replied to.
             other = (await client.post("/api/messages", headers=headers(101), json={"recipient_id": ADMIN, "body": "x"})).json()
@@ -94,6 +96,8 @@ def test_group_edit_delete_and_admin_rights(env) -> None:
 
             remaining = (await client.get(f"/api/groups/{gid}/messages", headers=headers(102))).json()["messages"]
             assert [m["id"] for m in remaining] == [m2["id"]]
+            assert remaining[0]["reply_to_body"] == "from member"
+            assert remaining[0]["reply_to_sender_id"] == 102
 
     run(scenario())
 
