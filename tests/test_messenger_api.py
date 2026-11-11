@@ -123,6 +123,15 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
             assert rename.status_code == 200
             assert rename.json()["display_name"] == "Alpha Updated"
 
+            updated_profile = await client.put(
+                "/api/me",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"display_name": "Alpha via PUT", "bio": "WaysGram profile"},
+            )
+            assert updated_profile.status_code == 200
+            assert updated_profile.json()["display_name"] == "Alpha via PUT"
+            assert updated_profile.json()["bio"] == "WaysGram profile"
+
             duplicate = await client.patch(
                 "/api/me",
                 headers={"Authorization": f"Bearer {token}"},
