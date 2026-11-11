@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import mimetypes
+import os
 import hmac
 import json
 import re
 import secrets
 import time
 from io import BytesIO
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +34,30 @@ MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
 PHONE_RE = re.compile(r"^\+1[0-9]{10}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
+
+
+def _external_api_base_url(request: Request) -> str:
+    """Return the canonical public API origin for links shared with clients."""
+    configured = os.getenv("PUBLIC_API_BASE_URL", "").strip()
+    if not configured:
+        return str(request.base_url).rstrip("/")
+
+    parsed = urlsplit(configured)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="PUBLIC_API_BASE_URL must be an absolute HTTP(S) origin",
+        )
+    return f"{parsed.scheme}://{parsed.netloc}"
+
 
 
 def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
@@ -2347,7 +2372,7 @@ def build_messenger_router(
             "is_public": is_public,
         }
         if invite_token:
-            result["invite_link"] = str(request.base_url).rstrip("/") + f"/api/channels/invites/{invite_token}"
+            result["invite_link"] = _external_api_base_url(request) + f"/api/channels/invites/{invite_token}"
         return result
 
     @router.get("/api/channels/invites/{invite_token}", name="preview_channel_invite")
