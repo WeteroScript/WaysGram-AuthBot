@@ -59,6 +59,7 @@ MESSENGER_TABLES = frozenset(
         "gift_catalog",
         "user_gifts",
         "gift_transactions",
+        "gift_market_listings",
         "gift_auctions",
         "auction_bids",
         "economy_transactions",
