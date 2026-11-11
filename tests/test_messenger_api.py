@@ -1485,6 +1485,12 @@ def test_private_channels_hide_content_until_invite_join(api_env) -> None:
             )
             assert denied_details.status_code == 403
             assert denied_messages.status_code == 403
+            denied_read_marker = await client.put(
+                "/api/read",
+                headers=guest,
+                json={"scope": "channel", "peer_id": channel_id, "last_read_id": 0},
+            )
+            assert denied_read_marker.status_code == 403
 
             joined = await client.post(
                 "/api/channels/join",
@@ -1503,6 +1509,12 @@ def test_private_channels_hide_content_until_invite_join(api_env) -> None:
             assert details.status_code == 200
             assert details.json()["is_public"] == 0
             assert history.status_code == 200
+            allowed_read_marker = await client.put(
+                "/api/read",
+                headers=guest,
+                json={"scope": "channel", "peer_id": channel_id, "last_read_id": 0},
+            )
+            assert allowed_read_marker.status_code == 200
 
             invalid = await client.post(
                 "/api/channels/join",
