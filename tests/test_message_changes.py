@@ -39,9 +39,9 @@ def test_edit_and_delete_private_messages_with_events(env) -> None:
 
     async def scenario() -> None:
         async with await client_for(app) as client:
-            cursor = (await client.get("/api/events", headers=headers(102))).json()["latest_id"]
             sent = (await client.post("/api/messages", headers=headers(101), json={"recipient_id": 102, "body": "typo"})).json()
             mid = sent["id"]
+            cursor = (await client.get("/api/events", headers=headers(102))).json()["latest_id"]
 
             assert (await client.patch(f"/api/messages/{mid}", headers=headers(102), json={"body": "x"})).status_code == 403
             assert (await client.patch(f"/api/messages/{mid}", headers=headers(101), json={"body": "  "})).status_code == 400
