@@ -212,6 +212,16 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_message_reactions_message
                 ON message_reactions(scope,chat_id,message_id,reaction);
+            CREATE TABLE IF NOT EXISTS pinned_messages (
+                scope TEXT NOT NULL CHECK(scope IN ('dm','group','channel')),
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                message_id INTEGER NOT NULL,
+                pinned_by INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(scope,chat_id,message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pinned_messages_created
+                ON pinned_messages(scope,chat_id,created_at DESC);
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
@@ -3549,6 +3559,168 @@ def build_messenger_router(
             "reactions": summary,
             "my_reactions": mine,
         }
+
+    async def change_pinned_message(
+        scope: str, chat_id: int, message_id: int, user_id: int, pin: bool
+    ) -> dict[str, Any]:
+        if scope not in ("dm", "group", "channel") or chat_id <= 0 or message_id <= 0:
+            raise HTTPException(status_code=400, detail="Некорректные параметры закрепления")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            event_user_a = 0
+            event_user_b = 0
+            if scope == "dm":
+                cur = await db.execute(
+                    """SELECT sender_telegram_id,recipient_telegram_id FROM messages
+                       WHERE id=? AND ((sender_telegram_id=? AND recipient_telegram_id=?)
+                                      OR (sender_telegram_id=? AND recipient_telegram_id=?))""",
+                    (message_id, user_id, chat_id, chat_id, user_id),
+                )
+                message = await cur.fetchone()
+                if message is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Сообщение не найдено в этой переписке")
+                event_user_a = int(message["sender_telegram_id"])
+                event_user_b = int(message["recipient_telegram_id"])
+            elif scope == "group":
+                membership = await require_group_member(db, chat_id, user_id)
+                if membership["role"] not in ("owner", "admin"):
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Закреплять сообщения могут только администраторы группы")
+                cur = await db.execute(
+                    "SELECT 1 FROM group_messages WHERE id=? AND group_id=?", (message_id, chat_id)
+                )
+                if await cur.fetchone() is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Сообщение группы не найдено")
+            else:
+                cur = await db.execute(
+                    """SELECT ch.owner_telegram_id,
+                              EXISTS(SELECT 1 FROM channel_admins ca
+                                     WHERE ca.channel_id=ch.id AND ca.telegram_id=?) AS is_admin
+                       FROM channels ch WHERE ch.id=?""",
+                    (user_id, chat_id),
+                )
+                channel = await cur.fetchone()
+                if channel is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Канал не найден")
+                if int(channel["owner_telegram_id"]) != user_id and not bool(channel["is_admin"]):
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Закреплять публикации могут только администраторы канала")
+                cur = await db.execute(
+                    "SELECT 1 FROM channel_messages WHERE id=? AND channel_id=?", (message_id, chat_id)
+                )
+                if await cur.fetchone() is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Публикация не найдена")
+            stored_chat_id = chat_id if scope != "dm" else 0
+            if pin:
+                cur = await db.execute(
+                    """INSERT OR IGNORE INTO pinned_messages(scope,chat_id,message_id,pinned_by,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (scope, stored_chat_id, message_id, user_id, now),
+                )
+                status = "pinned" if cur.rowcount == 1 else "already_pinned"
+                event_kind = "pin" if cur.rowcount == 1 else ""
+            else:
+                cur = await db.execute(
+                    "DELETE FROM pinned_messages WHERE scope=? AND chat_id=? AND message_id=?",
+                    (scope, stored_chat_id, message_id),
+                )
+                status = "unpinned" if cur.rowcount == 1 else "not_pinned"
+                event_kind = "unpin" if cur.rowcount == 1 else ""
+            if event_kind:
+                await record_event(
+                    db, scope, message_id, event_kind, user_id,
+                    chat_id=stored_chat_id, user_a=event_user_a, user_b=event_user_b,
+                )
+            await db.commit()
+        return {"status": status, "scope": scope, "peer_id": chat_id, "message_id": message_id}
+
+    @router.get("/api/pins")
+    async def list_pinned_messages(
+        scope: str = Query(...),
+        peer_id: int = Query(..., gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        if scope == "dm":
+            async with aiosqlite.connect(db_path()) as db:
+                cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (peer_id,))
+                if await cur.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Собеседник не найден")
+        elif scope == "group":
+            async with aiosqlite.connect(db_path()) as db:
+                await require_group_member(db, peer_id, uid)
+        else:
+            await require_channel_access(peer_id, uid)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            if scope == "dm":
+                cur = await db.execute(
+                    """SELECT p.message_id,p.pinned_by,p.created_at AS pinned_at,
+                              m.body,m.created_at,m.sender_telegram_id AS sender_id,
+                              m.recipient_telegram_id AS recipient_id
+                       FROM pinned_messages p JOIN messages m ON m.id=p.message_id
+                       WHERE p.scope='dm' AND p.chat_id=0 AND
+                         ((m.sender_telegram_id=? AND m.recipient_telegram_id=?) OR
+                          (m.sender_telegram_id=? AND m.recipient_telegram_id=?))
+                       ORDER BY p.created_at DESC,p.message_id DESC LIMIT 100""",
+                    (uid, peer_id, peer_id, uid),
+                )
+            elif scope == "group":
+                cur = await db.execute(
+                    """SELECT p.message_id,p.pinned_by,p.created_at AS pinned_at,
+                              m.body,m.created_at,m.sender_telegram_id AS sender_id
+                       FROM pinned_messages p JOIN group_messages m ON m.id=p.message_id
+                       WHERE p.scope='group' AND p.chat_id=? AND m.group_id=p.chat_id
+                       ORDER BY p.created_at DESC,p.message_id DESC LIMIT 100""",
+                    (peer_id,),
+                )
+            else:
+                cur = await db.execute(
+                    """SELECT p.message_id,p.pinned_by,p.created_at AS pinned_at,
+                              m.body,m.created_at,m.author_telegram_id AS sender_id
+                       FROM pinned_messages p JOIN channel_messages m ON m.id=p.message_id
+                       WHERE p.scope='channel' AND p.chat_id=? AND m.channel_id=p.chat_id
+                       ORDER BY p.created_at DESC,p.message_id DESC LIMIT 100""",
+                    (peer_id,),
+                )
+            rows = [dict(row) for row in await cur.fetchall()]
+        return {"scope": scope, "peer_id": peer_id, "pinned_messages": rows, "count": len(rows)}
+
+    @router.post("/api/pins")
+    async def pin_message(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        scope = payload.get("scope")
+        peer_id = payload.get("peer_id")
+        message_id = payload.get("message_id")
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (peer_id, message_id)):
+            raise HTTPException(status_code=400, detail="peer_id и message_id должны быть положительными целыми числами")
+        return await change_pinned_message(str(scope), peer_id, message_id, int(user["telegram_id"]), True)
+
+    @router.delete("/api/pins")
+    async def unpin_message(
+        scope: str = Query(...),
+        peer_id: int = Query(..., gt=0),
+        message_id: int = Query(..., gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        return await change_pinned_message(scope, peer_id, message_id, int(user["telegram_id"]), False)
 
     @router.post("/api/messages/{message_id}/reactions")
     async def react_to_direct_message(
