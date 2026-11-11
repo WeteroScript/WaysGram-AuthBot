@@ -1702,7 +1702,27 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             hidden = await client.post(direct_path, headers=outsider, json={"reaction": "👍"})
             assert hidden.status_code == 404
 
+            pending_events_started = time.monotonic()
+            pending_events = asyncio.create_task(
+                client.get(
+                    f"/api/events?after_id={direct_event_cursor}&wait_seconds=20",
+                    headers=owner,
+                )
+            )
+            await asyncio.sleep(0.05)
+
             first = await client.post(direct_path, headers=peer, json={"reaction": "👍"})
+            assert first.status_code == 200
+            delivered_events = await asyncio.wait_for(pending_events, timeout=3.0)
+            assert delivered_events.status_code == 200
+            assert time.monotonic() - pending_events_started < 3.0
+            assert any(
+                event["kind"] == "reaction"
+                and event["scope"] == "dm"
+                and event["message_id"] == direct_id
+                for event in delivered_events.json()["events"]
+            )
+
             second = await client.post(direct_path, headers=peer, json={"reaction": "❤️"})
             third = await client.post(direct_path, headers=peer, json={"reaction": "😂"})
             assert first.status_code == second.status_code == third.status_code == 200
