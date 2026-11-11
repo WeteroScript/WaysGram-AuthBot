@@ -2632,3 +2632,140 @@ def test_group_invites_enforce_expiry_usage_limits_and_admin_permissions(api_env
             assert expired_join.status_code == 410
 
     run(scenario())
+
+
+
+def test_group_invite_join_requests_require_admin_approval(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    for user_id, username in [
+        (95801, "approval_owner"),
+        (95802, "approval_admin"),
+        (95803, "approval_member"),
+        (95804, "approval_guest"),
+    ]:
+        add_account(api_env, user_id, username)
+        add_session(path, user_id, f"group-approval-session-{user_id}")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer group-approval-session-95801"}
+            admin = {"Authorization": "Bearer group-approval-session-95802"}
+            member = {"Authorization": "Bearer group-approval-session-95803"}
+            guest = {"Authorization": "Bearer group-approval-session-95804"}
+
+            created = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Approval Group", "username": "approval_group", "description": ""},
+            )
+            assert created.status_code == 201
+            group_id = created.json()["id"]
+            joined_admin = await client.post(
+                f"/api/groups/{group_id}/members", headers=owner,
+                json={"telegram_id": 95802},
+            )
+            assert joined_admin.status_code == 201
+            promoted = await client.post(
+                f"/api/groups/{group_id}/admins", headers=owner,
+                json={"telegram_id": 95802},
+            )
+            assert promoted.status_code == 201
+
+            invite = await client.post(
+                f"/api/groups/{group_id}/invites", headers=admin,
+                json={"expires_in_hours": 24, "max_uses": 1, "require_approval": True},
+            )
+            assert invite.status_code == 201
+            assert invite.json()["require_approval"] is True
+            link = invite.json()["invite_link"]
+            token = link.rsplit("/", 1)[-1]
+
+            preview = await client.get(link)
+            assert preview.status_code == 200
+            assert preview.json()["require_approval"] is True
+
+            request = await client.post(
+                "/api/groups/join", headers=guest,
+                json={"invite_link": link},
+            )
+            assert request.status_code == 200
+            assert request.json()["join_requested"] is True
+            assert request.json()["joined"] is False
+            assert (await client.get(f"/api/groups/{group_id}", headers=guest)).status_code == 403
+
+            repeated = await client.post(
+                "/api/groups/join", headers=guest,
+                json={"invite_token": token},
+            )
+            assert repeated.status_code == 200
+            assert repeated.json()["join_requested"] is True
+
+            listed = await client.get(
+                f"/api/groups/{group_id}/join-requests", headers=admin,
+            )
+            assert listed.status_code == 200
+            assert listed.json()["count"] == 1
+            assert listed.json()["requests"][0]["telegram_id"] == 95804
+            denied_list = await client.get(
+                f"/api/groups/{group_id}/join-requests", headers=member,
+            )
+            assert denied_list.status_code == 403
+
+            denied_approve = await client.post(
+                f"/api/groups/{group_id}/join-requests/95804/approve", headers=member,
+            )
+            assert denied_approve.status_code == 403
+
+            approved = await client.post(
+                f"/api/groups/{group_id}/join-requests/95804/approve", headers=admin,
+            )
+            assert approved.status_code == 200
+            assert approved.json()["approved"] is True
+            assert approved.json()["joined"] is True
+            joined_details = await client.get(f"/api/groups/{group_id}", headers=guest)
+            assert joined_details.status_code == 200
+            assert joined_details.json()["my_role"] == "member"
+            with db_split.sqlite_connect(path) as db:
+                uses = db.execute(
+                    "SELECT uses FROM group_invites WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                ).fetchone()[0]
+                assert uses == 1
+
+            exhausted = await client.post(
+                "/api/groups/join", headers=member,
+                json={"invite_token": token},
+            )
+            assert exhausted.status_code == 410
+
+            declined_invite = await client.post(
+                f"/api/groups/{group_id}/invites", headers=owner,
+                json={"expires_in_hours": 24, "require_approval": True},
+            )
+            assert declined_invite.status_code == 201
+            declined_token = declined_invite.json()["invite_link"].rsplit("/", 1)[-1]
+            declined_request = await client.post(
+                "/api/groups/join", headers=member,
+                json={"invite_token": declined_token},
+            )
+            assert declined_request.status_code == 200
+            assert declined_request.json()["join_requested"] is True
+            declined = await client.post(
+                f"/api/groups/{group_id}/join-requests/95803/decline", headers=owner,
+            )
+            assert declined.status_code == 200
+            assert declined.json()["declined"] is True
+            declined_list = await client.get(
+                f"/api/groups/{group_id}/join-requests", headers=owner,
+            )
+            assert declined_list.status_code == 200
+            assert declined_list.json()["count"] == 0
+
+            # A user may submit a new request after the previous one was declined.
+            requested_again = await client.post(
+                "/api/groups/join", headers=member,
+                json={"invite_token": declined_token},
+            )
+            assert requested_again.status_code == 200
+            assert requested_again.json()["join_requested"] is True
+
+    run(scenario())
