@@ -2389,7 +2389,7 @@ def test_shared_media_history_filters_and_enforces_access(api_env) -> None:
                 "/api/media/images", headers={**owner, "Content-Type": "image/png"}, content=image_bytes,
             )
             second_upload = await client.post(
-                "/api/media/images", headers={**owner, "Content-Type": "image/png"}, content=image_bytes,
+                "/api/media/images", headers={**peer, "Content-Type": "image/png"}, content=image_bytes,
             )
             assert first_upload.status_code == second_upload.status_code == 201
             first_media_id = first_upload.json()["id"]
@@ -2474,7 +2474,7 @@ def test_shared_media_history_filters_and_enforces_access(api_env) -> None:
             channel_id = channel.json()["id"]
             channel_post = await client.post(
                 f"/api/channels/{channel_id}/messages", headers=owner,
-                json={"media_id": second_media_id},
+                json={"media_id": first_media_id},
             )
             assert channel_post.status_code == 201
             channel_denied = await client.get(
