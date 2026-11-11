@@ -2297,3 +2297,69 @@ def test_typing_indicators_expire_and_respect_chat_membership(api_env) -> None:
             assert expired.status_code == 200 and expired.json()["count"] == 0
 
     run(scenario())
+
+
+
+def test_public_profile_shows_only_mutual_contacts_and_common_groups(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    for user_id, username in [
+        (95501, "common_viewer"),
+        (95502, "common_profile"),
+        (95503, "common_person"),
+        (95504, "viewer_only"),
+        (95505, "target_only"),
+    ]:
+        add_account(api_env, user_id, username)
+    for user_id, token in [
+        (95501, "common-viewer-session"),
+        (95502, "common-profile-session"),
+    ]:
+        add_session(path, user_id, token)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            viewer = {"Authorization": "Bearer common-viewer-session"}
+            target = {"Authorization": "Bearer common-profile-session"}
+
+            # One private group is shared; the other groups are deliberately not.
+            shared_group = await client.post(
+                "/api/groups", headers=viewer,
+                json={"title": "Shared Group", "username": "shared_group", "description": ""},
+            )
+            assert shared_group.status_code == 201
+            shared_id = shared_group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{shared_id}/members", headers=viewer,
+                json={"telegram_id": 95502},
+            )
+            assert joined.status_code == 201
+
+            viewer_group = await client.post(
+                "/api/groups", headers=viewer,
+                json={"title": "Viewer Only", "username": "viewer_only_group", "description": ""},
+            )
+            assert viewer_group.status_code == 201
+            target_group = await client.post(
+                "/api/groups", headers=target,
+                json={"title": "Target Only", "username": "target_only_group", "description": ""},
+            )
+            assert target_group.status_code == 201
+
+            # Mutual contacts are the intersection of the two private contact lists.
+            for user_id in (95503, 95504):
+                added = await client.post("/api/contacts", headers=viewer, json={"user_id": user_id})
+                assert added.status_code == 201
+            for user_id in (95503, 95505):
+                added = await client.post("/api/contacts", headers=target, json={"user_id": user_id})
+                assert added.status_code == 201
+
+            response = await client.get("/api/users/95502", headers=viewer)
+            assert response.status_code == 200
+            profile = response.json()
+            assert [group["id"] for group in profile["common_groups"]] == [shared_id]
+            assert [contact["id"] for contact in profile["common_contacts"]] == [95503]
+            assert "phone" not in profile
+            assert "stars" not in profile
+            assert "token" not in str(profile)
+
+    run(scenario())
