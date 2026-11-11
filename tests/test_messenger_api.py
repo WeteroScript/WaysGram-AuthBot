@@ -1800,3 +1800,56 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             assert channel_history.json()["messages"][0]["reaction_summary"] == "🙏:1"
 
     run(scenario())
+
+def test_profile_avatar_upload_set_remove_and_owner_isolation(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89501, "avatar_owner")
+    add_account(api_env, 89502, "avatar_other")
+    add_session(path, 89501, "avatar-owner-session")
+    add_session(path, 89502, "avatar-other-session")
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (4, 3), (80, 120, 180)).save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer avatar-owner-session"}
+            other = {"Authorization": "Bearer avatar-other-session"}
+
+            uploaded = await client.post(
+                "/api/media/images",
+                headers={**owner, "Content-Type": "image/png"},
+                content=image_bytes,
+            )
+            assert uploaded.status_code == 201
+            media_id = uploaded.json()["id"]
+
+            foreign_assignment = await client.put(
+                "/api/me/avatar",
+                headers=other,
+                json={"media_id": media_id},
+            )
+            assert foreign_assignment.status_code == 404
+
+            assigned = await client.put(
+                "/api/me/avatar",
+                headers=owner,
+                json={"media_id": media_id},
+            )
+            assert assigned.status_code == 200
+            assert assigned.json()["avatar_media_id"] == media_id
+
+            profile = await client.get("/api/me", headers=owner)
+            assert profile.status_code == 200
+            assert profile.json()["avatar_media_id"] == media_id
+
+            removed = await client.delete("/api/me/avatar", headers=owner)
+            assert removed.status_code == 200
+            assert removed.json()["avatar_media_id"] == ""
+
+            refreshed = await client.get("/api/me", headers=owner)
+            assert refreshed.status_code == 200
+            assert refreshed.json()["avatar_media_id"] == ""
+
+    run(scenario())
