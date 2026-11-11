@@ -344,3 +344,42 @@ def test_simultaneous_telegram_gift_purchases_cannot_oversell(env) -> None:
             connection.close()
 
     run(scenario())
+
+
+def test_auth_sessions_can_be_listed_and_revoked(env) -> None:
+    path, app = env
+    secondary = "s101-secondary-session-token"
+    tertiary = "s101-tertiary-session-token"
+    add_session(path, 101, secondary)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            listing = await client.get("/api/auth/sessions", headers=headers(101))
+            assert listing.status_code == 200
+            sessions = listing.json()["sessions"]
+            assert listing.json()["count"] == 2
+            current = [item for item in sessions if item["is_current"]]
+            other = [item for item in sessions if not item["is_current"]]
+            assert len(current) == 1 and len(other) == 1
+            assert "token_hash" not in str(listing.json())
+            assert "s101-session-token" not in str(listing.json())
+
+            revoked = await client.delete(
+                "/api/auth/sessions/" + other[0]["id"],
+                headers=headers(101),
+            )
+            assert revoked.status_code == 200
+            assert (await client.get("/api/auth/sessions", headers=headers(101))).json()["count"] == 1
+
+            add_session(path, 101, tertiary)
+            revoke_others = await client.post(
+                "/api/auth/sessions/revoke-others",
+                headers=headers(101),
+                json={},
+            )
+            assert revoke_others.status_code == 200
+            assert revoke_others.json()["revoked_sessions"] == 1
+            assert (await client.get("/api/auth/sessions", headers=headers(101))).json()["count"] == 1
+            assert (await client.get("/api/me", headers={"Authorization": "Bearer " + tertiary})).status_code == 401
+
+    run(scenario())
