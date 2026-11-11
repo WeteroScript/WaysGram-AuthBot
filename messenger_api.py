@@ -3082,6 +3082,22 @@ def build_messenger_router(
             "admins": [dict(row) for row in rows],
         }
 
+    async def attach_my_reactions(items: list[dict[str, Any]], scope: str, chat_id: int, user_id: int) -> None:
+        message_ids = [int(item["id"]) for item in items if item.get("id") is not None]
+        if not message_ids:
+            return
+        placeholders = ",".join("?" for _ in message_ids)
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                f"SELECT message_id,reaction FROM message_reactions WHERE scope=? AND chat_id=? AND user_telegram_id=? AND message_id IN ({placeholders}) ORDER BY created_at,reaction",
+                (scope, chat_id, user_id, *message_ids),
+            )
+            rows = await cur.fetchall()
+        mine: dict[int, list[str]] = {}
+        for message_id, reaction in rows:
+            mine.setdefault(int(message_id), []).append(str(reaction))
+        for item in items:
+            item["my_reactions"] = mine.get(int(item["id"]), [])
     @router.get("/api/channels/{channel_id}/messages")
     async def list_channel_messages(
         channel_id: int,
@@ -3134,6 +3150,7 @@ def build_messenger_router(
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
+        await attach_my_reactions(items, "channel", channel_id, int(user["telegram_id"]))
         return {"messages": items}
 
     def parse_reply_id(payload: dict[str, Any]) -> int | None:
@@ -3182,6 +3199,7 @@ def build_messenger_router(
             rows = await cur.fetchall()
         items = [dict(row) for row in rows]
         items.reverse()
+        await attach_my_reactions(items, "channel", channel_id, int(user["telegram_id"]))
         return {"query": term, "messages": items, "count": len(items), "has_more": len(items) == 100}
 
     @router.post("/api/channels/{channel_id}/messages", status_code=201)
@@ -3374,6 +3392,7 @@ def build_messenger_router(
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
+        await attach_my_reactions(items, "dm", 0, uid)
         async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
                 """SELECT
@@ -3429,6 +3448,7 @@ def build_messenger_router(
             rows = await cur.fetchall()
         items = [dict(row) for row in rows]
         items.reverse()
+        await attach_my_reactions(items, "dm", 0, uid)
         return {"query": term, "messages": items, "count": len(items), "has_more": len(items) == 100}
 
     @router.post("/api/messages", status_code=201)
@@ -5065,6 +5085,7 @@ def build_messenger_router(
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
+        await attach_my_reactions(items, "group", group_id, uid)
         return {"messages": items, "next_after_id": items[-1]["id"] if items else 0}
 
     @router.get("/api/groups/{group_id}/messages/search")
@@ -5098,6 +5119,7 @@ def build_messenger_router(
             rows = await cur.fetchall()
         items = [dict(row) for row in rows]
         items.reverse()
+        await attach_my_reactions(items, "group", group_id, int(user["telegram_id"]))
         return {"query": term, "messages": items, "count": len(items), "has_more": len(items) == 100}
 
     @router.post("/api/groups/{group_id}/messages", status_code=201)
