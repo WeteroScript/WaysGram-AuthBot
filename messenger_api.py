@@ -3039,10 +3039,23 @@ def build_messenger_router(
             if scope == "group":
                 await require_group_member(db, int(peer_id), uid)
             elif scope == "channel":
-                cur = await db.execute("SELECT 1 FROM channels WHERE id=?", (int(peer_id),))
-                if await cur.fetchone() is None:
+                cur = await db.execute(
+                    """SELECT ch.is_public,ch.owner_telegram_id,
+                              EXISTS(SELECT 1 FROM channel_admins ca
+                                     WHERE ca.channel_id=ch.id AND ca.telegram_id=?),
+                              EXISTS(SELECT 1 FROM channel_members cm
+                                     WHERE cm.channel_id=ch.id AND cm.telegram_id=?)
+                       FROM channels ch WHERE ch.id=?""",
+                    (uid, uid, int(peer_id)),
+                )
+                channel_access = await cur.fetchone()
+                if channel_access is None:
                     await db.rollback()
                     raise HTTPException(status_code=404, detail="Канал не найден")
+                is_public, owner_id, is_admin, is_member = channel_access
+                if not bool(is_public) and int(owner_id) != uid and not bool(is_admin) and not bool(is_member):
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Нет доступа к приватному каналу")
             else:
                 cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (int(peer_id),))
                 if await cur.fetchone() is None:
