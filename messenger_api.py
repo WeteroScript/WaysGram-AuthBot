@@ -3205,19 +3205,30 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
             cur = await db.execute(
-                "SELECT id FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                "SELECT id,status FROM gift_market_listings WHERE serial_number=?",
                 (serial,),
             )
-            if await cur.fetchone():
+            previous_listing = await cur.fetchone()
+            if previous_listing and str(previous_listing["status"]) == "active":
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Подарок уже выставлен на продажу")
-            cur = await db.execute(
-                """INSERT INTO gift_market_listings
-                   (serial_number,seller_telegram_id,price_grams,status,created_at)
-                   VALUES(?,?,?,'active',?)""",
-                (serial, uid, price, now),
-            )
-            listing_id = int(cur.lastrowid)
+            if previous_listing:
+                listing_id = int(previous_listing["id"])
+                await db.execute(
+                    """UPDATE gift_market_listings
+                       SET seller_telegram_id=?,price_grams=?,status='active',
+                           buyer_telegram_id=NULL,created_at=?,sold_at=NULL
+                       WHERE id=?""",
+                    (uid, price, now, listing_id),
+                )
+            else:
+                cur = await db.execute(
+                    """INSERT INTO gift_market_listings
+                       (serial_number,seller_telegram_id,price_grams,status,created_at)
+                       VALUES(?,?,?,'active',?)""",
+                    (serial, uid, price, now),
+                )
+                listing_id = int(cur.lastrowid)
             await db.commit()
         return {
             "status": "listed",
