@@ -2044,3 +2044,148 @@ def test_contact_notes_are_private_and_removed_with_contact(api_env) -> None:
             assert not_a_contact.status_code == 404
 
     run(scenario())
+
+
+
+def test_pinned_messages_cover_direct_group_and_channel_permissions(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 95301, "pin_owner")
+    add_account(api_env, 95302, "pin_peer")
+    add_account(api_env, 95303, "pin_admin")
+    add_account(api_env, 95304, "pin_member")
+    add_account(api_env, 95305, "pin_outsider")
+    for user_id, token in [
+        (95301, "pin-owner-session"),
+        (95302, "pin-peer-session"),
+        (95303, "pin-admin-session"),
+        (95304, "pin-member-session"),
+        (95305, "pin-outsider-session"),
+    ]:
+        add_session(path, user_id, token)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer pin-owner-session"}
+            peer = {"Authorization": "Bearer pin-peer-session"}
+            admin = {"Authorization": "Bearer pin-admin-session"}
+            member = {"Authorization": "Bearer pin-member-session"}
+            outsider = {"Authorization": "Bearer pin-outsider-session"}
+
+            # Direct messages: either participant can pin and unpin, outsiders cannot.
+            direct = await client.post(
+                "/api/messages", headers=owner,
+                json={"recipient_id": 95302, "body": "Pin this direct message"},
+            )
+            assert direct.status_code == 201
+            direct_id = direct.json()["id"]
+            pinned_dm = await client.post(
+                "/api/pins", headers=peer,
+                json={"scope": "dm", "peer_id": 95301, "message_id": direct_id},
+            )
+            assert pinned_dm.status_code == 200 and pinned_dm.json()["status"] == "pinned"
+            duplicate_dm = await client.post(
+                "/api/pins", headers=owner,
+                json={"scope": "dm", "peer_id": 95302, "message_id": direct_id},
+            )
+            assert duplicate_dm.status_code == 200 and duplicate_dm.json()["status"] == "already_pinned"
+            listed_dm = await client.get(
+                "/api/pins", headers=owner, params={"scope": "dm", "peer_id": 95302},
+            )
+            assert listed_dm.status_code == 200
+            assert listed_dm.json()["pinned_messages"][0]["body"] == "Pin this direct message"
+            denied_dm = await client.post(
+                "/api/pins", headers=outsider,
+                json={"scope": "dm", "peer_id": 95301, "message_id": direct_id},
+            )
+            assert denied_dm.status_code == 404
+            unpinned_dm = await client.delete(
+                "/api/pins", headers=owner,
+                params={"scope": "dm", "peer_id": 95302, "message_id": direct_id},
+            )
+            assert unpinned_dm.status_code == 200 and unpinned_dm.json()["status"] == "unpinned"
+
+            # Groups: only owners and admins can pin; all members can read the pin list.
+            created_group = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Pinned Group", "username": "pinned_group", "description": ""},
+            )
+            assert created_group.status_code == 201
+            group_id = created_group.json()["id"]
+            for username in ("pin_admin", "pin_member"):
+                joined = await client.post(
+                    f"/api/groups/{group_id}/members", headers=owner,
+                    json={"username": username},
+                )
+                assert joined.status_code == 201
+            promoted = await client.post(
+                f"/api/groups/{group_id}/admins", headers=owner,
+                json={"telegram_id": 95303},
+            )
+            assert promoted.status_code == 201
+            group_post = await client.post(
+                f"/api/groups/{group_id}/messages", headers=member,
+                json={"body": "Pin this group message"},
+            )
+            assert group_post.status_code == 201
+            group_message_id = group_post.json()["id"]
+            denied_group = await client.post(
+                "/api/pins", headers=member,
+                json={"scope": "group", "peer_id": group_id, "message_id": group_message_id},
+            )
+            assert denied_group.status_code == 403
+            pinned_group = await client.post(
+                "/api/pins", headers=admin,
+                json={"scope": "group", "peer_id": group_id, "message_id": group_message_id},
+            )
+            assert pinned_group.status_code == 200
+            listed_group = await client.get(
+                "/api/pins", headers=member, params={"scope": "group", "peer_id": group_id},
+            )
+            assert listed_group.status_code == 200
+            assert listed_group.json()["count"] == 1
+            denied_group_list = await client.get(
+                "/api/pins", headers=outsider, params={"scope": "group", "peer_id": group_id},
+            )
+            assert denied_group_list.status_code == 403
+
+            # Channels: viewers can read pins, while only channel admins can change them.
+            created_channel = await client.post(
+                "/api/channels", headers=owner,
+                json={"title": "Pinned Channel", "username": "pinned_channel"},
+            )
+            assert created_channel.status_code == 201
+            channel_id = created_channel.json()["id"]
+            channel_post = await client.post(
+                f"/api/channels/{channel_id}/messages", headers=owner,
+                json={"body": "Pin this channel post"},
+            )
+            assert channel_post.status_code == 201
+            channel_message_id = channel_post.json()["id"]
+            appointed = await client.post(
+                f"/api/channels/{channel_id}/admins", headers=owner,
+                json={"telegram_id": 95303},
+            )
+            assert appointed.status_code == 201
+            denied_channel = await client.post(
+                "/api/pins", headers=member,
+                json={"scope": "channel", "peer_id": channel_id, "message_id": channel_message_id},
+            )
+            assert denied_channel.status_code == 403
+            pinned_channel = await client.post(
+                "/api/pins", headers=admin,
+                json={"scope": "channel", "peer_id": channel_id, "message_id": channel_message_id},
+            )
+            assert pinned_channel.status_code == 200
+            listed_channel = await client.get(
+                "/api/pins", headers=outsider,
+                params={"scope": "channel", "peer_id": channel_id},
+            )
+            assert listed_channel.status_code == 200
+            assert listed_channel.json()["pinned_messages"][0]["body"] == "Pin this channel post"
+            removed_channel_pin = await client.delete(
+                "/api/pins", headers=owner,
+                params={"scope": "channel", "peer_id": channel_id, "message_id": channel_message_id},
+            )
+            assert removed_channel_pin.status_code == 200
+
+    run(scenario())
