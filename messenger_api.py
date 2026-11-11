@@ -349,6 +349,15 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_group_members_user
                 ON group_members(telegram_id,group_id);
+            CREATE TABLE IF NOT EXISTS contacts (
+                owner_telegram_id INTEGER NOT NULL,
+                contact_telegram_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_telegram_id,contact_telegram_id),
+                CHECK(owner_telegram_id<>contact_telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_contacts_contact
+                ON contacts(contact_telegram_id,owner_telegram_id);
             CREATE TABLE IF NOT EXISTS group_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id INTEGER NOT NULL,
@@ -1514,6 +1523,72 @@ def build_messenger_router(
                 )
             rows = await cur.fetchall()
         return {"users": [dict(row) for row in rows]}
+
+    @router.get("/api/contacts")
+    async def list_contacts(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT a.telegram_id AS id,a.username,a.display_name,a.avatar_media_id,a.bio,c.created_at
+                   FROM contacts c JOIN accounts a ON a.telegram_id=c.contact_telegram_id
+                   WHERE c.owner_telegram_id=? AND a.is_banned=0
+                   ORDER BY lower(a.display_name),lower(a.username),a.telegram_id""",
+                (uid,),
+            )
+            rows = await cur.fetchall()
+        return {"contacts": [dict(row) for row in rows], "count": len(rows)}
+
+    @router.post("/api/contacts", status_code=201)
+    async def add_contact(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        value = payload.get("user_id")
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise HTTPException(status_code=400, detail="Укажите корректный ID пользователя")
+        if value == uid:
+            raise HTTPException(status_code=400, detail="Нельзя добавить себя в контакты")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT telegram_id AS id,username,display_name,avatar_media_id,bio FROM accounts WHERE telegram_id=? AND is_banned=0",
+                (value,),
+            )
+            contact = await cur.fetchone()
+            if contact is None:
+                raise HTTPException(status_code=404, detail="Пользователь не найден")
+            cur = await db.execute(
+                """INSERT OR IGNORE INTO contacts(owner_telegram_id,contact_telegram_id,created_at)
+                   VALUES(?,?,?)""",
+                (uid, value, now),
+            )
+            added = cur.rowcount == 1
+            await db.commit()
+        return {
+            "status": "added" if added else "already_exists",
+            "contact": dict(contact),
+        }
+
+    @router.delete("/api/contacts/{user_id}")
+    async def remove_contact(
+        user_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "DELETE FROM contacts WHERE owner_telegram_id=? AND contact_telegram_id=?",
+                (int(user["telegram_id"]), user_id),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=404, detail="Контакт не найден")
+            await db.commit()
+        return {"status": "removed", "user_id": user_id}
 
     @router.get("/api/users/{user_id}")
     async def get_user_profile(
