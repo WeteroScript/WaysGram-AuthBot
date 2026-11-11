@@ -1042,6 +1042,12 @@ def test_group_and_channel_long_poll_return_incremental_messages(api_env) -> Non
                 and event["chat_id"] == channel_id
                 for event in channel_event_response.json()["events"]
             )
+            channel_rows = await client.get("/api/channels", headers=member)
+            channel_item = next(
+                item for item in channel_rows.json()["channels"]
+                if item["id"] == channel_id
+            )
+            assert channel_item["unread_count"] == 2
 
     run(scenario())
 
