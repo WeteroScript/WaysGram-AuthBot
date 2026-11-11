@@ -3261,6 +3261,8 @@ def build_messenger_router(
         now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
+            event_user_a = 0
+            event_user_b = 0
             if scope == "dm":
                 cur = await db.execute(
                     """SELECT sender_telegram_id,recipient_telegram_id
@@ -3271,6 +3273,8 @@ def build_messenger_router(
                 if message is None or user_id not in (int(message[0]), int(message[1])):
                     await db.rollback()
                     raise HTTPException(status_code=404, detail="Сообщение не найдено")
+                event_user_a = int(message[0])
+                event_user_b = int(message[1])
             elif scope == "group":
                 await require_group_member(db, chat_id, user_id)
                 cur = await db.execute(
@@ -3333,6 +3337,16 @@ def build_messenger_router(
                 (scope, chat_id, message_id, user_id),
             )
             mine = [str(row[0]) for row in await cur.fetchall()]
+            await record_event(
+                db,
+                scope,
+                message_id,
+                "reaction",
+                user_id,
+                chat_id=chat_id,
+                user_a=event_user_a,
+                user_b=event_user_b,
+            )
             await db.commit()
         return {
             "status": status,

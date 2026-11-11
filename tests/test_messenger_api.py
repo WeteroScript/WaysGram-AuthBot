@@ -1692,6 +1692,9 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             assert direct.status_code == 201
             direct_id = direct.json()["id"]
             direct_path = f"/api/messages/{direct_id}/reactions"
+            event_cursor_response = await client.get("/api/events", headers=owner)
+            assert event_cursor_response.status_code == 200
+            direct_event_cursor = event_cursor_response.json()["latest_id"]
 
             invalid = await client.post(direct_path, headers=peer, json={"reaction": "🔥"})
             assert invalid.status_code == 400
@@ -1717,6 +1720,18 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
 
             after_remove = await client.post(direct_path, headers=peer, json={"reaction": "😮"})
             assert after_remove.status_code == 200
+            direct_events = await client.get(
+                f"/api/events?after_id={direct_event_cursor}",
+                headers=owner,
+            )
+            assert direct_events.status_code == 200
+            assert any(
+                event["kind"] == "reaction"
+                and event["scope"] == "dm"
+                and event["message_id"] == direct_id
+                for event in direct_events.json()["events"]
+            )
+            event_cursor = direct_events.json()["latest_id"]
             direct_history = await client.get("/api/messages?with=89402", headers=owner)
             assert direct_history.status_code == 200
             direct_summary = direct_history.json()["messages"][0]["reaction_summary"]
@@ -1756,6 +1771,19 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             )
             assert group_reaction.status_code == 200
             assert group_reaction.json()["reactions"] == [{"reaction": "🎉", "count": 1}]
+            group_events = await client.get(
+                f"/api/events?after_id={event_cursor}",
+                headers=owner,
+            )
+            assert group_events.status_code == 200
+            assert any(
+                event["kind"] == "reaction"
+                and event["scope"] == "group"
+                and event["chat_id"] == group_id
+                and event["message_id"] == group_id_message
+                for event in group_events.json()["events"]
+            )
+            event_cursor = group_events.json()["latest_id"]
 
             denied_group_reaction = await client.post(
                 group_reaction_path,
@@ -1786,11 +1814,23 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             assert channel_message.status_code == 201
             channel_reaction = await client.post(
                 f"/api/channels/{channel_id}/messages/{channel_message.json()['id']}/reactions",
-                headers=owner,
+                headers=peer,
                 json={"reaction": "🙏"},
             )
             assert channel_reaction.status_code == 200
             assert channel_reaction.json()["reactions"] == [{"reaction": "🙏", "count": 1}]
+            channel_events = await client.get(
+                f"/api/events?after_id={event_cursor}",
+                headers=owner,
+            )
+            assert channel_events.status_code == 200
+            assert any(
+                event["kind"] == "reaction"
+                and event["scope"] == "channel"
+                and event["chat_id"] == channel_id
+                and event["message_id"] == channel_message.json()["id"]
+                for event in channel_events.json()["events"]
+            )
 
             channel_history = await client.get(
                 f"/api/channels/{channel_id}/messages",
