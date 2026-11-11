@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import logging
 import mimetypes
 import os
 import hmac
@@ -20,6 +22,8 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
 
 SESSION_TTL = 60 * 60 * 24 * 30
@@ -34,6 +38,64 @@ MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
 PHONE_RE = re.compile(r"^\+1[0-9]{10}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
+LOGGER = logging.getLogger(__name__)
+FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
+FCM_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def _b64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _firebase_service_account() -> dict[str, Any] | None:
+    """Load FCM HTTP v1 service-account credentials without exposing them to clients."""
+    raw = os.getenv("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+    file_path = os.getenv("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+    try:
+        if raw:
+            credentials = json.loads(raw)
+        elif file_path:
+            credentials = json.loads(Path(file_path).read_text(encoding="utf-8"))
+        else:
+            return None
+        if not isinstance(credentials, dict):
+            return None
+        required = ("project_id", "client_email", "private_key")
+        if any(not isinstance(credentials.get(key), str) or not credentials[key].strip() for key in required):
+            return None
+        return credentials
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _firebase_assertion(credentials: dict[str, Any], now: int) -> str:
+    header = _b64url(json.dumps(
+        {"alg": "RS256", "typ": "JWT"},
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    claims = _b64url(json.dumps(
+        {
+            "iss": credentials["client_email"],
+            "scope": FCM_SCOPE,
+            "aud": credentials.get("token_uri") or FCM_TOKEN_URI,
+            "iat": now,
+            "exp": now + 3600,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    signing_input = f"{header}.{claims}"
+    private_key = serialization.load_pem_private_key(
+        credentials["private_key"].encode("utf-8"),
+        password=None,
+    )
+    signature = private_key.sign(
+        signing_input.encode("ascii"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+    return f"{signing_input}.{_b64url(signature)}"
+
+
 
 
 def _external_api_base_url(request: Request) -> str:
@@ -142,6 +204,19 @@ async def init_messenger_storage(database_path: Path) -> None:
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS push_devices (
+                token_hash TEXT PRIMARY KEY,
+                token_value TEXT NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                session_token_hash TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'android',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_push_devices_user
+                ON push_devices(telegram_id,updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_push_devices_session
+                ON push_devices(session_token_hash);
             CREATE TABLE IF NOT EXISTS media_assets (
                 id TEXT PRIMARY KEY,
                 owner_telegram_id INTEGER NOT NULL,
@@ -836,6 +911,113 @@ def build_messenger_router(
     router = APIRouter()
     db_path = database_path if callable(database_path) else lambda: database_path
     telegram_gift_sync_lock = asyncio.Lock()
+    fcm_access_token_cache: dict[str, Any] = {}
+    fcm_access_token_lock = asyncio.Lock()
+
+    async def get_fcm_access_token(credentials: dict[str, Any]) -> tuple[str, str]:
+        project_id = str(credentials["project_id"]).strip()
+        now = int(time.time())
+        async with fcm_access_token_lock:
+            cached = fcm_access_token_cache
+            if (
+                cached.get("project_id") == project_id
+                and int(cached.get("expires_at", 0)) > now + 60
+                and isinstance(cached.get("access_token"), str)
+            ):
+                return project_id, str(cached["access_token"])
+            assertion = await asyncio.to_thread(_firebase_assertion, credentials, now)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                response = await client.post(
+                    str(credentials.get("token_uri") or FCM_TOKEN_URI),
+                    data={
+                        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                        "assertion": assertion,
+                    },
+                )
+                response.raise_for_status()
+                token_payload = response.json()
+            access_token = str(token_payload.get("access_token") or "")
+            expires_in = int(token_payload.get("expires_in") or 0)
+            if not access_token or expires_in <= 0:
+                raise RuntimeError("Firebase OAuth returned an invalid access token")
+            fcm_access_token_cache.clear()
+            fcm_access_token_cache.update({
+                "project_id": project_id,
+                "access_token": access_token,
+                "expires_at": now + expires_in,
+            })
+            return project_id, access_token
+
+    async def deliver_push_notifications(
+        account_ids: list[int],
+        title: str,
+        body: str,
+        data: dict[str, str],
+    ) -> None:
+        """Send best-effort FCM notifications only to devices with a live WaysGram session."""
+        credentials = _firebase_service_account()
+        if not credentials:
+            return
+        recipients = sorted({int(value) for value in account_ids if int(value) > 0})
+        if not recipients:
+            return
+        placeholders = ",".join("?" for _ in recipients)
+        try:
+            async with aiosqlite.connect(db_path()) as db:
+                cur = await db.execute(
+                    f"""SELECT DISTINCT d.token_hash,d.token_value
+                        FROM push_devices d
+                        JOIN api_sessions s
+                          ON s.token_hash=d.session_token_hash
+                         AND s.telegram_id=d.telegram_id
+                         AND s.expires_at>?
+                        JOIN accounts a ON a.telegram_id=d.telegram_id AND a.is_banned=0
+                        WHERE d.telegram_id IN ({placeholders})
+                        ORDER BY d.updated_at DESC LIMIT 500""",
+                    (int(time.time()), *recipients),
+                )
+                devices = await cur.fetchall()
+            if not devices:
+                return
+            project_id, access_token = await get_fcm_access_token(credentials)
+            notification_data = {
+                "waysgram": "1",
+                **{
+                    str(key): str(value)
+                    for key, value in data.items()
+                    if str(key) != "waysgram" and value is not None
+                },
+            }
+            notification_message = {
+                "notification": {
+                    "title": str(title or "WaysGram")[:80],
+                    "body": str(body or "Новое сообщение")[:180],
+                },
+                "data": notification_data,
+                "android": {
+                    "priority": "HIGH",
+                    "notification": {"channel_id": "waysgram_messages"},
+                },
+            }
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+                for token_hash, token_value in devices:
+                    response = await client.post(
+                        f"https://fcm.googleapis.com/v1/projects/{quote(project_id, safe='')}/messages:send",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        json={"message": {**notification_message, "token": str(token_value)}},
+                    )
+                    if response.status_code == 404:
+                        async with aiosqlite.connect(db_path()) as db:
+                            await db.execute(
+                                "DELETE FROM push_devices WHERE token_hash=?",
+                                (str(token_hash),),
+                            )
+                            await db.commit()
+                    elif response.status_code >= 400:
+                        LOGGER.warning("FCM delivery failed with HTTP %s", response.status_code)
+        except Exception as exc:
+            LOGGER.warning("FCM delivery skipped after %s", type(exc).__name__)
+
 
     async def ensure_telegram_gifts_fresh() -> dict[str, Any]:
         now = int(time.time())
@@ -917,6 +1099,45 @@ def build_messenger_router(
             ("waysgram-session-id:" + token_hash).encode("utf-8")
         ).hexdigest()[:32]
 
+    @router.post("/api/push/register")
+    async def register_push_device(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        raw_token = payload.get("token")
+        if not isinstance(raw_token, str):
+            raise HTTPException(status_code=400, detail="Некорректный FCM token")
+        device_token = raw_token.strip()
+        if (
+            not 20 <= len(device_token) <= 4096
+            or any(ord(char) < 33 or ord(char) > 126 for char in device_token)
+        ):
+            raise HTTPException(status_code=400, detail="Некорректный FCM token")
+        platform = str(payload.get("platform") or "android").strip().lower()
+        if platform != "android":
+            raise HTTPException(status_code=400, detail="Поддерживается только Android")
+        now = int(time.time())
+        uid = int(user["telegram_id"])
+        session_hash = _token_hash(authorization[7:].strip())
+        token_hash = _token_hash(device_token)
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute(
+                """INSERT INTO push_devices(
+                       token_hash,token_value,telegram_id,session_token_hash,
+                       platform,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(token_hash) DO UPDATE SET
+                       token_value=excluded.token_value,
+                       telegram_id=excluded.telegram_id,
+                       session_token_hash=excluded.session_token_hash,
+                       platform=excluded.platform,
+                       updated_at=excluded.updated_at""",
+                (token_hash, device_token, uid, session_hash, platform, now, now),
+            )
+            await db.commit()
+        return {"status": "registered", "platform": platform}
+
     @router.get("/api/auth/sessions")
     async def list_auth_sessions(
         authorization: str | None = Header(default=None),
@@ -976,6 +1197,10 @@ def build_messenger_router(
             )
             if token_hash is None:
                 raise HTTPException(status_code=404, detail="Сеанс не найден")
+            await db.execute(
+                "DELETE FROM push_devices WHERE session_token_hash=?",
+                (token_hash,),
+            )
             cur = await db.execute(
                 "DELETE FROM api_sessions WHERE telegram_id=? AND token_hash=?",
                 (uid, token_hash),
@@ -993,6 +1218,13 @@ def build_messenger_router(
         uid = int(user["telegram_id"])
         current_hash = _token_hash(authorization[7:].strip())
         async with aiosqlite.connect(db_path()) as db:
+            await db.execute(
+                """DELETE FROM push_devices WHERE session_token_hash IN (
+                       SELECT token_hash FROM api_sessions
+                       WHERE telegram_id=? AND token_hash<>?
+                   )""",
+                (uid, current_hash),
+            )
             cur = await db.execute(
                 "DELETE FROM api_sessions WHERE telegram_id=? AND token_hash<>?",
                 (uid, current_hash),
@@ -1525,6 +1757,8 @@ def build_messenger_router(
             "api_version": 1,
             "auth": "authwaysgram_bot",
             "authbot_delivery_ready": bool(bot_provider()),
+            "push_notifications": True,
+            "push_delivery_ready": _firebase_service_account() is not None,
             "sms_delivery_ready": False,
             "test_otp_enabled": False,
             "currencies": ["stars", "grams"],
@@ -1542,7 +1776,7 @@ def build_messenger_router(
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
                 "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages", "group_invites", "group_join_requests", "group_slow_mode",
                 "image_uploads", "document_uploads", "message_media", "shared_media", "private_media_downloads",
-                "long_poll_messages",
+                "long_poll_messages", "push_notifications",
                 "botfather", "bot_commands", "bot_runtime", "stars", "grams",
             ],
         }
@@ -1676,8 +1910,10 @@ def build_messenger_router(
         if authorization and authorization.startswith("Bearer "):
             token = authorization[7:].strip()
             if token:
+                session_hash = _token_hash(token)
                 async with aiosqlite.connect(db_path()) as db:
-                    await db.execute("DELETE FROM api_sessions WHERE token_hash=?", (_token_hash(token),))
+                    await db.execute("DELETE FROM push_devices WHERE session_token_hash=?", (session_hash,))
+                    await db.execute("DELETE FROM api_sessions WHERE token_hash=?", (session_hash,))
                     await db.commit()
         return {"status": "logged_out"}
 
@@ -3254,6 +3490,18 @@ def build_messenger_router(
             result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "reply_to_id": reply_to_id, **media_fields, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "SELECT telegram_id FROM channel_members WHERE channel_id=? AND telegram_id<>?",
+                (channel_id, uid),
+            )
+            channel_recipients = [int(row[0]) for row in await cur.fetchall()]
+        await deliver_push_notifications(
+            channel_recipients,
+            str(user.get("display_name") or user.get("username") or "Новая публикация"),
+            body,
+            {"scope": "channel", "chat_id": str(channel_id), "message_id": str(message_id)},
+        )
         return result
 
     @router.post("/api/channels/{channel_id}/admins", status_code=201)
@@ -3543,6 +3791,12 @@ def build_messenger_router(
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
             await db.commit()
+        await deliver_push_notifications(
+            [recipient_id],
+            str(user.get("display_name") or user.get("username") or "Новое сообщение"),
+            body,
+            {"scope": "dm", "chat_id": str(uid), "message_id": str(message_id)},
+        )
         return result
 
     @router.post("/api/messages/{message_id}/forward", status_code=201)
@@ -3652,6 +3906,12 @@ def build_messenger_router(
             }
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
+        await deliver_push_notifications(
+            [recipient_id],
+            str(user.get("display_name") or user.get("username") or "Новое сообщение"),
+            str(source["body"]),
+            {"scope": "dm", "chat_id": str(uid), "message_id": str(new_message_id)},
+        )
         return result
 
     async def record_event(
@@ -5207,6 +5467,18 @@ def build_messenger_router(
                 db, "group", message_id, "new_message", uid, chat_id=group_id,
             )
             await db.commit()
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "SELECT telegram_id FROM group_members WHERE group_id=? AND telegram_id<>?",
+                (group_id, uid),
+            )
+            group_recipients = [int(row[0]) for row in await cur.fetchall()]
+        await deliver_push_notifications(
+            group_recipients,
+            str(user.get("display_name") or user.get("username") or "Новое сообщение"),
+            body,
+            {"scope": "group", "chat_id": str(group_id), "message_id": str(message_id)},
+        )
         return {
             "id": message_id,
             "group_id": group_id,
