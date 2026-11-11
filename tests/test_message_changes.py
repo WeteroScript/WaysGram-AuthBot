@@ -96,7 +96,7 @@ def test_group_edit_delete_and_admin_rights(env) -> None:
 
             remaining = (await client.get(f"/api/groups/{gid}/messages", headers=headers(102))).json()["messages"]
             assert [m["id"] for m in remaining] == [m2["id"]]
-            assert remaining[0]["reply_to_body"] == "from member"
+            assert remaining[0]["reply_to_body"] == "edited via PUT"
             assert remaining[0]["reply_to_sender_id"] == 102
 
     run(scenario())
