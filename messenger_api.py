@@ -380,7 +380,9 @@ async def init_messenger_storage(database_path: Path) -> None:
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 owner_telegram_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                slow_mode_seconds INTEGER NOT NULL DEFAULT 0
+                    CHECK(slow_mode_seconds IN (0,5,10,15,30,60,120,300))
             );
             CREATE TABLE IF NOT EXISTS group_members (
                 group_id INTEGER NOT NULL,
@@ -502,6 +504,14 @@ async def init_messenger_storage(database_path: Path) -> None:
         # A database from an older version keeps everything in one file: move the messenger tables out first,
         # because a table left in the main file would hide the one in the messenger file.
         await db_split.migrate_legacy_with(db, database_path)
+        cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(chat_groups)")
+        chat_group_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "slow_mode_seconds" not in chat_group_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.chat_groups "
+                "ADD COLUMN slow_mode_seconds INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(slow_mode_seconds IN (0,5,10,15,30,60,120,300))"
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(group_invites)")
         group_invite_columns = {str(row[1]) for row in await cur.fetchall()}
         if "require_approval" not in group_invite_columns:
@@ -1530,7 +1540,7 @@ def build_messenger_router(
                 "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "session_management", "cloud_drafts", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
-                "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages", "group_invites", "group_join_requests",
+                "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages", "group_invites", "group_join_requests", "group_slow_mode",
                 "image_uploads", "document_uploads", "message_media", "shared_media", "private_media_downloads",
                 "long_poll_messages",
                 "botfather", "bot_commands", "bot_runtime", "stars", "grams",
@@ -4519,6 +4529,7 @@ def build_messenger_router(
             membership = await require_group_member(db, group_id, uid)
             cur = await db.execute(
                 """SELECT g.id,g.username,g.title,g.description,g.owner_telegram_id,g.created_at,
+                          g.slow_mode_seconds,
                           (SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id) AS member_count
                    FROM chat_groups g WHERE g.id=?""",
                 (group_id,),
@@ -4538,6 +4549,34 @@ def build_messenger_router(
         result["my_telegram_id"] = uid
         result["members"] = [dict(row) for row in members]
         return result
+
+    @router.put("/api/groups/{group_id}/slow-mode")
+    async def update_group_slow_mode(
+        group_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        seconds = payload.get("seconds")
+        allowed_intervals = {0, 5, 10, 15, 30, 60, 120, 300}
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds not in allowed_intervals:
+            raise HTTPException(
+                status_code=400,
+                detail="seconds должен быть одним из значений: 0, 5, 10, 15, 30, 60, 120, 300",
+            )
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            member = await require_group_member(db, group_id, uid)
+            if member["role"] not in ("owner", "admin"):
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Настраивать медленный режим могут только администраторы группы")
+            await db.execute(
+                "UPDATE chat_groups SET slow_mode_seconds=? WHERE id=?",
+                (seconds, group_id),
+            )
+            await db.commit()
+        return {"group_id": group_id, "slow_mode_seconds": seconds}
 
     @router.post("/api/groups/{group_id}/invites", status_code=201)
     async def create_group_invite(
@@ -5075,7 +5114,31 @@ def build_messenger_router(
         now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
-            await require_group_member(db, group_id, uid)
+            membership = await require_group_member(db, group_id, uid)
+            cur = await db.execute(
+                "SELECT slow_mode_seconds FROM chat_groups WHERE id=?",
+                (group_id,),
+            )
+            group_settings = await cur.fetchone()
+            slow_mode_seconds = int(group_settings[0]) if group_settings else 0
+            if slow_mode_seconds > 0 and membership["role"] not in ("owner", "admin"):
+                cur = await db.execute(
+                    """SELECT created_at FROM group_messages
+                       WHERE group_id=? AND sender_telegram_id=?
+                       ORDER BY id DESC LIMIT 1""",
+                    (group_id, uid),
+                )
+                previous_message = await cur.fetchone()
+                if previous_message is not None:
+                    elapsed = max(0, now - int(previous_message[0]))
+                    remaining = slow_mode_seconds - elapsed
+                    if remaining > 0:
+                        await db.rollback()
+                        raise HTTPException(
+                            status_code=429,
+                            detail=f"Медленный режим: подождите ещё {remaining} сек.",
+                            headers={"Retry-After": str(remaining)},
+                        )
             media_id = await require_owned_media(db, media_id, uid)
             if not body:
                 body = _message_body(await default_media_message_body(db, media_id))
