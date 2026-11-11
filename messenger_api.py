@@ -1165,20 +1165,6 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="scope: dm, group или channel")
         if kind not in (None, "image", "video", "audio", "document"):
             raise HTTPException(status_code=400, detail="kind: image, video, audio, document или без фильтра")
-        if scope == "dm":
-            async with aiosqlite.connect(db_path()) as db:
-                cur = await db.execute("SELECT is_banned FROM accounts WHERE telegram_id=?", (peer_id,))
-                target = await cur.fetchone()
-                if target is None:
-                    raise HTTPException(status_code=404, detail="Собеседник не найден")
-                if target[0]:
-                    raise HTTPException(status_code=403, detail="Аккаунт собеседника недоступен")
-        elif scope == "group":
-            async with aiosqlite.connect(db_path()) as db:
-                await require_group_member(db, peer_id, uid)
-        else:
-            await require_channel_access(peer_id, uid)
-
         mime_clause = ""
         if kind == "image":
             mime_clause = "AND lower(a.mime_type) LIKE 'image/%'"
@@ -1193,7 +1179,17 @@ def build_messenger_router(
 
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
+            # Keep authorization and the media query in the same read transaction.
+            await db.execute("BEGIN")
             if scope == "dm":
+                cur = await db.execute("SELECT is_banned FROM accounts WHERE telegram_id=?", (peer_id,))
+                target = await cur.fetchone()
+                if target is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Собеседник не найден")
+                if target[0]:
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Аккаунт собеседника недоступен")
                 cur = await db.execute(
                     f"""SELECT m.id AS message_id,m.sender_telegram_id AS sender_id,
                                m.recipient_telegram_id AS recipient_id,m.body,m.media_id,
@@ -1207,6 +1203,7 @@ def build_messenger_router(
                     (uid, peer_id, peer_id, uid, before_id, before_id, limit),
                 )
             elif scope == "group":
+                await require_group_member(db, peer_id, uid)
                 cur = await db.execute(
                     f"""SELECT m.id AS message_id,m.sender_telegram_id AS sender_id,
                                m.body,m.media_id,a.mime_type AS media_type,
@@ -1219,6 +1216,23 @@ def build_messenger_router(
                 )
             else:
                 cur = await db.execute(
+                    """SELECT ch.is_public,ch.owner_telegram_id,
+                              EXISTS(SELECT 1 FROM channel_admins ca
+                                     WHERE ca.channel_id=ch.id AND ca.telegram_id=?),
+                              EXISTS(SELECT 1 FROM channel_members cm
+                                     WHERE cm.channel_id=ch.id AND cm.telegram_id=?)
+                       FROM channels ch WHERE ch.id=?""",
+                    (uid, uid, peer_id),
+                )
+                access = await cur.fetchone()
+                if access is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Канал не найден")
+                is_public, owner_id, is_admin, is_member = access
+                if not bool(is_public) and int(owner_id) != uid and not bool(is_admin) and not bool(is_member):
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Нет доступа к приватному каналу")
+                cur = await db.execute(
                     f"""SELECT m.id AS message_id,m.author_telegram_id AS sender_id,
                                m.body,m.media_id,a.mime_type AS media_type,
                                a.original_name AS media_name,m.created_at
@@ -1229,6 +1243,7 @@ def build_messenger_router(
                     (peer_id, before_id, before_id, limit),
                 )
             rows = [dict(row) for row in await cur.fetchall()]
+            await db.commit()
         for row in rows:
             row["url"] = f"/api/media/{row['media_id']}"
         return {
