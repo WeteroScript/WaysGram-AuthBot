@@ -381,6 +381,15 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_contacts_contact
                 ON contacts(contact_telegram_id,owner_telegram_id);
+            CREATE TABLE IF NOT EXISTS contact_notes (
+                owner_telegram_id INTEGER NOT NULL,
+                contact_telegram_id INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_telegram_id,contact_telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_contact_notes_updated
+                ON contact_notes(owner_telegram_id,updated_at DESC);
             CREATE TABLE IF NOT EXISTS blocked_users (
                 owner_telegram_id INTEGER NOT NULL,
                 blocked_telegram_id INTEGER NOT NULL,
@@ -1683,8 +1692,11 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT a.telegram_id AS id,a.username,a.display_name,a.avatar_media_id,a.bio,c.created_at
+                """SELECT a.telegram_id AS id,a.username,a.display_name,a.avatar_media_id,a.bio,c.created_at,
+                          COALESCE(n.note,'') AS note
                    FROM contacts c JOIN accounts a ON a.telegram_id=c.contact_telegram_id
+                   LEFT JOIN contact_notes n
+                     ON n.owner_telegram_id=c.owner_telegram_id AND n.contact_telegram_id=c.contact_telegram_id
                    WHERE c.owner_telegram_id=? AND a.is_banned=0
                    ORDER BY lower(a.display_name),lower(a.username),a.telegram_id""",
                 (uid,),
@@ -1733,14 +1745,57 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
+            owner_id = int(user["telegram_id"])
             cur = await db.execute(
                 "DELETE FROM contacts WHERE owner_telegram_id=? AND contact_telegram_id=?",
-                (int(user["telegram_id"]), user_id),
+                (owner_id, user_id),
             )
             if cur.rowcount != 1:
                 raise HTTPException(status_code=404, detail="Контакт не найден")
+            await db.execute(
+                "DELETE FROM contact_notes WHERE owner_telegram_id=? AND contact_telegram_id=?",
+                (owner_id, user_id),
+            )
             await db.commit()
         return {"status": "removed", "user_id": user_id}
+
+    @router.put("/api/contacts/{user_id}/note")
+    async def update_contact_note(
+        user_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        note = payload.get("note")
+        if not isinstance(note, str) or len(note.strip()) > 500:
+            raise HTTPException(status_code=400, detail="Заметка должна содержать не более 500 символов")
+        note = note.strip()
+        owner_id = int(user["telegram_id"])
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT 1 FROM contacts WHERE owner_telegram_id=? AND contact_telegram_id=?",
+                (owner_id, user_id),
+            )
+            if await cur.fetchone() is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Сначала добавьте пользователя в контакты")
+            if note:
+                await db.execute(
+                    """INSERT INTO contact_notes(owner_telegram_id,contact_telegram_id,note,updated_at)
+                       VALUES(?,?,?,?)
+                       ON CONFLICT(owner_telegram_id,contact_telegram_id) DO UPDATE SET
+                           note=excluded.note,updated_at=excluded.updated_at""",
+                    (owner_id, user_id, note, now),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM contact_notes WHERE owner_telegram_id=? AND contact_telegram_id=?",
+                    (owner_id, user_id),
+                )
+            await db.commit()
+        return {"user_id": user_id, "note": note, "updated_at": now if note else None}
 
     @router.get("/api/blocks")
     async def list_blocked_users(
