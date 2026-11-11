@@ -91,8 +91,15 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
     async def scenario() -> None:
         async with await client_for(app) as client:
             await bot_module.set_telegram_gift_values("g1", price=40, supply=2)
-            bought = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
+            # Client-supplied price and stock values must never override the
+            # AuthBot administrator's configured listing.
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={"price_stars": 1, "supply": 9999},
+            )
             assert bought.status_code == 201
+            assert bought.json()["price_stars"] == 40
             assert bought.json()["stars"] == 5000 - 40
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert len(mine) == 1 and mine[0]["gift_name"] == "🎁"
