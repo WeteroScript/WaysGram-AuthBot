@@ -1970,7 +1970,7 @@ def build_messenger_router(
             title = await telegram_gift_title(db, gift_id)
             if not title:
                 await db.rollback()
-                raise HTTPException(status_code=404, detail="Подарок не найден")
+                raise HTTPException(status_code=409, detail="Подарок больше недоступен в Telegram")
             price = int(priced["price_stars"])
             cur = await db.execute("SELECT stars,is_banned FROM accounts WHERE telegram_id=?", (uid,))
             account = await cur.fetchone()
@@ -2048,7 +2048,10 @@ def build_messenger_router(
         state = await cur.fetchone()
         source = str(state[0]) if state else "telegram_bot_api"
         table = "telegram_mtproto_gift_catalog" if source == "telegram_mtproto" else "telegram_gift_catalog"
-        cur = await db.execute(f"SELECT title FROM {table} WHERE gift_id=?", (gift_id,))
+        cur = await db.execute(
+            f"SELECT title FROM {table} WHERE gift_id=? AND is_available=1",
+            (gift_id,),
+        )
         row = await cur.fetchone()
         return str(row[0]) if row else ""
 
