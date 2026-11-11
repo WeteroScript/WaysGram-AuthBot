@@ -1386,7 +1386,7 @@ def build_messenger_router(
                 "message_characters": MAX_MESSAGE_LENGTH,
             },
             "features": [
-                "profiles", "contact_notes", "direct_messages", "saved_messages", "pinned_messages", "typing_indicators", "incremental_messages",
+                "profiles", "contact_notes", "common_groups", "mutual_contacts", "direct_messages", "saved_messages", "pinned_messages", "typing_indicators", "incremental_messages",
                 "channels", "private_channels", "channel_invites",
                 "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "session_management", "cloud_drafts", "gifts", "gift_inventory", "gift_transfer",
