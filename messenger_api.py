@@ -2698,6 +2698,8 @@ def build_messenger_router(
                 if after_id:
                     cur = await db.execute(
                         """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
+                                  (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
+                                  (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                            FROM channel_messages WHERE channel_id=? AND id>?
@@ -2707,6 +2709,8 @@ def build_messenger_router(
                 else:
                     cur = await db.execute(
                         """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
+                                  (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
+                                  (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                            FROM channel_messages WHERE channel_id=?
@@ -2752,7 +2756,9 @@ def build_messenger_router(
             await channel_row(channel_id)
             cur = await db.execute(
                 """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
-                          (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
+                          (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
+                                  (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                    FROM channel_messages
                    WHERE channel_id=? AND body LIKE ? COLLATE NOCASE
@@ -2915,6 +2921,8 @@ def build_messenger_router(
                    recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
                    forwarded_from_telegram_id,forwarded_from_message_id,
                    (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
+                   (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
+                   (SELECT sender_telegram_id FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_sender_id,
                    (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                    (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
             FROM messages WHERE
@@ -2987,6 +2995,8 @@ def build_messenger_router(
                           recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
                           forwarded_from_telegram_id,forwarded_from_message_id,
                           (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
+                   (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
+                   (SELECT sender_telegram_id FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_sender_id,
                           (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
                    FROM messages
@@ -3760,6 +3770,8 @@ def build_messenger_router(
                 if after_id:
                     cur = await db.execute(
                         """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
+                                  (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
+                                  (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                            FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
@@ -3768,6 +3780,8 @@ def build_messenger_router(
                 else:
                     cur = await db.execute(
                         """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
+                                  (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
+                                  (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                            FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
@@ -3797,7 +3811,9 @@ def build_messenger_router(
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
-                          (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
+                          (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
+                                  (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                    FROM group_messages
                    WHERE group_id=? AND body LIKE ? COLLATE NOCASE
