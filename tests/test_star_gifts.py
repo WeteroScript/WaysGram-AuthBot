@@ -383,3 +383,34 @@ def test_auth_sessions_can_be_listed_and_revoked(env) -> None:
             assert (await client.get("/api/me", headers={"Authorization": "Bearer " + tertiary})).status_code == 401
 
     run(scenario())
+
+
+def test_public_profile_includes_received_gifts(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=35, supply=1)
+        async with await client_for(app) as client:
+            purchase = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={"recipient_id": 102},
+            )
+            assert purchase.status_code == 201
+
+            profile = await client.get("/api/users/102", headers=headers(101))
+            assert profile.status_code == 200
+            data = profile.json()
+            assert data["id"] == 102
+            assert len(data["gifts"]) == 1
+            gift = data["gifts"][0]
+            assert gift["telegram_gift_id"] == "g1"
+            assert gift["gift_name"] == "🎁"
+            assert gift["serial_number"] == purchase.json()["gift"]["serial_number"]
+
+            # Public profile output must not include account credentials or phone data.
+            assert "phone" not in data
+            assert "token" not in str(data)
+            assert "stars" not in data
+
+    run(scenario())
