@@ -241,3 +241,49 @@ def test_group_message_can_be_deleted_knowing_only_its_id(env) -> None:
             assert (await client.delete(f"/api/group-messages/{mid}", headers=headers(102))).status_code == 404
 
     run(scenario())
+
+
+def test_direct_message_search_is_scoped_to_conversation(env) -> None:
+    _path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            await client.post("/api/messages", headers=headers(101), json={
+                "recipient_id": 102, "body": "Searchable hello world",
+            })
+            await client.post("/api/messages", headers=headers(102), json={
+                "recipient_id": 101, "body": "Another HELLO from peer",
+            })
+            await client.post("/api/messages", headers=headers(101), json={
+                "recipient_id": ADMIN, "body": "HELLO in another conversation",
+            })
+
+            found = await client.get(
+                "/api/messages/search?with=102&q=hello",
+                headers=headers(101),
+            )
+            assert found.status_code == 200
+            payload = found.json()
+            assert payload["count"] == 2
+            assert [item["body"] for item in payload["messages"]] == [
+                "Searchable hello world",
+                "Another HELLO from peer",
+            ]
+            assert payload["has_more"] is False
+
+            none = await client.get(
+                "/api/messages/search?with=102&q=another%20conversation",
+                headers=headers(101),
+            )
+            assert none.status_code == 200 and none.json()["count"] == 0
+
+            invalid = await client.get(
+                "/api/messages/search?with=102&q=%20%20",
+                headers=headers(101),
+            )
+            assert invalid.status_code == 400
+
+            missing_auth = await client.get("/api/messages/search?with=102&q=hello")
+            assert missing_auth.status_code == 401
+
+    run(scenario())
