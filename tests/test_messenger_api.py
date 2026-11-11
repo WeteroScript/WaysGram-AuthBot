@@ -1735,6 +1735,10 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             direct_history = await client.get("/api/messages?with=89402", headers=owner)
             assert direct_history.status_code == 200
             direct_summary = direct_history.json()["messages"][0]["reaction_summary"]
+            assert direct_history.json()["messages"][0]["my_reactions"] == []
+            peer_direct_history = await client.get("/api/messages?with=89401", headers=peer)
+            assert peer_direct_history.status_code == 200
+            assert peer_direct_history.json()["messages"][0]["my_reactions"] == ["❤️", "😂", "😮"]
             assert "❤️:1" in direct_summary
             assert "😂:1" in direct_summary
             assert "😮:1" in direct_summary
@@ -1798,6 +1802,10 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             )
             assert group_history.status_code == 200
             assert group_history.json()["messages"][0]["reaction_summary"] == "🎉:1"
+            assert group_history.json()["messages"][0]["my_reactions"] == []
+            peer_group_history = await client.get(f"/api/groups/{group_id}/messages", headers=peer)
+            assert peer_group_history.status_code == 200
+            assert peer_group_history.json()["messages"][0]["my_reactions"] == ["🎉"]
 
             channel = await client.post(
                 "/api/channels",
@@ -1838,6 +1846,12 @@ def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env)
             )
             assert channel_history.status_code == 200
             assert channel_history.json()["messages"][0]["reaction_summary"] == "🙏:1"
+            assert channel_history.json()["messages"][0]["my_reactions"] == []
+            peer_channel_history = await client.get(
+                f"/api/channels/{channel_id}/messages", headers=peer
+            )
+            assert peer_channel_history.status_code == 200
+            assert peer_channel_history.json()["messages"][0]["my_reactions"] == ["🙏"]
 
     run(scenario())
 
