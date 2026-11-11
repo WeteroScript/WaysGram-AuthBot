@@ -113,8 +113,16 @@ def test_channel_posts_can_be_edited_and_deleted_by_the_owner_only(env) -> None:
             assert (await client.patch(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102), json={"body": "x"})).status_code == 403
             assert (await client.patch(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101), json={"body": "second"})).status_code == 200
             assert (await client.put(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101), json={"body": "second via PUT"})).status_code == 200
+            reply_post = await client.post(
+                f"/api/channels/{cid}/messages",
+                headers=headers(101),
+                json={"body": "reply to channel post", "reply_to_id": post["id"]},
+            )
+            assert reply_post.status_code == 201
             listed = (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"]
             assert listed[0]["body"] == "second via PUT" and listed[0]["edited_at"]
+            assert listed[1]["reply_to_body"] == "second via PUT"
+            assert listed[1]["reply_to_sender_id"] == 101
             assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102))).status_code == 403
             assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101))).status_code == 200
             assert (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"] == []
