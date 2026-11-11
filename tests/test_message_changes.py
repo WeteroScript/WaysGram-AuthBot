@@ -388,3 +388,68 @@ def test_contacts_can_be_added_listed_and_removed(env) -> None:
             assert (await client.get("/api/contacts")).status_code == 401
 
     run(scenario())
+
+
+
+def test_direct_messages_can_be_forwarded_with_original_attribution(env) -> None:
+    _path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            original = await client.post(
+                "/api/messages",
+                headers=headers(101),
+                json={"recipient_id": 102, "body": "Forward this message"},
+            )
+            assert original.status_code == 201
+            original_id = original.json()["id"]
+
+            key = "wg-forward-message-00001"
+            forwarded = await client.post(
+                f"/api/messages/{original_id}/forward",
+                headers={**headers(102), "Idempotency-Key": key},
+                json={"recipient_id": ADMIN},
+            )
+            assert forwarded.status_code == 201
+            result = forwarded.json()
+            assert result["status"] == "forwarded"
+            assert result["body"] == "Forward this message"
+            assert result["forwarded_from_telegram_id"] == 101
+            assert result["forwarded_from_message_id"] == original_id
+
+            retry = await client.post(
+                f"/api/messages/{original_id}/forward",
+                headers={**headers(102), "Idempotency-Key": key},
+                json={"recipient_id": ADMIN},
+            )
+            assert retry.status_code == 201
+            assert retry.json()["id"] == result["id"]
+
+            history = await client.get(
+                f"/api/messages?with=102",
+                headers=headers(ADMIN),
+            )
+            forwarded_rows = [
+                item for item in history.json()["messages"]
+                if item["id"] == result["id"]
+            ]
+            assert len(forwarded_rows) == 1
+            assert forwarded_rows[0]["forwarded_from_telegram_id"] == 101
+            assert forwarded_rows[0]["forwarded_from_message_id"] == original_id
+            assert forwarded_rows[0]["forwarded_from_display_name"]
+
+            denied = await client.post(
+                f"/api/messages/{original_id}/forward",
+                headers=headers(ADMIN),
+                json={"recipient_id": 101},
+            )
+            assert denied.status_code == 404
+
+            missing_target = await client.post(
+                f"/api/messages/{original_id}/forward",
+                headers=headers(102),
+                json={"recipient_id": 999999},
+            )
+            assert missing_target.status_code == 404
+
+    run(scenario())
