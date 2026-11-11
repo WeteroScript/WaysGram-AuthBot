@@ -170,7 +170,9 @@ async def init_messenger_storage(database_path: Path) -> None:
                 sender_telegram_id INTEGER NOT NULL,
                 recipient_telegram_id INTEGER NOT NULL,
                 body TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                forwarded_from_telegram_id INTEGER,
+                forwarded_from_message_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_api_messages_pair
                 ON messages(sender_telegram_id, recipient_telegram_id, id);
@@ -445,6 +447,11 @@ async def init_messenger_storage(database_path: Path) -> None:
                 await db.execute(f"ALTER TABLE {db_split.SCHEMA}.{table_name} ADD COLUMN edited_at INTEGER")
             if "reply_to_id" not in columns:
                 await db.execute(f"ALTER TABLE {db_split.SCHEMA}.{table_name} ADD COLUMN reply_to_id INTEGER")
+            if table_name == "messages":
+                if "forwarded_from_telegram_id" not in columns:
+                    await db.execute(f"ALTER TABLE {db_split.SCHEMA}.messages ADD COLUMN forwarded_from_telegram_id INTEGER")
+                if "forwarded_from_message_id" not in columns:
+                    await db.execute(f"ALTER TABLE {db_split.SCHEMA}.messages ADD COLUMN forwarded_from_message_id INTEGER")
         # Read marks arrived in a later version: whatever existed before them counts as read, once.
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.user_version")
         if int((await cur.fetchone())[0]) < 1:
@@ -2829,6 +2836,8 @@ def build_messenger_router(
         base = """
             SELECT id,sender_telegram_id AS sender_id,
                    recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
+                   forwarded_from_telegram_id,forwarded_from_message_id,
+                   (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                    (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                    (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
             FROM messages WHERE
@@ -2899,6 +2908,8 @@ def build_messenger_router(
             cur = await db.execute(
                 """SELECT id,sender_telegram_id AS sender_id,
                           recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
+                          forwarded_from_telegram_id,forwarded_from_message_id,
+                          (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                           (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
                    FROM messages
@@ -2987,6 +2998,100 @@ def build_messenger_router(
                 "created_at": now,
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
+            await db.commit()
+        return result
+
+    @router.post("/api/messages/{message_id}/forward", status_code=201)
+    async def forward_message(
+        message_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            recipient_id = int(payload.get("recipient_id", 0))
+        except (TypeError, ValueError):
+            recipient_id = 0
+        if recipient_id <= 0:
+            raise HTTPException(status_code=400, detail="Укажите корректного получателя")
+        now = int(time.time())
+        scope = f"/api/messages/{message_id}/forward"
+        descriptor = idempotency_descriptor(scope, payload, idempotency_key)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
+            cur = await db.execute(
+                """SELECT m.id,m.sender_telegram_id,m.recipient_telegram_id,m.body,m.media_id,
+                          m.forwarded_from_telegram_id,m.forwarded_from_message_id,
+                          COALESCE(a.display_name,a.username,'Пользователь') AS original_sender_name
+                   FROM messages m
+                   LEFT JOIN accounts a ON a.telegram_id=m.sender_telegram_id
+                   WHERE m.id=? AND (m.sender_telegram_id=? OR m.recipient_telegram_id=?)""",
+                (message_id, uid, uid),
+            )
+            source = await cur.fetchone()
+            if source is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Исходное сообщение не найдено")
+            cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?", (recipient_id,)
+            )
+            target = await cur.fetchone()
+            if target is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Получатель не найден")
+            if target[0]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND created_at>?",
+                (uid, now - 60),
+            )
+            if int((await cur.fetchone())[0]) >= DM_MESSAGES_PER_MINUTE:
+                await db.rollback()
+                raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
+            forwarded_from_id = (
+                int(source["forwarded_from_telegram_id"])
+                if source["forwarded_from_telegram_id"] is not None
+                else int(source["sender_telegram_id"])
+            )
+            forwarded_from_message_id = (
+                int(source["forwarded_from_message_id"])
+                if source["forwarded_from_message_id"] is not None
+                else int(source["id"])
+            )
+            cur = await db.execute(
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,media_id,reply_to_id,created_at,
+                    forwarded_from_telegram_id,forwarded_from_message_id)
+                   VALUES(?,?,?,?,NULL,?,?,?)""",
+                (
+                    uid, recipient_id, str(source["body"]), source["media_id"], now,
+                    forwarded_from_id, forwarded_from_message_id,
+                ),
+            )
+            new_message_id = int(cur.lastrowid)
+            media_fields = await media_message_fields(db, source["media_id"])
+            result = {
+                "id": new_message_id,
+                "status": "forwarded",
+                "sender_id": uid,
+                "recipient_id": recipient_id,
+                "body": str(source["body"]),
+                "media_id": source["media_id"],
+                "forwarded_from_telegram_id": forwarded_from_id,
+                "forwarded_from_message_id": forwarded_from_message_id,
+                "forwarded_from_display_name": str(source["original_sender_name"] or "Пользователь"),
+                **media_fields,
+                "created_at": now,
+            }
+            await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
         return result
 
