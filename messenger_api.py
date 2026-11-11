@@ -2430,6 +2430,10 @@ def build_messenger_router(
             raise HTTPException(status_code=403, detail="Изменять канал может только владелец")
         if not payload or not ({"title", "username"} & payload.keys()):
             raise HTTPException(status_code=400, detail="Нет полей для изменения")
+        is_public = bool(channel.get("is_public", 1))
+        if not is_public and "username" in payload:
+            raise HTTPException(status_code=400, detail="У приватного канала нельзя изменить публичный username")
+
         title = str(channel["title"])
         username = str(channel["username"])
         if "title" in payload:
@@ -2444,11 +2448,25 @@ def build_messenger_router(
             username = new_username
         try:
             async with aiosqlite.connect(db_path()) as db:
-                await db.execute("UPDATE channels SET username=?,title=? WHERE id=?", (username, title, channel_id))
+                if is_public:
+                    await db.execute(
+                        "UPDATE channels SET username=?,title=? WHERE id=?",
+                        (username, title, channel_id),
+                    )
+                else:
+                    # channel_row intentionally hides private usernames; never write that redacted value
+                    # back into the database when changing a private channel's title.
+                    await db.execute("UPDATE channels SET title=? WHERE id=?", (title, channel_id))
                 await db.commit()
         except aiosqlite.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="Username канала уже занят") from exc
-        return {"id": channel_id, "username": username, "title": title, "owner_telegram_id": int(channel["owner_telegram_id"])}
+        return {
+            "id": channel_id,
+            "username": username if is_public else "",
+            "title": title,
+            "owner_telegram_id": int(channel["owner_telegram_id"]),
+            "is_public": is_public,
+        }
 
     @router.get("/api/channels/{channel_id}/admins")
     async def list_channel_admins(
