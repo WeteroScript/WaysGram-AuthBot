@@ -249,3 +249,61 @@ def test_telegram_gift_purchase_is_idempotent(env) -> None:
             assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 4960
 
     run(scenario())
+
+
+def test_removed_telegram_gift_cannot_be_purchased(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, app = env
+
+    gift_one = {
+        "id": "g1",
+        "sticker": {
+            "file_id": "f1", "file_unique_id": "u1", "type": "regular",
+            "width": 512, "height": 512, "is_animated": False, "is_video": False,
+            "emoji": "🎁", "mime_type": "image/webp",
+        },
+        "star_count": 25,
+    }
+    gift_two = {
+        "id": "g2",
+        "sticker": {
+            "file_id": "f2", "file_unique_id": "u2", "type": "regular",
+            "width": 512, "height": 512, "is_animated": False, "is_video": False,
+            "emoji": "🧸", "mime_type": "image/webp",
+        },
+        "star_count": 50,
+    }
+
+    async def scenario() -> None:
+        # Start with both gifts active and configure a sale for g1.
+        await messenger_api.store_telegram_gifts(path, [gift_one, gift_two], synced_at=1)
+        await bot_module.set_telegram_gift_values("g1", price=40, supply=2)
+
+        # Telegram later removes g1. Force the next request to refresh the catalog.
+        async def current_catalog(bot):
+            return [gift_two]
+
+        monkeypatch.setattr(messenger_api, "fetch_telegram_gifts", current_catalog)
+
+        async with await client_for(app) as client:
+            result = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert result.status_code == 409
+            assert "недоступен" in result.json()["detail"].lower()
+            balance = (await client.get("/api/me", headers=headers(101))).json()["stars"]
+            assert balance == 5000
+
+        connection = db_split.sqlite_connect(path)
+        try:
+            assert connection.execute(
+                "SELECT sold FROM telegram_gift_prices WHERE gift_id='g1'"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                "SELECT is_available FROM telegram_gift_catalog WHERE gift_id='g1'"
+            ).fetchone() == (0,)
+        finally:
+            connection.close()
+
+    run(scenario())
