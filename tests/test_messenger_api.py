@@ -1635,3 +1635,27 @@ def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
             assert saved["unread_count"] == 0
 
     run(scenario())
+
+
+def test_private_channel_invite_uses_configured_public_api_base_url(api_env, monkeypatch) -> None:
+    _path, _auth_store, _fake_bot, app = api_env
+    user_id = 82121
+    add_account(api_env, user_id, "invite_host_owner")
+    add_session(_path, user_id, "invite-host-owner-session")
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://authbot.waysgram.example")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.post(
+                "/api/channels",
+                headers={"Authorization": "Bearer invite-host-owner-session"},
+                json={"title": "Invite Host Test", "is_public": False},
+            )
+            assert response.status_code == 201
+            invite_link = response.json()["invite_link"]
+            assert invite_link.startswith(
+                "https://authbot.waysgram.example/api/channels/invites/"
+            )
+            assert "http://test" not in invite_link
+
+    run(scenario())
