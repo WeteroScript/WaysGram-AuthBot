@@ -1530,7 +1530,7 @@ def build_messenger_router(
                 "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "session_management", "cloud_drafts", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
-                "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages", "group_invites",
+                "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages", "group_invites", "group_join_requests",
                 "image_uploads", "document_uploads", "message_media", "shared_media", "private_media_downloads",
                 "long_poll_messages",
                 "botfather", "bot_commands", "bot_runtime", "stars", "grams",
@@ -4554,6 +4554,9 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="expires_in_hours должен быть целым числом")
         if expires_hours < 1 or expires_hours > 24 * 365:
             raise HTTPException(status_code=400, detail="Срок приглашения должен быть от 1 часа до 1 года")
+        require_approval = payload.get("require_approval", False)
+        if not isinstance(require_approval, bool):
+            raise HTTPException(status_code=400, detail="require_approval должен быть логическим значением")
         raw_max_uses = payload.get("max_uses")
         max_uses = None
         if raw_max_uses is not None:
@@ -4574,9 +4577,9 @@ def build_messenger_router(
                 raise HTTPException(status_code=403, detail="Создавать приглашения могут только администраторы группы")
             await db.execute(
                 """INSERT INTO group_invites
-                   (token_hash,group_id,created_by,created_at,expires_at,max_uses,uses,revoked_at)
-                   VALUES(?,?,?,?,?,?,0,NULL)""",
-                (token_hash, group_id, uid, now, expires_at, max_uses),
+                   (token_hash,group_id,created_by,created_at,expires_at,max_uses,uses,require_approval,revoked_at)
+                   VALUES(?,?,?,?,?,?,0,?,NULL)""",
+                (token_hash, group_id, uid, now, expires_at, max_uses, int(require_approval)),
             )
             cur = await db.execute("SELECT title FROM chat_groups WHERE id=?", (group_id,))
             group = await cur.fetchone()
@@ -4588,6 +4591,7 @@ def build_messenger_router(
             "expires_at": expires_at,
             "max_uses": max_uses,
             "uses": 0,
+            "require_approval": require_approval,
         }
 
     @router.get("/api/groups/invites/{invite_token}")
@@ -4600,7 +4604,7 @@ def build_messenger_router(
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT gi.group_id,gi.created_at,gi.expires_at,gi.max_uses,gi.uses,
-                          g.title,g.username,
+                          gi.require_approval,g.title,g.username,
                           (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id=g.id) AS member_count
                    FROM group_invites gi JOIN chat_groups g ON g.id=gi.group_id
                    WHERE gi.token_hash=? AND gi.revoked_at IS NULL
@@ -4620,6 +4624,7 @@ def build_messenger_router(
             "expires_at": int(invite["expires_at"]) if invite["expires_at"] is not None else None,
             "max_uses": int(invite["max_uses"]) if invite["max_uses"] is not None else None,
             "uses": int(invite["uses"]),
+            "require_approval": bool(invite["require_approval"]),
         }
 
     @router.post("/api/groups/join")
@@ -4643,7 +4648,7 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                """SELECT gi.group_id,gi.expires_at,gi.max_uses,gi.uses,g.title
+                """SELECT gi.group_id,gi.expires_at,gi.max_uses,gi.uses,g.title,gi.require_approval
                    FROM group_invites gi JOIN chat_groups g ON g.id=gi.group_id
                    WHERE gi.token_hash=? AND gi.revoked_at IS NULL""",
                 (token_hash,),
@@ -4665,25 +4670,159 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=410, detail="Лимит вступлений по приглашению исчерпан")
             joined = False
+            join_requested = False
             if not already_member:
-                cur = await db.execute(
-                    """INSERT OR IGNORE INTO group_members(group_id,telegram_id,role,joined_at)
-                       VALUES(?,?,'member',?)""",
-                    (group_id, uid, now),
-                )
-                joined = cur.rowcount == 1
-                if joined:
-                    await db.execute(
-                        "UPDATE group_invites SET uses=uses+1 WHERE token_hash=?",
-                        (token_hash,),
+                if bool(invite[5]):
+                    cur = await db.execute(
+                        """INSERT INTO group_join_requests
+                           (group_id,telegram_id,invite_token_hash,requested_at,status,reviewed_by,reviewed_at)
+                           VALUES(?,?,?,?,'pending',NULL,NULL)
+                           ON CONFLICT(group_id,telegram_id) DO UPDATE SET
+                               invite_token_hash=excluded.invite_token_hash,
+                               requested_at=excluded.requested_at,
+                               status='pending',reviewed_by=NULL,reviewed_at=NULL
+                           WHERE group_join_requests.status<>'pending'""",
+                        (group_id, uid, token_hash, now),
                     )
+                    join_requested = cur.rowcount == 1
+                    if not join_requested:
+                        cur = await db.execute(
+                            "SELECT 1 FROM group_join_requests WHERE group_id=? AND telegram_id=? AND status='pending'",
+                            (group_id, uid),
+                        )
+                        join_requested = await cur.fetchone() is not None
+                else:
+                    cur = await db.execute(
+                        """INSERT OR IGNORE INTO group_members(group_id,telegram_id,role,joined_at)
+                           VALUES(?,?,'member',?)""",
+                        (group_id, uid, now),
+                    )
+                    joined = cur.rowcount == 1
+                    if joined:
+                        await db.execute(
+                            "UPDATE group_invites SET uses=uses+1 WHERE token_hash=?",
+                            (token_hash,),
+                        )
             await db.commit()
         return {
             "joined": joined,
+            "join_requested": join_requested,
             "already_member": already_member,
             "id": group_id,
             "title": str(invite[4]),
         }
+
+    @router.get("/api/groups/{group_id}/join-requests")
+    async def list_group_join_requests(
+        group_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            member = await require_group_member(db, group_id, uid)
+            if member["role"] not in ("owner", "admin"):
+                raise HTTPException(status_code=403, detail="Просматривать заявки могут только администраторы группы")
+            cur = await db.execute(
+                """SELECT r.telegram_id,r.requested_at,a.username,a.display_name,a.avatar_media_id
+                   FROM group_join_requests r
+                   JOIN accounts a ON a.telegram_id=r.telegram_id
+                   WHERE r.group_id=? AND r.status='pending' AND a.is_banned=0
+                   ORDER BY r.requested_at,r.telegram_id LIMIT 200""",
+                (group_id,),
+            )
+            rows = [dict(row) for row in await cur.fetchall()]
+        return {"group_id": group_id, "requests": rows, "count": len(rows)}
+
+    @router.post("/api/groups/{group_id}/join-requests/{telegram_id}/approve")
+    async def approve_group_join_request(
+        group_id: int,
+        telegram_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            member = await require_group_member(db, group_id, uid)
+            if member["role"] not in ("owner", "admin"):
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Одобрять заявки могут только администраторы группы")
+            cur = await db.execute(
+                """SELECT invite_token_hash FROM group_join_requests
+                   WHERE group_id=? AND telegram_id=? AND status='pending'""",
+                (group_id, telegram_id),
+            )
+            request_row = await cur.fetchone()
+            if request_row is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Ожидающая заявка не найдена")
+            cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?",
+                (telegram_id,),
+            )
+            account = await cur.fetchone()
+            if account is None or account[0]:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Аккаунт пользователя не найден или заблокирован")
+            invite_hash = str(request_row["invite_token_hash"])
+            cur = await db.execute(
+                "SELECT max_uses,uses FROM group_invites WHERE token_hash=? AND group_id=?",
+                (invite_hash, group_id),
+            )
+            invite = await cur.fetchone()
+            if invite is None:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Исходное приглашение больше не существует")
+            if invite[0] is not None and int(invite[1]) >= int(invite[0]):
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Лимит вступлений по приглашению исчерпан")
+            cur = await db.execute(
+                """INSERT OR IGNORE INTO group_members(group_id,telegram_id,role,joined_at)
+                   VALUES(?,?,'member',?)""",
+                (group_id, telegram_id, now),
+            )
+            joined = cur.rowcount == 1
+            if joined:
+                await db.execute(
+                    "UPDATE group_invites SET uses=uses+1 WHERE token_hash=?",
+                    (invite_hash,),
+                )
+            await db.execute(
+                """UPDATE group_join_requests SET status='approved',reviewed_by=?,reviewed_at=?
+                   WHERE group_id=? AND telegram_id=? AND status='pending'""",
+                (uid, now, group_id, telegram_id),
+            )
+            await db.commit()
+        return {"approved": True, "joined": joined, "group_id": group_id, "telegram_id": telegram_id}
+
+    @router.post("/api/groups/{group_id}/join-requests/{telegram_id}/decline")
+    async def decline_group_join_request(
+        group_id: int,
+        telegram_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            member = await require_group_member(db, group_id, uid)
+            if member["role"] not in ("owner", "admin"):
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Отклонять заявки могут только администраторы группы")
+            cur = await db.execute(
+                """UPDATE group_join_requests SET status='declined',reviewed_by=?,reviewed_at=?
+                   WHERE group_id=? AND telegram_id=? AND status='pending'""",
+                (uid, now, group_id, telegram_id),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Ожидающая заявка не найдена")
+        return {"declined": True, "group_id": group_id, "telegram_id": telegram_id}
 
     @router.delete("/api/groups/{group_id}/invites/{invite_token}")
     async def revoke_group_invite(
