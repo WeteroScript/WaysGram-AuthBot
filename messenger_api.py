@@ -830,6 +830,95 @@ def build_messenger_router(
             raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
         return user
 
+    def public_session_id(token_hash: str) -> str:
+        return hashlib.sha256(
+            ("waysgram-session-id:" + token_hash).encode("utf-8")
+        ).hexdigest()[:32]
+
+    @router.get("/api/auth/sessions")
+    async def list_auth_sessions(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        current_hash = _token_hash(authorization[7:].strip())
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                "DELETE FROM api_sessions WHERE telegram_id=? AND expires_at<=?",
+                (uid, now),
+            )
+            cur = await db.execute(
+                """SELECT token_hash,created_at,expires_at
+                   FROM api_sessions WHERE telegram_id=?
+                   ORDER BY created_at DESC,token_hash""",
+                (uid,),
+            )
+            rows = await cur.fetchall()
+            await db.commit()
+        sessions = [
+            {
+                "id": public_session_id(str(row["token_hash"])),
+                "created_at": int(row["created_at"]),
+                "expires_at": int(row["expires_at"]),
+                "is_current": hmac.compare_digest(str(row["token_hash"]), current_hash),
+            }
+            for row in rows
+        ]
+        return {"sessions": sessions, "count": len(sessions)}
+
+    @router.delete("/api/auth/sessions/{session_id}")
+    async def revoke_auth_session(
+        session_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        if not re.fullmatch(r"[a-f0-9]{32}", session_id):
+            raise HTTPException(status_code=400, detail="Некорректный ID сеанса")
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT token_hash FROM api_sessions WHERE telegram_id=?",
+                (uid,),
+            )
+            rows = await cur.fetchall()
+            token_hash = next(
+                (
+                    str(row["token_hash"])
+                    for row in rows
+                    if hmac.compare_digest(public_session_id(str(row["token_hash"])), session_id)
+                ),
+                None,
+            )
+            if token_hash is None:
+                raise HTTPException(status_code=404, detail="Сеанс не найден")
+            cur = await db.execute(
+                "DELETE FROM api_sessions WHERE telegram_id=? AND token_hash=?",
+                (uid, token_hash),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Сеанс не найден")
+        return {"status": "revoked", "session_id": session_id}
+
+    @router.post("/api/auth/sessions/revoke-others")
+    async def revoke_other_auth_sessions(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        current_hash = _token_hash(authorization[7:].strip())
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "DELETE FROM api_sessions WHERE telegram_id=? AND token_hash<>?",
+                (uid, current_hash),
+            )
+            revoked = int(cur.rowcount)
+            await db.commit()
+        return {"status": "revoked", "revoked_sessions": revoked}
+
     async def require_owned_media(db: Any, media_id: str | None, owner_id: int) -> str | None:
         value = str(media_id or "").strip()
         if not value:
@@ -1235,7 +1324,7 @@ def build_messenger_router(
                 "profiles", "direct_messages", "saved_messages", "incremental_messages",
                 "channels", "private_channels", "channel_invites",
                 "incremental_channel_posts", "idempotent_writes",
-                "session_refresh", "gifts", "gift_inventory", "gift_transfer",
+                "session_refresh", "session_management", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
                 "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages",
                 "image_uploads", "document_uploads", "message_media", "private_media_downloads",
