@@ -340,3 +340,51 @@ def test_group_and_channel_message_search_enforces_access(env) -> None:
             assert channel_found.json()["count"] == 1
 
     run(scenario())
+
+
+
+def test_contacts_can_be_added_listed_and_removed(env) -> None:
+    _path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = headers(101)
+            initial = await client.get("/api/contacts", headers=auth)
+            assert initial.status_code == 200
+            assert initial.json()["count"] == 0
+
+            added = await client.post(
+                "/api/contacts", headers=auth, json={"user_id": 102},
+            )
+            assert added.status_code == 201
+            assert added.json()["status"] == "added"
+            assert added.json()["contact"]["id"] == 102
+
+            duplicate = await client.post(
+                "/api/contacts", headers=auth, json={"user_id": 102},
+            )
+            assert duplicate.status_code == 201
+            assert duplicate.json()["status"] == "already_exists"
+
+            contacts = await client.get("/api/contacts", headers=auth)
+            assert contacts.json()["count"] == 1
+            assert contacts.json()["contacts"][0]["id"] == 102
+
+            assert (await client.post(
+                "/api/contacts", headers=auth, json={"user_id": 101},
+            )).status_code == 400
+            assert (await client.post(
+                "/api/contacts", headers=auth, json={"user_id": "102"},
+            )).status_code == 400
+            assert (await client.post(
+                "/api/contacts", headers=auth, json={"user_id": 999999},
+            )).status_code == 404
+
+            removed = await client.delete("/api/contacts/102", headers=auth)
+            assert removed.status_code == 200
+            assert removed.json()["status"] == "removed"
+            assert (await client.get("/api/contacts", headers=auth)).json()["count"] == 0
+            assert (await client.delete("/api/contacts/102", headers=auth)).status_code == 404
+            assert (await client.get("/api/contacts")).status_code == 401
+
+    run(scenario())
