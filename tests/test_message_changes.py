@@ -287,3 +287,56 @@ def test_direct_message_search_is_scoped_to_conversation(env) -> None:
             assert missing_auth.status_code == 401
 
     run(scenario())
+
+
+
+def test_group_and_channel_message_search_enforces_access(env) -> None:
+    _path, app = env
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            group = (await client.post(
+                "/api/groups", headers=headers(101), json={"title": "Search Group"},
+            )).json()
+            group_id = group["id"]
+            await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=headers(101),
+                json={"telegram_id": 102},
+            )
+            await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=headers(102),
+                json={"body": "Group search marker"},
+            )
+            group_found = await client.get(
+                f"/api/groups/{group_id}/messages/search?q=search",
+                headers=headers(101),
+            )
+            assert group_found.status_code == 200
+            assert group_found.json()["count"] == 1
+            denied_group = await client.get(
+                f"/api/groups/{group_id}/messages/search?q=search",
+                headers=headers(ADMIN),
+            )
+            assert denied_group.status_code == 403
+
+            channel = (await client.post(
+                "/api/channels",
+                headers=headers(101),
+                json={"title": "Search Channel", "username": "search_channel"},
+            )).json()
+            channel_id = channel["id"]
+            await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=headers(101),
+                json={"body": "Channel search marker"},
+            )
+            channel_found = await client.get(
+                f"/api/channels/{channel_id}/messages/search?q=marker",
+                headers=headers(102),
+            )
+            assert channel_found.status_code == 200
+            assert channel_found.json()["count"] == 1
+
+    run(scenario())
