@@ -3008,3 +3008,144 @@ def test_group_slow_mode_enforces_per_member_interval_and_admin_exemption(api_en
             assert unrestricted_first.status_code == unrestricted_second.status_code == 201
 
     run(scenario())
+
+
+
+def test_push_device_registration_is_bound_to_the_active_session(api_env, monkeypatch) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    monkeypatch.setenv("FCM_SERVICE_ACCOUNT_JSON", "")
+    monkeypatch.setenv("FCM_SERVICE_ACCOUNT_FILE", "")
+    add_account(api_env, 96101, "push_owner")
+    add_account(api_env, 96102, "push_second")
+    add_session(path, 96101, "push-owner-session")
+    add_session(path, 96101, "push-owner-other-session")
+    add_session(path, 96102, "push-second-session")
+    device_token = "fcm-test-registration-token-96101"
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            missing_auth = await client.post(
+                "/api/push/register",
+                json={"token": device_token},
+            )
+            assert missing_auth.status_code == 401
+
+            owner = {"Authorization": "Bearer push-owner-session"}
+            second = {"Authorization": "Bearer push-second-session"}
+            invalid = await client.post(
+                "/api/push/register",
+                headers=owner,
+                json={"token": "short"},
+            )
+            assert invalid.status_code == 400
+
+            unsupported = await client.post(
+                "/api/push/register",
+                headers=owner,
+                json={"token": device_token, "platform": "ios"},
+            )
+            assert unsupported.status_code == 400
+
+            registered = await client.post(
+                "/api/push/register",
+                headers=owner,
+                json={"token": device_token, "platform": "android"},
+            )
+            assert registered.status_code == 200
+            assert registered.json() == {"status": "registered", "platform": "android"}
+
+            token_hash = hashlib.sha256(device_token.encode()).hexdigest()
+            session_hash = hashlib.sha256(b"push-owner-session").hexdigest()
+            with db_split.sqlite_connect(path) as db:
+                record = db.execute(
+                    """SELECT token_hash,token_value,telegram_id,session_token_hash,platform
+                       FROM push_devices WHERE token_hash=?""",
+                    (token_hash,),
+                ).fetchone()
+            assert record == (token_hash, device_token, 96101, session_hash, "android")
+
+            # A token moved to a different authenticated account cannot remain attached
+            # to the previous account or session.
+            moved = await client.post(
+                "/api/push/register",
+                headers=second,
+                json={"token": device_token},
+            )
+            assert moved.status_code == 200
+            with db_split.sqlite_connect(path) as db:
+                rows = db.execute(
+                    """SELECT telegram_id,session_token_hash FROM push_devices
+                       WHERE token_hash=?""",
+                    (token_hash,),
+                ).fetchall()
+            assert rows == [(
+                96102,
+                hashlib.sha256(b"push-second-session").hexdigest(),
+            )]
+
+            # Re-register on the first account, then revoke that specific session.
+            registered_again = await client.post(
+                "/api/push/register",
+                headers=owner,
+                json={"token": device_token},
+            )
+            assert registered_again.status_code == 200
+            survivor = {"Authorization": "Bearer push-owner-other-session"}
+            revoked = await client.post(
+                "/api/auth/sessions/revoke-others",
+                headers=survivor,
+            )
+            assert revoked.status_code == 200
+            with db_split.sqlite_connect(path) as db:
+                remaining = db.execute(
+                    "SELECT COUNT(*) FROM push_devices WHERE token_hash=?",
+                    (token_hash,),
+                ).fetchone()[0]
+                old_session = db.execute(
+                    "SELECT COUNT(*) FROM api_sessions WHERE token_hash=?",
+                    (session_hash,),
+                ).fetchone()[0]
+            assert remaining == 0
+            assert old_session == 0
+
+            config = await client.get("/api/config")
+            assert config.status_code == 200
+            assert config.json()["push_notifications"] is True
+            assert config.json()["push_delivery_ready"] is False
+
+    run(scenario())
+
+
+def test_firebase_service_account_assertion_is_signed() -> None:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    import base64
+    import json
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    credentials = {
+        "project_id": "waysgram-test",
+        "client_email": "push-test@example.invalid",
+        "private_key": private_pem,
+    }
+    assertion = messenger_api._firebase_assertion(credentials, 1_800_000_000)
+    header_part, claims_part, signature_part = assertion.split(".")
+    decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    header = json.loads(decode(header_part))
+    claims = json.loads(decode(claims_part))
+    assert header == {"alg": "RS256", "typ": "JWT"}
+    assert claims["iss"] == credentials["client_email"]
+    assert claims["scope"] == messenger_api.FCM_SCOPE
+    assert claims["iat"] == 1_800_000_000
+    assert claims["exp"] == 1_800_003_600
+    private_key.public_key().verify(
+        decode(signature_part),
+        f"{header_part}.{claims_part}".encode("ascii"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
