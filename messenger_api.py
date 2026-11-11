@@ -3099,9 +3099,16 @@ def build_messenger_router(
                    WHERE id>? AND actor_id<>? AND (
                        (scope='dm' AND (user_a=? OR user_b=?))
                        OR (scope='group' AND chat_id IN (SELECT group_id FROM group_members WHERE telegram_id=?))
-                       OR scope='channel')
+                       OR (scope='channel' AND chat_id IN (
+                           SELECT ch.id FROM channels ch
+                           WHERE ch.is_public=1 OR ch.owner_telegram_id=?
+                              OR EXISTS(SELECT 1 FROM channel_admins ca
+                                        WHERE ca.channel_id=ch.id AND ca.telegram_id=?)
+                              OR EXISTS(SELECT 1 FROM channel_members cm
+                                        WHERE cm.channel_id=ch.id AND cm.telegram_id=?)
+                       )))
                    ORDER BY id ASC LIMIT 200""",
-                (after_id, uid, uid, uid, uid),
+                (after_id, uid, uid, uid, uid, uid, uid, uid),
             )
             rows = [dict(row) for row in await cur.fetchall()]
         cursor = rows[-1]["id"] if len(rows) >= 200 else latest
