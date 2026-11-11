@@ -2069,7 +2069,15 @@ def build_messenger_router(
                 (int(user["telegram_id"]),),
             )
             rows = await cur.fetchall()
-        return {"gifts": [dict(row) for row in rows]}
+        gifts = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["attributes"] = json.loads(item.pop("attributes_json") or "{}")
+            except (TypeError, ValueError):
+                item["attributes"] = {}
+            gifts.append(item)
+        return {"gifts": gifts}
 
     @router.get("/api/me/gifts/transactions")
     async def my_gift_transactions(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -2351,6 +2359,11 @@ def build_messenger_router(
             )
             common_contacts = [dict(item) for item in await cur.fetchall()]
         profile = dict(row)
+        for gift in gifts:
+            try:
+                gift["attributes"] = json.loads(gift.pop("attributes_json") or "{}")
+            except (TypeError, ValueError):
+                gift["attributes"] = {}
         profile["gifts"] = gifts
         profile["common_groups"] = common_groups
         profile["common_contacts"] = common_contacts
