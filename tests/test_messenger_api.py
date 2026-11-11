@@ -2769,3 +2769,129 @@ def test_group_invite_join_requests_require_admin_approval(api_env) -> None:
             assert requested_again.json()["join_requested"] is True
 
     run(scenario())
+
+
+
+def test_group_slow_mode_enforces_per_member_interval_and_admin_exemption(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    for user_id, username in [
+        (95901, "slow_owner"),
+        (95902, "slow_admin"),
+        (95903, "slow_member"),
+        (95904, "slow_outsider"),
+    ]:
+        add_account(api_env, user_id, username)
+        add_session(path, user_id, f"slow-mode-session-{user_id}")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer slow-mode-session-95901"}
+            admin = {"Authorization": "Bearer slow-mode-session-95902"}
+            member = {"Authorization": "Bearer slow-mode-session-95903"}
+            outsider = {"Authorization": "Bearer slow-mode-session-95904"}
+
+            created = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Slow Mode Group", "username": "slow_mode_group", "description": ""},
+            )
+            assert created.status_code == 201
+            group_id = created.json()["id"]
+            for user_id in (95902, 95903):
+                joined = await client.post(
+                    f"/api/groups/{group_id}/members", headers=owner,
+                    json={"telegram_id": user_id},
+                )
+                assert joined.status_code == 201
+            promoted = await client.post(
+                f"/api/groups/{group_id}/admins", headers=owner,
+                json={"telegram_id": 95902},
+            )
+            assert promoted.status_code == 201
+
+            invalid_bool = await client.put(
+                f"/api/groups/{group_id}/slow-mode", headers=owner,
+                json={"seconds": True},
+            )
+            assert invalid_bool.status_code == 400
+            invalid_value = await client.put(
+                f"/api/groups/{group_id}/slow-mode", headers=owner,
+                json={"seconds": 7},
+            )
+            assert invalid_value.status_code == 400
+
+            denied = await client.put(
+                f"/api/groups/{group_id}/slow-mode", headers=member,
+                json={"seconds": 10},
+            )
+            assert denied.status_code == 403
+
+            enabled = await client.put(
+                f"/api/groups/{group_id}/slow-mode", headers=admin,
+                json={"seconds": 10},
+            )
+            assert enabled.status_code == 200
+            assert enabled.json()["slow_mode_seconds"] == 10
+
+            details = await client.get(f"/api/groups/{group_id}", headers=member)
+            assert details.status_code == 200
+            assert details.json()["slow_mode_seconds"] == 10
+
+            first = await client.post(
+                f"/api/groups/{group_id}/messages", headers=member,
+                json={"body": "First message"},
+            )
+            assert first.status_code == 201
+
+            blocked = await client.post(
+                f"/api/groups/{group_id}/messages", headers=member,
+                json={"body": "Too soon"},
+            )
+            assert blocked.status_code == 429
+            assert blocked.headers.get("retry-after") is not None
+            assert "Медленный режим" in blocked.json()["detail"]
+
+            # Simulate elapsed delay without making the suite sleep.
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    "UPDATE group_messages SET created_at=? WHERE id=?",
+                    (int(time.time()) - 11, first.json()["id"]),
+                )
+            after_wait = await client.post(
+                f"/api/groups/{group_id}/messages", headers=member,
+                json={"body": "Delay elapsed"},
+            )
+            assert after_wait.status_code == 201
+
+            # Group administrators are not held by member slow mode.
+            admin_first = await client.post(
+                f"/api/groups/{group_id}/messages", headers=admin,
+                json={"body": "Admin message one"},
+            )
+            admin_second = await client.post(
+                f"/api/groups/{group_id}/messages", headers=admin,
+                json={"body": "Admin message two"},
+            )
+            assert admin_first.status_code == admin_second.status_code == 201
+
+            outsider_message = await client.post(
+                f"/api/groups/{group_id}/messages", headers=outsider,
+                json={"body": "Not a member"},
+            )
+            assert outsider_message.status_code == 403
+
+            disabled = await client.put(
+                f"/api/groups/{group_id}/slow-mode", headers=owner,
+                json={"seconds": 0},
+            )
+            assert disabled.status_code == 200
+            unrestricted_first = await client.post(
+                f"/api/groups/{group_id}/messages", headers=member,
+                json={"body": "Slow mode disabled one"},
+            )
+            unrestricted_second = await client.post(
+                f"/api/groups/{group_id}/messages", headers=member,
+                json={"body": "Slow mode disabled two"},
+            )
+            assert unrestricted_first.status_code == unrestricted_second.status_code == 201
+
+    run(scenario())
