@@ -4397,35 +4397,43 @@ def build_messenger_router(
     @router.get("/api/events")
     async def message_changes(
         after_id: int | None = Query(default=None, ge=0),
+        wait_seconds: int = Query(default=0, ge=0, le=20),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        """Edits, deletions and read marks made by other people. Without after_id only the current cursor is returned."""
+        """Return message changes, optionally waiting briefly for a new visible event."""
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
-        async with aiosqlite.connect(db_path()) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT COALESCE(MAX(id),0) FROM message_events")
-            latest = int((await cur.fetchone())[0])
-            if after_id is None:
-                return {"events": [], "latest_id": latest}
-            cur = await db.execute(
-                """SELECT id,scope,chat_id,user_a,user_b,message_id,kind,actor_id,created_at
-                   FROM message_events
-                   WHERE id>? AND actor_id<>? AND (
-                       (scope='dm' AND (user_a=? OR user_b=?))
-                       OR (scope='group' AND chat_id IN (SELECT group_id FROM group_members WHERE telegram_id=?))
-                       OR (scope='channel' AND chat_id IN (
-                           SELECT ch.id FROM channels ch
-                           WHERE ch.is_public=1 OR ch.owner_telegram_id=?
-                              OR EXISTS(SELECT 1 FROM channel_admins ca
-                                        WHERE ca.channel_id=ch.id AND ca.telegram_id=?)
-                              OR EXISTS(SELECT 1 FROM channel_members cm
-                                        WHERE cm.channel_id=ch.id AND cm.telegram_id=?)
-                       )))
-                   ORDER BY id ASC LIMIT 200""",
-                (after_id, uid, uid, uid, uid, uid, uid, uid),
-            )
-            rows = [dict(row) for row in await cur.fetchall()]
+        deadline = time.monotonic() + (wait_seconds if after_id is not None else 0)
+        rows: list[dict[str, Any]] = []
+        latest = 0
+        while True:
+            async with aiosqlite.connect(db_path()) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT COALESCE(MAX(id),0) FROM message_events")
+                latest = int((await cur.fetchone())[0])
+                if after_id is None:
+                    return {"events": [], "latest_id": latest}
+                cur = await db.execute(
+                    """SELECT id,scope,chat_id,user_a,user_b,message_id,kind,actor_id,created_at
+                       FROM message_events
+                       WHERE id>? AND actor_id<>? AND (
+                           (scope='dm' AND (user_a=? OR user_b=?))
+                           OR (scope='group' AND chat_id IN (SELECT group_id FROM group_members WHERE telegram_id=?))
+                           OR (scope='channel' AND chat_id IN (
+                               SELECT ch.id FROM channels ch
+                               WHERE ch.is_public=1 OR ch.owner_telegram_id=?
+                                  OR EXISTS(SELECT 1 FROM channel_admins ca
+                                            WHERE ca.channel_id=ch.id AND ca.telegram_id=?)
+                                  OR EXISTS(SELECT 1 FROM channel_members cm
+                                            WHERE cm.channel_id=ch.id AND cm.telegram_id=?)
+                           )))
+                       ORDER BY id ASC LIMIT 200""",
+                    (after_id, uid, uid, uid, uid, uid, uid, uid),
+                )
+                rows = [dict(row) for row in await cur.fetchall()]
+            if rows or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
         cursor = rows[-1]["id"] if len(rows) >= 200 else latest
         return {"events": rows, "latest_id": cursor}
 
