@@ -74,6 +74,8 @@ class ObservabilityTests(unittest.TestCase):
                 ],
                 "$current_url": "https://example.test/api/users/123",
                 "$ip": "192.0.2.1",
+                "telegram_id": 123456,
+                "body": "private message text",
                 "surface": "backend",
             },
         }
@@ -82,6 +84,8 @@ class ObservabilityTests(unittest.TestCase):
         properties = sanitized["properties"]
         self.assertNotIn("$current_url", properties)
         self.assertNotIn("$ip", properties)
+        self.assertNotIn("telegram_id", properties)
+        self.assertNotIn("body", properties)
         self.assertNotIn("message", properties["$exception_list"][0])
         self.assertEqual(properties["surface"], "backend")
 
