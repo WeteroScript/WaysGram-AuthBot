@@ -201,6 +201,16 @@ async def init_messenger_storage(database_path: Path) -> None:
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY(telegram_id, scope, peer_id)
             );
+            CREATE TABLE IF NOT EXISTS typing_indicators (
+                scope TEXT NOT NULL CHECK(scope IN ('dm','group')),
+                chat_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY(scope,chat_id,user_telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_typing_indicators_expiry
+                ON typing_indicators(expires_at);
             CREATE TABLE IF NOT EXISTS message_reactions (
                 scope TEXT NOT NULL CHECK(scope IN ('dm','group','channel')),
                 chat_id INTEGER NOT NULL DEFAULT 0,
@@ -1376,7 +1386,7 @@ def build_messenger_router(
                 "message_characters": MAX_MESSAGE_LENGTH,
             },
             "features": [
-                "profiles", "contact_notes", "direct_messages", "saved_messages", "pinned_messages", "incremental_messages",
+                "profiles", "contact_notes", "direct_messages", "saved_messages", "pinned_messages", "typing_indicators", "incremental_messages",
                 "channels", "private_channels", "channel_invites",
                 "incremental_channel_posts", "idempotent_writes",
                 "session_refresh", "session_management", "cloud_drafts", "gifts", "gift_inventory", "gift_transfer",
@@ -4060,6 +4070,131 @@ def build_messenger_router(
             deleted = cur.rowcount == 1
             await db.commit()
         return {"status": "deleted" if deleted else "not_found", "scope": scope, "peer_id": peer_id}
+
+    @router.put("/api/typing")
+    async def update_typing_indicator(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        scope = payload.get("scope")
+        peer_id = payload.get("peer_id")
+        is_typing = payload.get("is_typing", True)
+        if scope not in ("dm", "group"):
+            raise HTTPException(status_code=400, detail="scope: dm или group")
+        if isinstance(peer_id, bool) or not isinstance(peer_id, int) or peer_id <= 0:
+            raise HTTPException(status_code=400, detail="peer_id должен быть положительным целым числом")
+        if not isinstance(is_typing, bool):
+            raise HTTPException(status_code=400, detail="is_typing должен быть логическим значением")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if scope == "dm":
+                if peer_id == uid:
+                    await db.rollback()
+                    raise HTTPException(status_code=400, detail="Индикатор набора не нужен для избранного")
+                cur = await db.execute(
+                    "SELECT is_banned FROM accounts WHERE telegram_id=?", (peer_id,)
+                )
+                target = await cur.fetchone()
+                if target is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Собеседник не найден")
+                if target[0]:
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Аккаунт собеседника недоступен")
+                cur = await db.execute(
+                    """SELECT 1 FROM blocked_users
+                       WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                          OR (owner_telegram_id=? AND blocked_telegram_id=?) LIMIT 1""",
+                    (uid, peer_id, peer_id, uid),
+                )
+                if await cur.fetchone():
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Индикатор недоступен для этого диалога")
+                chat_id = peer_id
+            else:
+                await require_group_member(db, peer_id, uid)
+                chat_id = peer_id
+            await db.execute("DELETE FROM typing_indicators WHERE expires_at<=?", (now,))
+            if is_typing:
+                expires_at = now + 8
+                await db.execute(
+                    """INSERT INTO typing_indicators(scope,chat_id,user_telegram_id,updated_at,expires_at)
+                       VALUES(?,?,?,?,?)
+                       ON CONFLICT(scope,chat_id,user_telegram_id) DO UPDATE SET
+                           updated_at=excluded.updated_at,expires_at=excluded.expires_at""",
+                    (scope, chat_id, uid, now, expires_at),
+                )
+            else:
+                expires_at = 0
+                await db.execute(
+                    "DELETE FROM typing_indicators WHERE scope=? AND chat_id=? AND user_telegram_id=?",
+                    (scope, chat_id, uid),
+                )
+            await db.commit()
+        return {
+            "scope": scope,
+            "peer_id": peer_id,
+            "is_typing": is_typing,
+            "expires_at": expires_at if is_typing else None,
+        }
+
+    @router.get("/api/typing")
+    async def get_typing_indicators(
+        scope: str = Query(...),
+        peer_id: int = Query(..., gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if scope not in ("dm", "group"):
+            raise HTTPException(status_code=400, detail="scope: dm или group")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("DELETE FROM typing_indicators WHERE expires_at<=?", (now,))
+            if scope == "dm":
+                if peer_id == uid:
+                    raise HTTPException(status_code=400, detail="Для избранного индикатор набора не используется")
+                cur = await db.execute(
+                    "SELECT is_banned FROM accounts WHERE telegram_id=?", (peer_id,)
+                )
+                target = await cur.fetchone()
+                if target is None:
+                    raise HTTPException(status_code=404, detail="Собеседник не найден")
+                if target[0]:
+                    raise HTTPException(status_code=403, detail="Аккаунт собеседника недоступен")
+                cur = await db.execute(
+                    """SELECT 1 FROM blocked_users
+                       WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                          OR (owner_telegram_id=? AND blocked_telegram_id=?) LIMIT 1""",
+                    (uid, peer_id, peer_id, uid),
+                )
+                if await cur.fetchone():
+                    raise HTTPException(status_code=403, detail="Индикатор недоступен для этого диалога")
+                cur = await db.execute(
+                    """SELECT a.telegram_id AS id,a.username,a.display_name,ti.updated_at
+                       FROM typing_indicators ti JOIN accounts a ON a.telegram_id=ti.user_telegram_id
+                       WHERE ti.scope='dm' AND ti.chat_id=? AND ti.user_telegram_id=?
+                         AND ti.expires_at>? AND a.is_banned=0""",
+                    (uid, peer_id, now),
+                )
+            else:
+                await require_group_member(db, peer_id, uid)
+                cur = await db.execute(
+                    """SELECT a.telegram_id AS id,a.username,a.display_name,ti.updated_at
+                       FROM typing_indicators ti JOIN accounts a ON a.telegram_id=ti.user_telegram_id
+                       JOIN group_members gm ON gm.telegram_id=ti.user_telegram_id AND gm.group_id=ti.chat_id
+                       WHERE ti.scope='group' AND ti.chat_id=? AND ti.user_telegram_id<>?
+                         AND ti.expires_at>? AND a.is_banned=0
+                       ORDER BY ti.updated_at DESC LIMIT 50""",
+                    (peer_id, uid, now),
+                )
+            rows = [dict(row) for row in await cur.fetchall()]
+            await db.commit()
+        return {"scope": scope, "peer_id": peer_id, "typing_users": rows, "count": len(rows)}
 
     @router.get("/api/events")
     async def message_changes(
