@@ -1515,6 +1515,56 @@ def test_private_channels_hide_content_until_invite_join(api_env) -> None:
 
 
 
+def test_private_channel_title_updates_preserve_internal_usernames(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 82111, "private_edit_owner")
+    add_session(path, 82111, "private-edit-owner-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer private-edit-owner-session"}
+            first = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"title": "Private One", "is_public": False},
+            )
+            second = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"title": "Private Two", "is_public": False},
+            )
+            assert first.status_code == 201
+            assert second.status_code == 201
+
+            first_id = first.json()["id"]
+            second_id = second.json()["id"]
+            renamed_first = await client.patch(
+                f"/api/channels/{first_id}",
+                headers=owner,
+                json={"title": "Private One Renamed"},
+            )
+            renamed_second = await client.patch(
+                f"/api/channels/{second_id}",
+                headers=owner,
+                json={"title": "Private Two Renamed"},
+            )
+            assert renamed_first.status_code == 200
+            assert renamed_second.status_code == 200
+            assert renamed_first.json()["username"] == ""
+            assert renamed_second.json()["username"] == ""
+            assert renamed_first.json()["is_public"] is False
+            assert renamed_second.json()["is_public"] is False
+
+            rejected = await client.patch(
+                f"/api/channels/{first_id}",
+                headers=owner,
+                json={"username": "should_not_be_public"},
+            )
+            assert rejected.status_code == 400
+
+    run(scenario())
+
+
 def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 82301
