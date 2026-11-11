@@ -128,7 +128,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 - `GET /api/channels/invites/{token}` — проверить приглашение без вступления.
 - `POST /api/channels/join` — вступить по `invite_link` или `invite_token`.
 
-Для корректных внешних ссылок за reverse proxy задай `PUBLIC_API_BASE_URL=https://<публичный-домен>`. Для текущего размещения WaysGram на Bothost используется `PUBLIC_API_BASE_URL=https://bot-1793554244-6434-weterochina.bothost.tech`. Без этой переменной сервер использует origin текущего HTTP-запроса.
+Для корректных внешних ссылок за reverse proxy задай `PUBLIC_API_BASE_URL=https://<публичный-домен>`. Для текущего размещения WaysGram на Bothost Dockerfile и Compose используют `PUBLIC_API_BASE_URL=https://bot-1793554244-6434-weterochina.bothost.tech` по умолчанию; значение из окружения имеет приоритет. При запуске через Procfile или собственную команду запуска добавь эту переменную в окружение сервиса. Без неё сервер использует origin текущего HTTP-запроса.
 - `GET /api/channels/{id}/messages?after_id=...` — получить публикации.
   Для ленты в открытом экране поддерживается `wait_seconds=20` вместе с `after_id`; максимальное ожидание — 20 секунд.
 - `POST /api/channels/{id}/messages` — опубликовать сообщение; доступ владельцу или администратору канала. Поддерживает `Idempotency-Key`.
