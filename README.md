@@ -97,6 +97,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 | `OTP_FERNET_KEY` | Постоянный ключ шифрования одноразовых кодов |
 | `INTERNAL_API_HOST` | Адрес привязки API; по умолчанию `0.0.0.0` |
 | `INTERNAL_API_PORT` | Порт API; по умолчанию используется `PORT`, затем 8081 |
+| `PUBLIC_API_BASE_URL` | Публичный origin API для ссылок-приглашений; задай внешний HTTPS-домен, если приложение работает за reverse proxy |
 | `LOG_LEVEL` | Уровень логирования; по умолчанию `INFO` |
 
 ## Начальные балансы
@@ -123,7 +124,11 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
   Для активного диалога можно добавить `after_id` и `wait_seconds=20`: API подождёт новые сообщения до 20 секунд и вернёт их сразу после появления. Для обычной загрузки истории `wait_seconds` не требуется.
 - `POST /api/messages` — JSON `{"recipient_id":123,"body":"Текст"}`; отправить личное сообщение. Поддерживает `Idempotency-Key` для безопасного повтора после сетевого сбоя.
 - `GET /api/channels`, `GET /api/channels/{id}` — список и карточка канала.
-- `POST /api/channels` — создать канал; JSON содержит `username` и `title`.
+- `POST /api/channels` — создать канал; JSON содержит `title`, `username` для публичного канала и `is_public` (boolean). Для приватного канала передай `is_public: false`; сервер вернёт `invite_link`.
+- `GET /api/channels/invites/{token}` — проверить приглашение без вступления.
+- `POST /api/channels/join` — вступить по `invite_link` или `invite_token`.
+
+Для корректных внешних ссылок за reverse proxy задай `PUBLIC_API_BASE_URL=https://<публичный-домен>`. Без этой переменной сервер использует origin текущего HTTP-запроса.
 - `GET /api/channels/{id}/messages?after_id=...` — получить публикации.
   Для ленты в открытом экране поддерживается `wait_seconds=20` вместе с `after_id`; максимальное ожидание — 20 секунд.
 - `POST /api/channels/{id}/messages` — опубликовать сообщение; доступ владельцу или администратору канала. Поддерживает `Idempotency-Key`.
