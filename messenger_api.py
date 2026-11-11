@@ -2577,6 +2577,34 @@ def build_messenger_router(
             await db.rollback()
             raise HTTPException(status_code=404, detail="Сообщение, на которое вы отвечаете, не найдено")
 
+    @router.get("/api/channels/{channel_id}/messages/search")
+    async def search_channel_messages(
+        channel_id: int,
+        q: str = Query(min_length=1, max_length=128),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        await require_channel_access(channel_id, int(user["telegram_id"]))
+        term = q.strip()
+        if not term:
+            raise HTTPException(status_code=400, detail="Введите текст для поиска")
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await channel_row(channel_id)
+            cur = await db.execute(
+                """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
+                          (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
+                          (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
+                   FROM channel_messages
+                   WHERE channel_id=? AND body LIKE ? COLLATE NOCASE
+                   ORDER BY id DESC LIMIT 100""",
+                (channel_id, f"%{term}%"),
+            )
+            rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        items.reverse()
+        return {"query": term, "messages": items, "count": len(items), "has_more": len(items) == 100}
+
     @router.post("/api/channels/{channel_id}/messages", status_code=201)
     async def create_channel_message(
         channel_id: int,
@@ -3475,6 +3503,33 @@ def build_messenger_router(
         if not after_id:
             items.reverse()
         return {"messages": items, "next_after_id": items[-1]["id"] if items else 0}
+
+    @router.get("/api/groups/{group_id}/messages/search")
+    async def search_group_messages(
+        group_id: int,
+        q: str = Query(min_length=1, max_length=128),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        term = q.strip()
+        if not term:
+            raise HTTPException(status_code=400, detail="Введите текст для поиска")
+        async with aiosqlite.connect(db_path()) as db:
+            await require_group_member(db, group_id, int(user["telegram_id"]))
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
+                          (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
+                          (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
+                   FROM group_messages
+                   WHERE group_id=? AND body LIKE ? COLLATE NOCASE
+                   ORDER BY id DESC LIMIT 100""",
+                (group_id, f"%{term}%"),
+            )
+            rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        items.reverse()
+        return {"query": term, "messages": items, "count": len(items), "has_more": len(items) == 100}
 
     @router.post("/api/groups/{group_id}/messages", status_code=201)
     async def send_group_message(
