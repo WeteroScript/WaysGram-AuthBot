@@ -3074,7 +3074,7 @@ def build_messenger_router(
                        updated_at=excluded.updated_at""",
                 (uid, scope, int(peer_id), value, now),
             )
-            if scope == "dm" and value > current:
+            if scope == "dm" and int(peer_id) != uid and value > current:
                 await record_event(db, "dm", value, "read", uid, user_a=uid, user_b=int(peer_id))
             await db.commit()
         return {"last_read_id": value}
