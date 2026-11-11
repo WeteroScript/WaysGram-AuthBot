@@ -88,6 +88,11 @@ def test_group_edit_delete_and_admin_rights(env) -> None:
             assert (await client.patch(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(101), json={"body": "hack"})).status_code == 403
             assert (await client.patch(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(102), json={"body": "edited"})).status_code == 200
             assert (await client.put(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(102), json={"body": "edited via PUT"})).status_code == 200
+            before_delete = (await client.get(
+                f"/api/groups/{gid}/messages", headers=headers(102)
+            )).json()["messages"]
+            assert before_delete[1]["reply_to_body"] == "edited via PUT"
+            assert before_delete[1]["reply_to_sender_id"] == 102
             # A member cannot delete the owner's message, the owner can delete anybody's.
             assert (await client.delete(f"/api/groups/{gid}/messages/{m2['id']}", headers=headers(102))).status_code == 403
             assert (await client.delete(f"/api/groups/{gid}/messages/{m1['id']}", headers=headers(101))).status_code == 200
@@ -96,8 +101,8 @@ def test_group_edit_delete_and_admin_rights(env) -> None:
 
             remaining = (await client.get(f"/api/groups/{gid}/messages", headers=headers(102))).json()["messages"]
             assert [m["id"] for m in remaining] == [m2["id"]]
-            assert remaining[0]["reply_to_body"] == "edited via PUT"
-            assert remaining[0]["reply_to_sender_id"] == 102
+            assert remaining[0]["reply_to_body"] is None
+            assert remaining[0]["reply_to_sender_id"] is None
 
     run(scenario())
 
@@ -125,7 +130,10 @@ def test_channel_posts_can_be_edited_and_deleted_by_the_owner_only(env) -> None:
             assert listed[1]["reply_to_sender_id"] == 101
             assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(102))).status_code == 403
             assert (await client.delete(f"/api/channels/{cid}/messages/{post['id']}", headers=headers(101))).status_code == 200
-            assert (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"] == []
+            remaining = (await client.get(f"/api/channels/{cid}/messages", headers=headers(102))).json()["messages"]
+            assert [message["id"] for message in remaining] == [reply_post.json()["id"]]
+            assert remaining[0]["reply_to_body"] is None
+            assert remaining[0]["reply_to_sender_id"] is None
 
     run(scenario())
 
