@@ -201,6 +201,17 @@ async def init_messenger_storage(database_path: Path) -> None:
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY(telegram_id, scope, peer_id)
             );
+            CREATE TABLE IF NOT EXISTS message_reactions (
+                scope TEXT NOT NULL CHECK(scope IN ('dm','group','channel')),
+                chat_id INTEGER NOT NULL DEFAULT 0,
+                message_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                reaction TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(scope,chat_id,message_id,user_telegram_id,reaction)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_reactions_message
+                ON message_reactions(scope,chat_id,message_id,reaction);
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
@@ -2700,6 +2711,10 @@ def build_messenger_router(
                         """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
                                   (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
                                   (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                                     FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                                           WHERE scope='channel' AND chat_id=channel_messages.channel_id
+                                             AND message_id=channel_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                            FROM channel_messages WHERE channel_id=? AND id>?
@@ -2711,6 +2726,10 @@ def build_messenger_router(
                         """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
                                   (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
                                   (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                                     FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                                           WHERE scope='channel' AND chat_id=channel_messages.channel_id
+                                             AND message_id=channel_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                            FROM channel_messages WHERE channel_id=?
@@ -2758,6 +2777,10 @@ def build_messenger_router(
                 """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,edited_at,reply_to_id,created_at,
                           (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
                                   (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                                     FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                                           WHERE scope='channel' AND chat_id=channel_messages.channel_id
+                                             AND message_id=channel_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
                    FROM channel_messages
@@ -2923,6 +2946,9 @@ def build_messenger_router(
                    (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                    (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
                    (SELECT sender_telegram_id FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_sender_id,
+                   (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                      FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                            WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                    (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                    (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
             FROM messages WHERE
@@ -2997,6 +3023,9 @@ def build_messenger_router(
                           (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                    (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
                    (SELECT sender_telegram_id FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_sender_id,
+                   (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                      FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                            WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                           (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
                    FROM messages
@@ -3218,6 +3247,137 @@ def build_messenger_router(
         if not isinstance(value, str) or not value.strip():
             raise HTTPException(status_code=400, detail="Текст сообщения не может быть пустым")
         return _message_body(value)
+
+    async def toggle_message_reaction(
+        scope: str,
+        chat_id: int,
+        message_id: int,
+        user_id: int,
+        reaction: str,
+    ) -> dict[str, Any]:
+        allowed = {"👍", "❤️", "😂", "😮", "😢", "🎉", "🙏"}
+        if reaction not in allowed:
+            raise HTTPException(status_code=400, detail="Недопустимая реакция")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if scope == "dm":
+                cur = await db.execute(
+                    """SELECT sender_telegram_id,recipient_telegram_id
+                       FROM messages WHERE id=?""",
+                    (message_id,),
+                )
+                message = await cur.fetchone()
+                if message is None or user_id not in (int(message[0]), int(message[1])):
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Сообщение не найдено")
+            elif scope == "group":
+                await require_group_member(db, chat_id, user_id)
+                cur = await db.execute(
+                    "SELECT 1 FROM group_messages WHERE id=? AND group_id=?",
+                    (message_id, chat_id),
+                )
+                if await cur.fetchone() is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Сообщение не найдено")
+            elif scope == "channel":
+                cur = await db.execute(
+                    "SELECT 1 FROM channel_messages WHERE id=? AND channel_id=?",
+                    (message_id, chat_id),
+                )
+                if await cur.fetchone() is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Публикация не найдена")
+            cur = await db.execute(
+                """SELECT 1 FROM message_reactions
+                   WHERE scope=? AND chat_id=? AND message_id=?
+                     AND user_telegram_id=? AND reaction=?""",
+                (scope, chat_id, message_id, user_id, reaction),
+            )
+            exists = await cur.fetchone() is not None
+            if exists:
+                await db.execute(
+                    """DELETE FROM message_reactions
+                       WHERE scope=? AND chat_id=? AND message_id=?
+                         AND user_telegram_id=? AND reaction=?""",
+                    (scope, chat_id, message_id, user_id, reaction),
+                )
+                status = "removed"
+            else:
+                cur = await db.execute(
+                    """SELECT COUNT(*) FROM message_reactions
+                       WHERE scope=? AND chat_id=? AND message_id=? AND user_telegram_id=?""",
+                    (scope, chat_id, message_id, user_id),
+                )
+                if int((await cur.fetchone())[0]) >= 3:
+                    await db.rollback()
+                    raise HTTPException(status_code=409, detail="Можно поставить не более трёх разных реакций")
+                await db.execute(
+                    """INSERT INTO message_reactions
+                       (scope,chat_id,message_id,user_telegram_id,reaction,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (scope, chat_id, message_id, user_id, reaction, now),
+                )
+                status = "added"
+            cur = await db.execute(
+                """SELECT reaction,COUNT(*) AS count FROM message_reactions
+                   WHERE scope=? AND chat_id=? AND message_id=?
+                   GROUP BY reaction ORDER BY MIN(created_at),reaction""",
+                (scope, chat_id, message_id),
+            )
+            summary = [{"reaction": str(row[0]), "count": int(row[1])} for row in await cur.fetchall()]
+            cur = await db.execute(
+                """SELECT reaction FROM message_reactions
+                   WHERE scope=? AND chat_id=? AND message_id=? AND user_telegram_id=?
+                   ORDER BY created_at,reaction""",
+                (scope, chat_id, message_id, user_id),
+            )
+            mine = [str(row[0]) for row in await cur.fetchall()]
+            await db.commit()
+        return {
+            "status": status,
+            "scope": scope,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reactions": summary,
+            "my_reactions": mine,
+        }
+
+    @router.post("/api/messages/{message_id}/reactions")
+    async def react_to_direct_message(
+        message_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        return await toggle_message_reaction(
+            "dm", 0, message_id, int(user["telegram_id"]), str(payload.get("reaction") or "")
+        )
+
+    @router.post("/api/groups/{group_id}/messages/{message_id}/reactions")
+    async def react_to_group_message(
+        group_id: int,
+        message_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        return await toggle_message_reaction(
+            "group", group_id, message_id, int(user["telegram_id"]), str(payload.get("reaction") or "")
+        )
+
+    @router.post("/api/channels/{channel_id}/messages/{message_id}/reactions")
+    async def react_to_channel_message(
+        channel_id: int,
+        message_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        await require_channel_access(channel_id, int(user["telegram_id"]))
+        return await toggle_message_reaction(
+            "channel", channel_id, message_id, int(user["telegram_id"]), str(payload.get("reaction") or "")
+        )
 
     @router.put("/api/messages/{message_id}")
     @router.patch("/api/messages/{message_id}")
@@ -3772,6 +3932,10 @@ def build_messenger_router(
                         """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
                                   (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
                                   (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                                     FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                                           WHERE scope='group' AND chat_id=group_messages.group_id
+                                             AND message_id=group_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                            FROM group_messages WHERE group_id=? AND id>? ORDER BY id ASC LIMIT 100""",
@@ -3782,6 +3946,10 @@ def build_messenger_router(
                         """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
                                   (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
                                   (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                                     FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                                           WHERE scope='group' AND chat_id=group_messages.group_id
+                                             AND message_id=group_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
                                   (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                            FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 100""",
@@ -3813,6 +3981,10 @@ def build_messenger_router(
                 """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,edited_at,reply_to_id,created_at,
                           (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
                                   (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
+                                  (SELECT group_concat(reaction || ':' || reaction_count, ',')
+                                     FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
+                                           WHERE scope='group' AND chat_id=group_messages.group_id
+                                             AND message_id=group_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
                    FROM group_messages
