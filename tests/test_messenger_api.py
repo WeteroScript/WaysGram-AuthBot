@@ -1893,3 +1893,106 @@ def test_profile_avatar_upload_set_remove_and_owner_isolation(api_env) -> None:
             assert refreshed.json()["avatar_media_id"] == ""
 
     run(scenario())
+
+
+def test_cloud_drafts_sync_and_enforce_chat_access(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 95101, "draft_owner")
+    add_account(api_env, 95102, "draft_member")
+    add_account(api_env, 95103, "draft_outsider")
+    add_session(path, 95101, "draft-owner-session")
+    add_session(path, 95102, "draft-member-session")
+    add_session(path, 95103, "draft-outsider-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer draft-owner-session"}
+            member = {"Authorization": "Bearer draft-member-session"}
+            outsider = {"Authorization": "Bearer draft-outsider-session"}
+
+            # DM drafts are private to the account that created them, even when
+            # both participants can access the conversation itself.
+            saved_dm = await client.put(
+                "/api/drafts", headers=owner,
+                json={"scope": "dm", "peer_id": 95102, "body": "private DM draft"},
+            )
+            assert saved_dm.status_code == 200
+            own_dm = await client.get(
+                "/api/drafts", headers=owner, params={"scope": "dm", "peer_id": 95102},
+            )
+            assert own_dm.json()["draft"]["body"] == "private DM draft"
+            other_dm = await client.get(
+                "/api/drafts", headers=member, params={"scope": "dm", "peer_id": 95101},
+            )
+            assert other_dm.status_code == 200 and other_dm.json()["draft"] is None
+
+            # Group drafts require current membership and remain per-user.
+            created_group = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Draft Group", "username": "draft_group", "description": ""},
+            )
+            assert created_group.status_code == 201
+            group_id = created_group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members", headers=owner,
+                json={"username": "draft_member"},
+            )
+            assert joined.status_code == 201
+            saved_group = await client.put(
+                "/api/drafts", headers=owner,
+                json={"scope": "group", "peer_id": group_id, "body": "owner group draft"},
+            )
+            assert saved_group.status_code == 200
+            member_group = await client.get(
+                "/api/drafts", headers=member, params={"scope": "group", "peer_id": group_id},
+            )
+            assert member_group.status_code == 200 and member_group.json()["draft"] is None
+            assert (await client.get(
+                "/api/drafts", headers=outsider, params={"scope": "group", "peer_id": group_id},
+            )).status_code == 403
+
+            # Private channel drafts are inaccessible before invite join.
+            created_channel = await client.post(
+                "/api/channels", headers=owner,
+                json={"title": "Draft Channel", "is_public": False},
+            )
+            assert created_channel.status_code == 201
+            channel_id = created_channel.json()["id"]
+            invite_link = created_channel.json()["invite_link"]
+            saved_channel = await client.put(
+                "/api/drafts", headers=owner,
+                json={"scope": "channel", "peer_id": channel_id, "body": "owner channel draft"},
+            )
+            assert saved_channel.status_code == 200
+            denied_channel = await client.get(
+                "/api/drafts", headers=member, params={"scope": "channel", "peer_id": channel_id},
+            )
+            assert denied_channel.status_code == 403
+            joined_channel = await client.post(
+                "/api/channels/join", headers=member, json={"invite_link": invite_link},
+            )
+            assert joined_channel.status_code == 200
+            member_channel = await client.get(
+                "/api/drafts", headers=member, params={"scope": "channel", "peer_id": channel_id},
+            )
+            assert member_channel.status_code == 200 and member_channel.json()["draft"] is None
+
+            # Draft size and scope are validated; clearing is idempotent.
+            too_large = await client.put(
+                "/api/drafts", headers=owner,
+                json={"scope": "dm", "peer_id": 95102, "body": "x" * 4001},
+            )
+            assert too_large.status_code == 400
+            deleted = await client.delete(
+                "/api/drafts", headers=owner, params={"scope": "dm", "peer_id": 95102},
+            )
+            assert deleted.status_code == 200 and deleted.json()["status"] == "deleted"
+            missing = await client.delete(
+                "/api/drafts", headers=owner, params={"scope": "dm", "peer_id": 95102},
+            )
+            assert missing.status_code == 200 and missing.json()["status"] == "not_found"
+            assert (await client.get(
+                "/api/drafts", headers=owner, params={"scope": "dm", "peer_id": 95102},
+            )).json()["draft"] is None
+
+    run(scenario())
