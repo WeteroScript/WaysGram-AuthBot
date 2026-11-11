@@ -1385,6 +1385,7 @@ def build_messenger_router(
             await db.commit()
         return {"avatar_media_id": ""}
 
+    @router.put("/api/me")
     @router.patch("/api/me")
     async def update_me(
         payload: dict[str, Any],
