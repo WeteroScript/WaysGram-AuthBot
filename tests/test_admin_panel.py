@@ -184,3 +184,23 @@ def test_admin_edits_telegram_gift_prices_from_the_bot(panel) -> None:
     assert "✅" in press("wgadm:tggifts").sent[0][0] + str(press("wgadm:tggifts").sent[0][1])
     press("wgadm:tghide:g1")
     assert query(path, "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id='g1'") == [(0, 0)]
+
+
+def test_admin_balance_credit_sends_system_message(panel) -> None:
+    path, store = panel
+    user_id = 770077
+    run(bot_module.ensure_system_account())
+    run(bot_module.ensure_account(user_id, "+15550770077", "credit_test", "Credit Test"))
+
+    press(f"wgadm:credit:stars:{user_id}")
+    completed = type_text("125")
+    assert "Начислено 125 STARS" in completed.sent[0][0]
+
+    messages = query(
+        path,
+        "SELECT body FROM messages WHERE sender_telegram_id=? AND recipient_telegram_id=? ORDER BY id",
+        (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+    )
+    assert len(messages) == 2
+    assert "Начислено: +125 Stars" in messages[-1][0]
+    assert "Текущий баланс: 5125 Stars" in messages[-1][0]

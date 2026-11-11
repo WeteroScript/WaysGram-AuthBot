@@ -47,6 +47,19 @@ except ValueError:
     TELEGRAM_API_ID = 0
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 
+# Reserved WaysGram-only system identity. This is not a Telegram user account.
+SYSTEM_ACCOUNT_ID = 4_277_000_000_000
+SYSTEM_ACCOUNT_NUMBER = "+4277"
+WELCOME_DM_TEXT = (
+    "Привет 👋\n"
+    "Это WaysGram, независимый мессенджер с привычным интерфейсом Telegram!\n\n"
+    "Здесь можно общаться с друзьями, создавать группы и каналы, отправлять фото и файлы, "
+    "а также пользоваться внутренним балансом Stars и Gram.\n\n"
+    "Мы постепенно добавляем новые возможности, чтобы общение стало удобнее. "
+    "Заглядывай в приложение, изучай функции и оставайся на связи.\n\n"
+    "Добро пожаловать в WaysGram! ✨"
+)
+
 PHONE_RE = re.compile(r"^\+1\d{10}$")
 OTP_RE = re.compile(r"^\d{6}$")
 EMOJI = ["🐱", "🐶", "🦊", "🐼", "🐸", "🐵", "🐧", "🐰", "🦁", "🐨", "🐯", "🐹"]
@@ -762,6 +775,25 @@ async def init_admin_storage() -> None:
             await db.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
         await db.commit()
 
+
+async def ensure_system_account() -> None:
+    """Create the reserved WaysGram sender identity after all account tables exist."""
+    now = int(time.time())
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            """INSERT INTO accounts
+               (telegram_id,virtual_number,username,display_name,stars,grams,is_banned,created_at,updated_at)
+               VALUES(?,?,'waysgram','WaysGram',0,0,0,?,?)
+               ON CONFLICT(telegram_id) DO UPDATE SET
+                   virtual_number=excluded.virtual_number,
+                   username=excluded.username,
+                   display_name=excluded.display_name,
+                   updated_at=excluded.updated_at""",
+            (SYSTEM_ACCOUNT_ID, SYSTEM_ACCOUNT_NUMBER, now, now),
+        )
+        await db.commit()
+
+
 async def account_is_banned(telegram_id: int) -> bool:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cur = await db.execute("SELECT is_banned FROM accounts WHERE telegram_id=?", (telegram_id,))
@@ -809,6 +841,12 @@ async def ensure_account(telegram_id: int, number: str, username: str = "", disp
                     (telegram_id, "stars", 5000, 5000, "welcome_bonus", now),
                     (telegram_id, "grams", 15, 15, "welcome_bonus", now),
                 ],
+            )
+            # The welcome conversation is created exactly once with the account.
+            await db.execute(
+                """INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (SYSTEM_ACCOUNT_ID, telegram_id, WELCOME_DM_TEXT, now),
             )
         await db.commit()
 
@@ -997,7 +1035,8 @@ async def admin_telegram_gifts_page(page: int) -> tuple[str, InlineKeyboardMarku
 
 
 async def admin_telegram_gift_card(gift_id: str) -> tuple[str, InlineKeyboardMarkup] | None:
-    row = next((r for r in await telegram_gift_rows() if str(r["id"]) == gift_id), None)    if not row:
+    row = next((r for r in await telegram_gift_rows() if str(r["id"]) == gift_id), None)
+    if not row:
         return None
     remaining = max(int(row["supply"]) - int(row["sold"]), 0)
     body = (
@@ -1779,6 +1818,19 @@ async def admin_text_input(message: Message) -> None:
                 (user_id,asset,amount,balance,"admin_credit",ADMIN_ID,now))
             await db.execute("INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
                 (ADMIN_ID,"balance_credit",str(user_id),f"{asset} +{amount}; balance={balance}",now))
+            asset_label = "Stars" if asset == "stars" else "Gram"
+            await db.execute(
+                """INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (
+                    SYSTEM_ACCOUNT_ID,
+                    user_id,
+                    f"Баланс пополнен!\n\nНачислено: +{amount} {asset_label}\n"
+                    f"Текущий баланс: {balance} {asset_label}\n\n"
+                    "Спасибо, что пользуешься WaysGram! ✨",
+                    now,
+                ),
+            )
             await db.commit()
         ADMIN_INPUT.pop(ADMIN_ID, None)
         await message.answer(f"Начислено {amount} {asset.upper()}. Новый баланс: {balance}.")
@@ -2328,6 +2380,7 @@ async def main() -> None:
     await store.init()
     await init_admin_storage()
     await init_messenger_storage(DATABASE_PATH)
+    await ensure_system_account()
     bot = Bot(token=BOT_TOKEN)
     if TELEGRAM_API_ID > 0 and TELEGRAM_API_HASH:
         try:

@@ -34,6 +34,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> bot_module.Store:
     instance.configure_otp_encryption(Fernet.generate_key().decode("ascii"))
     asyncio.run(instance.init())
     asyncio.run(bot_module.init_admin_storage())
+    asyncio.run(init_messenger_storage(instance.path))
     monkeypatch.setattr(bot_module, "store", instance)
     return instance
 
@@ -354,6 +355,7 @@ def test_new_account_receives_one_time_welcome_balances(
     user_id = 880001
     number = "+15550000001"
 
+    run(bot_module.ensure_system_account())
     run(bot_module.ensure_account(user_id, number, "starter", "Starter User"))
 
     with db_split.sqlite_connect(store.path) as conn:
@@ -371,6 +373,17 @@ def test_new_account_receives_one_time_welcome_balances(
         ("grams", 15, "welcome_bonus"),
         ("stars", 5000, "welcome_bonus"),
     ]
+    with db_split.sqlite_connect(store.path) as conn:
+        welcome = conn.execute(
+            "SELECT sender_telegram_id,body FROM messages WHERE recipient_telegram_id=?",
+            (user_id,),
+        ).fetchone()
+        system_account = conn.execute(
+            "SELECT virtual_number,username,display_name FROM accounts WHERE telegram_id=?",
+            (bot_module.SYSTEM_ACCOUNT_ID,),
+        ).fetchone()
+    assert welcome == (bot_module.SYSTEM_ACCOUNT_ID, bot_module.WELCOME_DM_TEXT)
+    assert system_account == ("+4277", "waysgram", "WaysGram")
 
     # A repeated number/account sync must not issue the welcome balance twice.
     with db_split.sqlite_connect(store.path) as conn:

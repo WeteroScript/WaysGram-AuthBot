@@ -152,6 +152,90 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
     run(scenario())
 
 
+def test_new_account_gets_system_welcome_and_balance_notifications(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    run(bot_module.ensure_system_account())
+    user_id = 81234
+    number = add_account(api_env, user_id, "newbie")
+    add_session(path, user_id, "system-welcome-session")
+
+    with db_split.sqlite_connect(path) as db:
+        system_account = db.execute(
+            "SELECT virtual_number,username,display_name FROM accounts WHERE telegram_id=?",
+            (bot_module.SYSTEM_ACCOUNT_ID,),
+        ).fetchone()
+        welcome = db.execute(
+            """SELECT sender_telegram_id,recipient_telegram_id,body FROM messages
+               WHERE sender_telegram_id=? AND recipient_telegram_id=?""",
+            (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+        ).fetchall()
+
+    assert system_account == ("+4277", "waysgram", "WaysGram")
+    assert len(welcome) == 1
+    assert welcome[0][0:2] == (bot_module.SYSTEM_ACCOUNT_ID, user_id)
+    assert welcome[0][2].startswith("Привет 👋")
+    assert "Добро пожаловать в WaysGram!" in welcome[0][2]
+    assert "—" not in welcome[0][2]
+
+    class FakeAdminMessage:
+        def __init__(self, text: str):
+            self.text = text
+            self.from_user = SimpleNamespace(id=bot_module.ADMIN_ID)
+
+        async def answer(self, *_args, **_kwargs):
+            return None
+
+    async def apply_credit(asset: str, amount: int) -> None:
+        bot_module.ADMIN_INPUT[bot_module.ADMIN_ID] = ("credit", (asset, user_id))
+        await bot_module.admin_text_input(FakeAdminMessage(str(amount)))
+
+    try:
+        run(apply_credit("stars", 125))
+        run(apply_credit("grams", 7))
+    finally:
+        bot_module.ADMIN_INPUT.pop(bot_module.ADMIN_ID, None)
+
+    with db_split.sqlite_connect(path) as db:
+        notices = db.execute(
+            """SELECT body FROM messages WHERE sender_telegram_id=? AND recipient_telegram_id=?
+               ORDER BY id ASC""",
+            (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+        ).fetchall()
+        balances = db.execute(
+            "SELECT stars,grams FROM accounts WHERE telegram_id=?",
+            (user_id,),
+        ).fetchone()
+
+    assert len(notices) == 3
+    assert "Начислено: +125 Stars" in notices[1][0]
+    assert "Текущий баланс: 5125 Stars" in notices[1][0]
+    assert "Начислено: +7 Gram" in notices[2][0]
+    assert "Текущий баланс: 22 Gram" in notices[2][0]
+    assert balances == (5125, 22)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.get(
+                "/api/conversations",
+                headers={"Authorization": "Bearer system-welcome-session"},
+            )
+            assert response.status_code == 200
+            conversations = response.json()["conversations"]
+            system_chat = next(item for item in conversations if item["id"] == bot_module.SYSTEM_ACCOUNT_ID)
+            assert system_chat["display_name"] == "WaysGram"
+            assert system_chat["last_message"].startswith("Баланс пополнен!")
+
+    run(scenario())
+
+    run(bot_module.ensure_account(user_id, number, "newbie", "User 81234"))
+    with db_split.sqlite_connect(path) as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND recipient_telegram_id=?",
+            (bot_module.SYSTEM_ACCOUNT_ID, user_id),
+        ).fetchone()[0]
+    assert count == 3
+
+
 def test_direct_message_long_poll_returns_new_message(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89201, "longpoll_sender")
@@ -1132,8 +1216,14 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert payload["source"] == "telegram_bot_api"
             assert payload["scope"] == "gifts_available_to_authbot"
             assert payload["currency"] == "stars"
-            # Nothing is for sale until the administrator sets a price and a stock.
+            # The storefront is sale-filtered, but the Android catalog must be able
+            # to display every Telegram gift even before a WaysGram price is assigned.
             assert payload["count"] == 0
+            full_catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
+            assert full_catalog.status_code == 200
+            assert full_catalog.json()["count"] == 1
+            assert full_catalog.json()["gifts"][0]["id"] == "gift_123"
+            assert full_catalog.json()["gifts"][0]["for_sale"] is False
             with db_split.sqlite_connect(path) as db:
                 db.execute(
                     "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('gift_123',40,3,0,1)"
@@ -1352,5 +1442,220 @@ def test_channel_owner_can_change_title_and_username(api_env) -> None:
             assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={"username": "taken_chan"})).status_code == 409
             assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={"username": "1bad"})).status_code == 400
             assert (await client.patch(f"/api/channels/{channel_id}", headers=owner, json={})).status_code == 400
+
+    run(scenario())
+
+
+def test_private_channels_hide_content_until_invite_join(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 82101, "private_owner")
+    add_account(api_env, 82102, "private_guest")
+    add_session(path, 82101, "private-owner-session")
+    add_session(path, 82102, "private-guest-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer private-owner-session"}
+            guest = {"Authorization": "Bearer private-guest-session"}
+            created = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"title": "Private Room", "is_public": False},
+            )
+            assert created.status_code == 201
+            private = created.json()
+            assert private["is_public"] is False
+            assert private["username"] == ""
+            assert private["invite_link"].startswith("http://test/api/channels/invites/")
+            channel_id = private["id"]
+
+            private_post = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+                json={"body": "Private event payload"},
+            )
+            assert private_post.status_code == 201
+            private_event = await client.delete(
+                f"/api/channels/{channel_id}/messages/{private_post.json()['id']}",
+                headers=owner,
+            )
+            assert private_event.status_code == 200
+
+            events_before_join = await client.get("/api/events?after_id=0", headers=guest)
+            assert events_before_join.status_code == 200
+            assert not any(
+                event.get("scope") == "channel" and event.get("chat_id") == channel_id
+                for event in events_before_join.json()["events"]
+            )
+
+            preview = await client.get(private["invite_link"])
+            assert preview.status_code == 200
+            assert preview.json()["channel_id"] == channel_id
+            assert preview.json()["is_public"] is False
+
+            hidden = await client.get("/api/channels", headers=guest)
+            assert hidden.status_code == 200
+            assert all(item["id"] != channel_id for item in hidden.json()["channels"])
+
+            denied_details = await client.get(f"/api/channels/{channel_id}", headers=guest)
+            denied_messages = await client.get(
+                f"/api/channels/{channel_id}/messages",
+                headers=guest,
+            )
+            assert denied_details.status_code == 403
+            assert denied_messages.status_code == 403
+            denied_read_marker = await client.put(
+                "/api/read",
+                headers=guest,
+                json={"scope": "channel", "peer_id": channel_id, "last_read_id": 0},
+            )
+            assert denied_read_marker.status_code == 403
+
+            joined = await client.post(
+                "/api/channels/join",
+                headers=guest,
+                json={"invite_link": private["invite_link"]},
+            )
+            assert joined.status_code == 200
+            assert joined.json()["joined"] is True
+            assert joined.json()["id"] == channel_id
+
+            events_after_join = await client.get("/api/events?after_id=0", headers=guest)
+            assert events_after_join.status_code == 200
+            assert any(
+                event.get("scope") == "channel" and event.get("chat_id") == channel_id
+                for event in events_after_join.json()["events"]
+            )
+
+            visible = await client.get("/api/channels", headers=guest)
+            assert any(item["id"] == channel_id and item["is_public"] == 0
+                       for item in visible.json()["channels"])
+            details = await client.get(f"/api/channels/{channel_id}", headers=guest)
+            history = await client.get(f"/api/channels/{channel_id}/messages", headers=guest)
+            assert details.status_code == 200
+            assert details.json()["is_public"] == 0
+            assert history.status_code == 200
+            allowed_read_marker = await client.put(
+                "/api/read",
+                headers=guest,
+                json={"scope": "channel", "peer_id": channel_id, "last_read_id": 0},
+            )
+            assert allowed_read_marker.status_code == 200
+
+            invalid = await client.post(
+                "/api/channels/join",
+                headers=guest,
+                json={"invite_token": "not-a-valid-invite"},
+            )
+            assert invalid.status_code == 400
+
+    run(scenario())
+
+
+
+def test_private_channel_title_updates_preserve_internal_usernames(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 82111, "private_edit_owner")
+    add_session(path, 82111, "private-edit-owner-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer private-edit-owner-session"}
+            first = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"title": "Private One", "is_public": False},
+            )
+            second = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"title": "Private Two", "is_public": False},
+            )
+            assert first.status_code == 201
+            assert second.status_code == 201
+
+            first_id = first.json()["id"]
+            second_id = second.json()["id"]
+            renamed_first = await client.patch(
+                f"/api/channels/{first_id}",
+                headers=owner,
+                json={"title": "Private One Renamed"},
+            )
+            renamed_second = await client.patch(
+                f"/api/channels/{second_id}",
+                headers=owner,
+                json={"title": "Private Two Renamed"},
+            )
+            assert renamed_first.status_code == 200
+            assert renamed_second.status_code == 200
+            assert renamed_first.json()["username"] == ""
+            assert renamed_second.json()["username"] == ""
+            assert renamed_first.json()["is_public"] is False
+            assert renamed_second.json()["is_public"] is False
+
+            rejected = await client.patch(
+                f"/api/channels/{first_id}",
+                headers=owner,
+                json={"username": "should_not_be_public"},
+            )
+            assert rejected.status_code == 400
+
+    run(scenario())
+
+
+def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    user_id = 82301
+    add_account(api_env, user_id, "saved_user")
+    add_session(path, user_id, "saved-messages-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            headers = {"Authorization": "Bearer saved-messages-session"}
+            sent = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={"recipient_id": user_id, "body": "Note to myself"},
+            )
+            assert sent.status_code == 201
+            assert sent.json()["sender_id"] == user_id
+            assert sent.json()["recipient_id"] == user_id
+
+            history = await client.get(
+                f"/api/messages?with={user_id}",
+                headers=headers,
+            )
+            assert history.status_code == 200
+            assert [item["body"] for item in history.json()["messages"]] == ["Note to myself"]
+
+            conversations = await client.get("/api/conversations", headers=headers)
+            assert conversations.status_code == 200
+            saved = next(item for item in conversations.json()["conversations"] if item["id"] == user_id)
+            assert saved["last_message"] == "Note to myself"
+            assert saved["unread_count"] == 0
+
+    run(scenario())
+
+
+def test_private_channel_invite_uses_configured_public_api_base_url(api_env, monkeypatch) -> None:
+    _path, _auth_store, _fake_bot, app = api_env
+    user_id = 82121
+    add_account(api_env, user_id, "invite_host_owner")
+    add_session(_path, user_id, "invite-host-owner-session")
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://bot-1793554244-6434-weterochina.bothost.tech")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.post(
+                "/api/channels",
+                headers={"Authorization": "Bearer invite-host-owner-session"},
+                json={"title": "Invite Host Test", "is_public": False},
+            )
+            assert response.status_code == 201
+            invite_link = response.json()["invite_link"]
+            assert invite_link.startswith(
+                "https://bot-1793554244-6434-weterochina.bothost.tech/api/channels/invites/"
+            )
+            assert "http://test" not in invite_link
 
     run(scenario())

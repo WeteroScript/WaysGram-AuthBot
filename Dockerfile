@@ -5,7 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     DATABASE_PATH=/data/waysgram_authbot.sqlite3 \
     INTERNAL_API_HOST=0.0.0.0 \
-    INTERNAL_API_PORT=8081
+    INTERNAL_API_PORT=8081 \
+    PUBLIC_API_BASE_URL=https://bot-1793554244-6434-weterochina.bothost.tech
 
 WORKDIR /app
 
