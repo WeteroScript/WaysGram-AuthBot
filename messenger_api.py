@@ -400,10 +400,24 @@ async def init_messenger_storage(database_path: Path) -> None:
                 expires_at INTEGER,
                 max_uses INTEGER,
                 uses INTEGER NOT NULL DEFAULT 0 CHECK(uses >= 0),
+                require_approval INTEGER NOT NULL DEFAULT 0 CHECK(require_approval IN (0,1)),
                 revoked_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_group_invites_group
                 ON group_invites(group_id,created_at DESC);
+            CREATE TABLE IF NOT EXISTS group_join_requests (
+                group_id INTEGER NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                invite_token_hash TEXT NOT NULL,
+                requested_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','approved','declined')),
+                reviewed_by INTEGER,
+                reviewed_at INTEGER,
+                PRIMARY KEY(group_id,telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_group_join_requests_status
+                ON group_join_requests(group_id,status,requested_at);
             CREATE TABLE IF NOT EXISTS contacts (
                 owner_telegram_id INTEGER NOT NULL,
                 contact_telegram_id INTEGER NOT NULL,
@@ -488,6 +502,13 @@ async def init_messenger_storage(database_path: Path) -> None:
         # A database from an older version keeps everything in one file: move the messenger tables out first,
         # because a table left in the main file would hide the one in the messenger file.
         await db_split.migrate_legacy_with(db, database_path)
+        cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(group_invites)")
+        group_invite_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "require_approval" not in group_invite_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.group_invites "
+                "ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0 CHECK(require_approval IN (0,1))"
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(channels)")
         channel_columns = {str(row[1]) for row in await cur.fetchall()}
         if "is_public" not in channel_columns:
