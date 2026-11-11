@@ -25,6 +25,21 @@ def enable_datadog_tracing() -> bool:
     return True
 
 
+
+def install_datadog_log_context() -> None:
+    """Keep Datadog trace correlation fields in logs, even when tracing is disabled."""
+    class DatadogLogContextFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            record.__dict__.setdefault("dd.trace_id", "0")
+            record.__dict__.setdefault("dd.span_id", "0")
+            record.__dict__.setdefault("dd.service", os.getenv("DD_SERVICE", "waysgram-authbot"))
+            record.__dict__.setdefault("dd.env", os.getenv("DD_ENV", "production"))
+            record.__dict__.setdefault("dd.version", os.getenv("DD_VERSION", "unknown"))
+            return True
+
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(DatadogLogContextFilter())
+
 def initialize_observability(app: Any | None = None) -> Any | None:
     """Create one optional PostHog client and attach FastAPI exception middleware."""
     global _POSTHOG_CLIENT
