@@ -8,3 +8,5 @@ uvicorn[standard]>=0.30,<1.0
 cryptography>=43,<48
 Telethon>=1.45,<2.0
 
+posthog
+ddtrace
