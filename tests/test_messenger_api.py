@@ -1642,7 +1642,7 @@ def test_private_channel_invite_uses_configured_public_api_base_url(api_env, mon
     user_id = 82121
     add_account(api_env, user_id, "invite_host_owner")
     add_session(_path, user_id, "invite-host-owner-session")
-    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://authbot.waysgram.example")
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://bot-1793554244-6434-weterochina.bothost.tech")
 
     async def scenario() -> None:
         async with await client_for(app) as client:
@@ -1654,7 +1654,7 @@ def test_private_channel_invite_uses_configured_public_api_base_url(api_env, mon
             assert response.status_code == 201
             invite_link = response.json()["invite_link"]
             assert invite_link.startswith(
-                "https://authbot.waysgram.example/api/channels/invites/"
+                "https://bot-1793554244-6434-weterochina.bothost.tech/api/channels/invites/"
             )
             assert "http://test" not in invite_link
 
