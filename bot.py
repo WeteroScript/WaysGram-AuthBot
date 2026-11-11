@@ -773,6 +773,10 @@ async def init_admin_storage() -> None:
             await db.execute("ALTER TABLE accounts ADD COLUMN avatar_media_id TEXT NOT NULL DEFAULT ''")
         if "bio" not in account_columns:
             await db.execute("ALTER TABLE accounts ADD COLUMN bio TEXT NOT NULL DEFAULT ''")
+        cur = await db.execute("PRAGMA table_info(user_gifts)")
+        user_gift_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "telegram_gift_id" not in user_gift_columns:
+            await db.execute("ALTER TABLE user_gifts ADD COLUMN telegram_gift_id TEXT NOT NULL DEFAULT ''")
         await db.commit()
 
 
@@ -1023,6 +1027,7 @@ async def admin_telegram_gifts_page(page: int) -> tuple[str, InlineKeyboardMarku
     if not rows:
         body += "\n\nКаталог пока не загружен. Проверьте BOT_TOKEN и повторите."
     keyboard = [[(telegram_gift_label(row), f"wgadm:tggift:{row['id']}")] for row in chunk]
+    keyboard.append([("➕ Добавить по Telegram Gift ID", "wgadm:tgadd")])
     navigation = []
     if page > 0:
         navigation.append(("⬅️ Назад", f"wgadm:tggifts:{page - 1}"))
@@ -1525,6 +1530,9 @@ async def admin_callback(callback: CallbackQuery) -> None:
         page = int(parts[2]) if len(parts) >= 3 and parts[2].lstrip("-").isdigit() else 0
         body, keyboard = await admin_telegram_gifts_page(page)
         await callback.message.answer(body, reply_markup=keyboard)
+    elif action == "tgadd":
+        ADMIN_INPUT[ADMIN_ID] = ("tgadd_id", None)
+        await callback.message.answer("Отправьте Telegram Gift ID из синхронизированного каталога. Название вводить не нужно.")
     elif action == "tggift" and len(parts) == 3:
         card = await admin_telegram_gift_card(parts[2])
         if card:
@@ -1838,6 +1846,27 @@ async def admin_text_input(message: Message) -> None:
         if card:
             await message.answer(card[0], reply_markup=card[1])
 
+    elif kind == "tgadd_id":
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", value):
+            await message.answer("Некорректный Telegram Gift ID. Отправьте ID без пробелов.")
+            return
+        row = next((item for item in await telegram_gift_rows() if str(item["id"]) == value), None)
+        if row is None:
+            await message.answer("Такого ID нет в синхронизированном каталоге Telegram. Обновите каталог и проверьте ID.")
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                """INSERT OR IGNORE INTO telegram_gift_prices
+                   (gift_id,price_stars,supply,sold,updated_at) VALUES(?,0,0,0,?)""",
+                (value, int(time.time())),
+            )
+            await db.commit()
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        card = await admin_telegram_gift_card(value)
+        if card:
+            await message.answer("Telegram Gift ID добавлен в управление.\n\n" + card[0], reply_markup=card[1])
+        else:
+            await message.answer("Подарок не найден. Обновите каталог.")
     elif kind in ("tgprice", "tgsupply"):
         try:
             amount = int(value)
