@@ -4,6 +4,16 @@ import asyncio
 import json
 import logging
 import os
+from waysgram_observability import (
+    enable_datadog_tracing,
+    initialize_observability,
+    install_datadog_log_context,
+    shutdown_observability,
+    track_event,
+)
+
+enable_datadog_tracing()
+
 import random
 import re
 import secrets
@@ -66,9 +76,10 @@ EMOJI = ["🐱", "🐶", "🦊", "🐼", "🐸", "🐵", "🐧", "🐰", "🦁",
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s | dd.trace_id=%(dd.trace_id)s dd.span_id=%(dd.span_id)s dd.service=%(dd.service)s dd.env=%(dd.env)s dd.version=%(dd.version)s",
 )
 log = logging.getLogger("waysgram-authbot")
+install_datadog_log_context()
 
 TEXT: dict[str, dict[str, str]] = {
     "ru": {
@@ -1832,6 +1843,7 @@ async def admin_text_input(message: Message) -> None:
                 ),
             )
             await db.commit()
+        track_event("balance_credited", {"asset": asset})
         ADMIN_INPUT.pop(ADMIN_ID, None)
         await message.answer(f"Начислено {amount} {asset.upper()}. Новый баланс: {balance}.")
         card = await admin_account_card(user_id)
@@ -2433,6 +2445,7 @@ async def main() -> None:
     if not INTERNAL_API_TOKEN:
         log.warning("INTERNAL_API_TOKEN is not set; backend API endpoints will reject requests")
 
+    initialize_observability(app)
     config = uvicorn.Config(
         app,
         host=INTERNAL_API_HOST,
@@ -2449,6 +2462,7 @@ async def main() -> None:
             except Exception as exc:
                 log.warning("Could not disconnect MTProto client (%s)", type(exc).__name__)
         await bot.session.close()
+        shutdown_observability()
 
 
 if __name__ == "__main__":
