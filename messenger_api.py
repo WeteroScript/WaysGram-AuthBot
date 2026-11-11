@@ -3031,7 +3031,8 @@ def build_messenger_router(
                           m.forwarded_from_telegram_id,m.forwarded_from_message_id,
                           COALESCE(a.display_name,a.username,'Пользователь') AS original_sender_name
                    FROM messages m
-                   LEFT JOIN accounts a ON a.telegram_id=m.sender_telegram_id
+                   LEFT JOIN accounts a
+                     ON a.telegram_id=COALESCE(m.forwarded_from_telegram_id,m.sender_telegram_id)
                    WHERE m.id=? AND (m.sender_telegram_id=? OR m.recipient_telegram_id=?)""",
                 (message_id, uid, uid),
             )
