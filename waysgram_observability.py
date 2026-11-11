@@ -40,6 +40,35 @@ def install_datadog_log_context() -> None:
     for handler in logging.getLogger().handlers:
         handler.addFilter(DatadogLogContextFilter())
 
+
+_SENSITIVE_PROPERTY_NAMES = frozenset({
+    "$ip", "ip", "$current_url", "$pathname", "$current_path", "$url",
+    "url", "path", "http.url", "http.target", "$user_agent", "$raw_user_agent",
+    "authorization", "cookie", "token", "phone", "email", "user_id",
+    "telegram_id", "body", "message", "exception_message",
+})
+
+
+def _sanitize_posthog_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Remove request identifiers and content from automatic exception events."""
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: scrub(item)
+                for key, item in value.items()
+                if key.lower() not in _SENSITIVE_PROPERTY_NAMES
+                and not key.lower().startswith("$geoip_")
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    properties = event.get("properties")
+    if isinstance(properties, dict):
+        event["properties"] = scrub(properties)
+    return event
+
+
 def initialize_observability(app: Any | None = None) -> Any | None:
     """Create one optional PostHog client and attach FastAPI exception middleware."""
     global _POSTHOG_CLIENT
@@ -66,6 +95,7 @@ def initialize_observability(app: Any | None = None) -> Any | None:
             enable_exception_autocapture=True,
             capture_exception_code_variables=False,
             disable_geoip=True,
+            before_send=_sanitize_posthog_event,
         )
         if app is not None:
             try:
