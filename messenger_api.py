@@ -1150,6 +1150,97 @@ def build_messenger_router(
             "url": f"/api/media/{media_id}",
         }
 
+    @router.get("/api/media/shared")
+    async def list_shared_media(
+        scope: str = Query(...),
+        peer_id: int = Query(..., gt=0),
+        kind: str | None = Query(default=None),
+        before_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=50, ge=1, le=100),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        if kind not in (None, "image", "video", "audio", "document"):
+            raise HTTPException(status_code=400, detail="kind: image, video, audio, document или без фильтра")
+        if scope == "dm":
+            async with aiosqlite.connect(db_path()) as db:
+                cur = await db.execute("SELECT is_banned FROM accounts WHERE telegram_id=?", (peer_id,))
+                target = await cur.fetchone()
+                if target is None:
+                    raise HTTPException(status_code=404, detail="Собеседник не найден")
+                if target[0]:
+                    raise HTTPException(status_code=403, detail="Аккаунт собеседника недоступен")
+        elif scope == "group":
+            async with aiosqlite.connect(db_path()) as db:
+                await require_group_member(db, peer_id, uid)
+        else:
+            await require_channel_access(peer_id, uid)
+
+        mime_clause = ""
+        if kind == "image":
+            mime_clause = "AND lower(a.mime_type) LIKE 'image/%'"
+        elif kind == "video":
+            mime_clause = "AND lower(a.mime_type) LIKE 'video/%'"
+        elif kind == "audio":
+            mime_clause = "AND lower(a.mime_type) LIKE 'audio/%'"
+        elif kind == "document":
+            mime_clause = """AND lower(a.mime_type) NOT LIKE 'image/%'
+                             AND lower(a.mime_type) NOT LIKE 'video/%'
+                             AND lower(a.mime_type) NOT LIKE 'audio/%'"""
+
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            if scope == "dm":
+                cur = await db.execute(
+                    f"""SELECT m.id AS message_id,m.sender_telegram_id AS sender_id,
+                               m.recipient_telegram_id AS recipient_id,m.body,m.media_id,
+                               a.mime_type AS media_type,a.original_name AS media_name,m.created_at
+                        FROM messages m JOIN media_assets a ON a.id=m.media_id
+                        WHERE ((m.sender_telegram_id=? AND m.recipient_telegram_id=?) OR
+                               (m.sender_telegram_id=? AND m.recipient_telegram_id=?))
+                          AND m.media_id IS NOT NULL AND (?=0 OR m.id<?)
+                          {mime_clause}
+                        ORDER BY m.id DESC LIMIT ?""",
+                    (uid, peer_id, peer_id, uid, before_id, before_id, limit),
+                )
+            elif scope == "group":
+                cur = await db.execute(
+                    f"""SELECT m.id AS message_id,m.sender_telegram_id AS sender_id,
+                               m.body,m.media_id,a.mime_type AS media_type,
+                               a.original_name AS media_name,m.created_at
+                        FROM group_messages m JOIN media_assets a ON a.id=m.media_id
+                        WHERE m.group_id=? AND m.media_id IS NOT NULL
+                          AND (?=0 OR m.id<?) {mime_clause}
+                        ORDER BY m.id DESC LIMIT ?""",
+                    (peer_id, before_id, before_id, limit),
+                )
+            else:
+                cur = await db.execute(
+                    f"""SELECT m.id AS message_id,m.author_telegram_id AS sender_id,
+                               m.body,m.media_id,a.mime_type AS media_type,
+                               a.original_name AS media_name,m.created_at
+                        FROM channel_messages m JOIN media_assets a ON a.id=m.media_id
+                        WHERE m.channel_id=? AND m.media_id IS NOT NULL
+                          AND (?=0 OR m.id<?) {mime_clause}
+                        ORDER BY m.id DESC LIMIT ?""",
+                    (peer_id, before_id, before_id, limit),
+                )
+            rows = [dict(row) for row in await cur.fetchall()]
+        for row in rows:
+            row["url"] = f"/api/media/{row['media_id']}"
+        return {
+            "scope": scope,
+            "peer_id": peer_id,
+            "kind": kind or "all",
+            "media": rows,
+            "count": len(rows),
+            "has_more": len(rows) == limit,
+            "next_before_id": int(rows[-1]["message_id"]) if rows else 0,
+        }
+
     @router.get("/api/media/{media_id}")
     async def download_media(
         media_id: str,
@@ -1392,7 +1483,7 @@ def build_messenger_router(
                 "session_refresh", "session_management", "cloud_drafts", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
                 "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages",
-                "image_uploads", "document_uploads", "message_media", "private_media_downloads",
+                "image_uploads", "document_uploads", "message_media", "shared_media", "private_media_downloads",
                 "long_poll_messages",
                 "botfather", "bot_commands", "bot_runtime", "stars", "grams",
             ],
