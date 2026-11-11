@@ -1890,7 +1890,8 @@ def build_messenger_router(
         user_id: int,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        await current_user(authorization)
+        viewer = await current_user(authorization)
+        viewer_id = int(viewer["telegram_id"])
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -1909,8 +1910,36 @@ def build_messenger_router(
                 (user_id,),
             )
             gifts = [dict(item) for item in await cur.fetchall()]
+            cur = await db.execute(
+                """SELECT g.id,g.username,g.title,
+                          (SELECT COUNT(*) FROM group_members count_members
+                           WHERE count_members.group_id=g.id) AS member_count
+                   FROM group_members viewer_member
+                   JOIN group_members target_member
+                     ON target_member.group_id=viewer_member.group_id
+                   JOIN chat_groups g ON g.id=viewer_member.group_id
+                   WHERE viewer_member.telegram_id=? AND target_member.telegram_id=?
+                   ORDER BY g.id DESC LIMIT 50""",
+                (viewer_id, user_id),
+            )
+            common_groups = [dict(item) for item in await cur.fetchall()]
+            cur = await db.execute(
+                """SELECT a.telegram_id AS id,a.username,a.display_name,a.avatar_media_id
+                   FROM contacts viewer_contact
+                   JOIN contacts target_contact
+                     ON target_contact.contact_telegram_id=viewer_contact.contact_telegram_id
+                    AND target_contact.owner_telegram_id=?
+                   JOIN accounts a ON a.telegram_id=viewer_contact.contact_telegram_id
+                   WHERE viewer_contact.owner_telegram_id=? AND a.is_banned=0
+                   ORDER BY lower(a.display_name),lower(a.username),a.telegram_id
+                   LIMIT 50""",
+                (user_id, viewer_id),
+            )
+            common_contacts = [dict(item) for item in await cur.fetchall()]
         profile = dict(row)
         profile["gifts"] = gifts
+        profile["common_groups"] = common_groups
+        profile["common_contacts"] = common_contacts
         return profile
 
     async def settle_due_auctions(db: Any, now: int) -> int:
