@@ -1996,3 +1996,51 @@ def test_cloud_drafts_sync_and_enforce_chat_access(api_env) -> None:
             )).json()["draft"] is None
 
     run(scenario())
+
+
+def test_contact_notes_are_private_and_removed_with_contact(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 95201, "note_owner")
+    add_account(api_env, 95202, "note_contact")
+    add_session(path, 95201, "note-owner-session")
+    add_session(path, 95202, "note-contact-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer note-owner-session"}
+            contact = {"Authorization": "Bearer note-contact-session"}
+            added = await client.post("/api/contacts", headers=owner, json={"user_id": 95202})
+            assert added.status_code == 201
+            saved = await client.put(
+                "/api/contacts/95202/note", headers=owner,
+                json={"note": "Met through the WaysGram project"},
+            )
+            assert saved.status_code == 200
+            owner_list = await client.get("/api/contacts", headers=owner)
+            assert owner_list.status_code == 200
+            assert owner_list.json()["contacts"][0]["note"] == "Met through the WaysGram project"
+
+            # The other account has a separate contact record and cannot read this note.
+            reverse_added = await client.post("/api/contacts", headers=contact, json={"user_id": 95201})
+            assert reverse_added.status_code == 201
+            reverse_list = await client.get("/api/contacts", headers=contact)
+            assert reverse_list.status_code == 200
+            assert reverse_list.json()["contacts"][0]["note"] == ""
+
+            invalid = await client.put(
+                "/api/contacts/95202/note", headers=owner, json={"note": "x" * 501},
+            )
+            assert invalid.status_code == 400
+            removed = await client.delete("/api/contacts/95202", headers=owner)
+            assert removed.status_code == 200
+            readded = await client.post("/api/contacts", headers=owner, json={"user_id": 95202})
+            assert readded.status_code == 201
+            cleared = await client.get("/api/contacts", headers=owner)
+            assert cleared.json()["contacts"][0]["note"] == ""
+
+            not_a_contact = await client.put(
+                "/api/contacts/95202/note", headers=contact, json={"note": "Not permitted"},
+            )
+            assert not_a_contact.status_code == 404
+
+    run(scenario())
