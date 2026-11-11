@@ -249,13 +249,16 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89201, "longpoll_sender")
     add_account(api_env, 89202, "longpoll_recipient")
+    add_account(api_env, 89203, "longpoll_outsider")
     add_session(path, 89201, "longpoll-sender-session")
     add_session(path, 89202, "longpoll-recipient-session")
+    add_session(path, 89203, "longpoll-outsider-session")
 
     async def scenario() -> None:
         async with await client_for(app) as client:
             sender = {"Authorization": "Bearer longpoll-sender-session"}
             recipient = {"Authorization": "Bearer longpoll-recipient-session"}
+            outsider = {"Authorization": "Bearer longpoll-outsider-session"}
 
             initial = await client.post(
                 "/api/messages",
@@ -264,6 +267,12 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
             )
             assert initial.status_code == 201
             initial_id = initial.json()["id"]
+
+            sender_conversations = await client.get("/api/conversations", headers=sender)
+            assert sender_conversations.status_code == 200
+            assert sender_conversations.json()["conversations"][0]["unread_count"] == 0
+            assert (await client.get("/api/events?after_id=0", headers=sender)).json()["events"] == []
+            assert (await client.get("/api/events?after_id=0", headers=outsider)).json()["events"] == []
 
             initial_conversations = await client.get("/api/conversations", headers=recipient)
             assert initial_conversations.status_code == 200
@@ -309,6 +318,12 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
             )
             refreshed_conversations = await client.get("/api/conversations", headers=recipient)
             assert refreshed_conversations.json()["conversations"][0]["unread_count"] == 2
+            assert (await client.get(
+                f"/api/events?after_id={event_cursor}", headers=sender
+            )).json()["events"] == []
+            assert (await client.get(
+                f"/api/events?after_id={event_cursor}", headers=outsider
+            )).json()["events"] == []
 
             invalid_wait = await client.get(
                 f"/api/messages?with=89201&after_id={next_message.json()['id']}&wait_seconds=21",
