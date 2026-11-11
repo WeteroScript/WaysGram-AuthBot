@@ -61,6 +61,30 @@ class ObservabilityTests(unittest.TestCase):
             },
         )
 
+    def test_exception_event_sanitizer_removes_identifiers_and_content(self) -> None:
+        event = {
+            "event": "$exception",
+            "properties": {
+                "$exception_list": [
+                    {
+                        "type": "ValueError",
+                        "message": "private user input",
+                        "stacktrace": {"frames": []},
+                    }
+                ],
+                "$current_url": "https://example.test/api/users/123",
+                "$ip": "192.0.2.1",
+                "surface": "backend",
+            },
+        }
+        sanitized = observability._sanitize_posthog_event(event)
+        self.assertIsNotNone(sanitized)
+        properties = sanitized["properties"]
+        self.assertNotIn("$current_url", properties)
+        self.assertNotIn("$ip", properties)
+        self.assertNotIn("message", properties["$exception_list"][0])
+        self.assertEqual(properties["surface"], "backend")
+
     def test_event_name_is_validated(self) -> None:
         client = Mock()
         observability._POSTHOG_CLIENT = client
