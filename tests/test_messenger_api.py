@@ -1668,3 +1668,135 @@ def test_private_channel_invite_uses_configured_public_api_base_url(api_env, mon
             assert "http://test" not in invite_link
 
     run(scenario())
+
+def test_message_reactions_cover_direct_group_channel_access_and_limits(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89401, "reaction_owner")
+    add_account(api_env, 89402, "reaction_peer")
+    add_account(api_env, 89403, "reaction_outsider")
+    add_session(path, 89401, "reaction-owner-session")
+    add_session(path, 89402, "reaction-peer-session")
+    add_session(path, 89403, "reaction-outsider-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer reaction-owner-session"}
+            peer = {"Authorization": "Bearer reaction-peer-session"}
+            outsider = {"Authorization": "Bearer reaction-outsider-session"}
+
+            direct = await client.post(
+                "/api/messages",
+                headers=owner,
+                json={"recipient_id": 89402, "body": "react to this direct message"},
+            )
+            assert direct.status_code == 201
+            direct_id = direct.json()["id"]
+            direct_path = f"/api/messages/{direct_id}/reactions"
+
+            invalid = await client.post(direct_path, headers=peer, json={"reaction": "🔥"})
+            assert invalid.status_code == 400
+
+            hidden = await client.post(direct_path, headers=outsider, json={"reaction": "👍"})
+            assert hidden.status_code == 404
+
+            first = await client.post(direct_path, headers=peer, json={"reaction": "👍"})
+            second = await client.post(direct_path, headers=peer, json={"reaction": "❤️"})
+            third = await client.post(direct_path, headers=peer, json={"reaction": "😂"})
+            assert first.status_code == second.status_code == third.status_code == 200
+            assert first.json()["status"] == "added"
+            assert first.json()["my_reactions"] == ["👍"]
+            assert {item["reaction"] for item in third.json()["reactions"]} == {"👍", "❤️", "😂"}
+
+            over_limit = await client.post(direct_path, headers=peer, json={"reaction": "😮"})
+            assert over_limit.status_code == 409
+
+            removed = await client.post(direct_path, headers=peer, json={"reaction": "👍"})
+            assert removed.status_code == 200
+            assert removed.json()["status"] == "removed"
+            assert "👍" not in removed.json()["my_reactions"]
+
+            after_remove = await client.post(direct_path, headers=peer, json={"reaction": "😮"})
+            assert after_remove.status_code == 200
+            direct_history = await client.get("/api/messages?with=89402", headers=owner)
+            assert direct_history.status_code == 200
+            direct_summary = direct_history.json()["messages"][0]["reaction_summary"]
+            assert "❤️:1" in direct_summary
+            assert "😂:1" in direct_summary
+            assert "😮:1" in direct_summary
+            assert "👍" not in direct_summary
+
+            group = await client.post(
+                "/api/groups",
+                headers=owner,
+                json={"title": "Reaction group", "username": "reaction_group"},
+            )
+            assert group.status_code == 201
+            group_id = group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=owner,
+                json={"telegram_id": 89402},
+            )
+            assert joined.status_code == 201
+
+            group_message = await client.post(
+                f"/api/groups/{group_id}/messages",
+                headers=owner,
+                json={"body": "react to the group message"},
+            )
+            assert group_message.status_code == 201
+            group_id_message = group_message.json()["id"]
+            group_reaction_path = (
+                f"/api/groups/{group_id}/messages/{group_id_message}/reactions"
+            )
+            group_reaction = await client.post(
+                group_reaction_path,
+                headers=peer,
+                json={"reaction": "🎉"},
+            )
+            assert group_reaction.status_code == 200
+            assert group_reaction.json()["reactions"] == [{"reaction": "🎉", "count": 1}]
+
+            denied_group_reaction = await client.post(
+                group_reaction_path,
+                headers=outsider,
+                json={"reaction": "🙏"},
+            )
+            assert denied_group_reaction.status_code == 403
+
+            group_history = await client.get(
+                f"/api/groups/{group_id}/messages",
+                headers=owner,
+            )
+            assert group_history.status_code == 200
+            assert group_history.json()["messages"][0]["reaction_summary"] == "🎉:1"
+
+            channel = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"username": "reaction_channel", "title": "Reaction channel"},
+            )
+            assert channel.status_code == 201
+            channel_id = channel.json()["id"]
+            channel_message = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+                json={"body": "react to the channel post"},
+            )
+            assert channel_message.status_code == 201
+            channel_reaction = await client.post(
+                f"/api/channels/{channel_id}/messages/{channel_message.json()['id']}/reactions",
+                headers=owner,
+                json={"reaction": "🙏"},
+            )
+            assert channel_reaction.status_code == 200
+            assert channel_reaction.json()["reactions"] == [{"reaction": "🙏", "count": 1}]
+
+            channel_history = await client.get(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+            )
+            assert channel_history.status_code == 200
+            assert channel_history.json()["messages"][0]["reaction_summary"] == "🙏:1"
+
+    run(scenario())
