@@ -2363,3 +2363,134 @@ def test_public_profile_shows_only_mutual_contacts_and_common_groups(api_env) ->
             assert "token" not in str(profile)
 
     run(scenario())
+
+
+
+def test_shared_media_history_filters_and_enforces_access(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 95601, "shared_owner")
+    add_account(api_env, 95602, "shared_peer")
+    add_account(api_env, 95603, "shared_outsider")
+    add_session(path, 95601, "shared-owner-session")
+    add_session(path, 95602, "shared-peer-session")
+    add_session(path, 95603, "shared-outsider-session")
+
+    image_buffer = BytesIO()
+    Image.new("RGB", (4, 4), (40, 90, 160)).save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer shared-owner-session"}
+            peer = {"Authorization": "Bearer shared-peer-session"}
+            outsider = {"Authorization": "Bearer shared-outsider-session"}
+
+            first_upload = await client.post(
+                "/api/media/images", headers={**owner, "Content-Type": "image/png"}, content=image_bytes,
+            )
+            second_upload = await client.post(
+                "/api/media/images", headers={**owner, "Content-Type": "image/png"}, content=image_bytes,
+            )
+            assert first_upload.status_code == second_upload.status_code == 201
+            first_media_id = first_upload.json()["id"]
+            second_media_id = second_upload.json()["id"]
+
+            first_message = await client.post(
+                "/api/messages", headers=owner,
+                json={"recipient_id": 95602, "media_id": first_media_id},
+            )
+            second_message = await client.post(
+                "/api/messages", headers=peer,
+                json={"recipient_id": 95601, "media_id": second_media_id},
+            )
+            assert first_message.status_code == second_message.status_code == 201
+
+            first_page = await client.get(
+                "/api/media/shared", headers=owner,
+                params={"scope": "dm", "peer_id": 95602, "kind": "image", "limit": 1},
+            )
+            assert first_page.status_code == 200
+            assert first_page.json()["count"] == 1
+            assert first_page.json()["has_more"] is True
+            assert first_page.json()["media"][0]["media_type"] == "image/png"
+            assert first_page.json()["media"][0]["url"].startswith("/api/media/")
+            second_page = await client.get(
+                "/api/media/shared", headers=owner,
+                params={
+                    "scope": "dm", "peer_id": 95602,
+                    "kind": "image", "before_id": first_page.json()["next_before_id"],
+                },
+            )
+            assert second_page.status_code == 200
+            assert second_page.json()["count"] == 1
+            assert second_page.json()["has_more"] is False
+            assert first_page.json()["media"][0]["message_id"] > second_page.json()["media"][0]["message_id"]
+
+            document_filter = await client.get(
+                "/api/media/shared", headers=owner,
+                params={"scope": "dm", "peer_id": 95602, "kind": "document"},
+            )
+            assert document_filter.status_code == 200 and document_filter.json()["count"] == 0
+            outsider_dm = await client.get(
+                "/api/media/shared", headers=outsider,
+                params={"scope": "dm", "peer_id": 95601},
+            )
+            assert outsider_dm.status_code == 200 and outsider_dm.json()["count"] == 0
+
+            # Group media is visible to members but not outsiders.
+            group = await client.post(
+                "/api/groups", headers=owner,
+                json={"title": "Shared Media Group", "username": "shared_media_group"},
+            )
+            assert group.status_code == 201
+            group_id = group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members", headers=owner,
+                json={"telegram_id": 95602},
+            )
+            assert joined.status_code == 201
+            group_post = await client.post(
+                f"/api/groups/{group_id}/messages", headers=owner,
+                json={"media_id": first_media_id},
+            )
+            assert group_post.status_code == 201
+            group_media = await client.get(
+                "/api/media/shared", headers=peer,
+                params={"scope": "group", "peer_id": group_id},
+            )
+            assert group_media.status_code == 200 and group_media.json()["count"] == 1
+            group_denied = await client.get(
+                "/api/media/shared", headers=outsider,
+                params={"scope": "group", "peer_id": group_id},
+            )
+            assert group_denied.status_code == 403
+
+            # Private-channel media requires invite membership.
+            channel = await client.post(
+                "/api/channels", headers=owner,
+                json={"title": "Private Shared Media", "is_public": False},
+            )
+            assert channel.status_code == 201
+            channel_id = channel.json()["id"]
+            channel_post = await client.post(
+                f"/api/channels/{channel_id}/messages", headers=owner,
+                json={"media_id": second_media_id},
+            )
+            assert channel_post.status_code == 201
+            channel_denied = await client.get(
+                "/api/media/shared", headers=peer,
+                params={"scope": "channel", "peer_id": channel_id},
+            )
+            assert channel_denied.status_code == 403
+            joined_channel = await client.post(
+                "/api/channels/join", headers=peer,
+                json={"invite_link": channel.json()["invite_link"]},
+            )
+            assert joined_channel.status_code == 200
+            channel_media = await client.get(
+                "/api/media/shared", headers=peer,
+                params={"scope": "channel", "peer_id": channel_id, "kind": "image"},
+            )
+            assert channel_media.status_code == 200 and channel_media.json()["count"] == 1
+
+    run(scenario())
