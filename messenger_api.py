@@ -255,6 +255,16 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_api_idempotency_created
                 ON api_idempotency_records(created_at);
+            CREATE TABLE IF NOT EXISTS cloud_drafts (
+                owner_telegram_id INTEGER NOT NULL,
+                scope TEXT NOT NULL CHECK(scope IN ('dm','group','channel')),
+                peer_id INTEGER NOT NULL CHECK(peer_id > 0),
+                body TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_telegram_id,scope,peer_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cloud_drafts_updated
+                ON cloud_drafts(owner_telegram_id,updated_at DESC);
             CREATE TABLE IF NOT EXISTS telegram_gift_prices (
                 gift_id TEXT PRIMARY KEY,
                 price_stars INTEGER NOT NULL DEFAULT 0 CHECK(price_stars >= 0),
@@ -1287,6 +1297,32 @@ def build_messenger_router(
             raise HTTPException(status_code=403, detail="Вы не состоите в этой группе")
         return dict(row)
 
+    async def require_cloud_draft_access(scope: str, peer_id: int, telegram_id: int) -> None:
+        if scope == "dm":
+            async with aiosqlite.connect(db_path()) as db:
+                cur = await db.execute(
+                    "SELECT is_banned FROM accounts WHERE telegram_id=?", (peer_id,)
+                )
+                peer = await cur.fetchone()
+                if peer is None:
+                    raise HTTPException(status_code=404, detail="Собеседник не найден")
+                if peer[0]:
+                    raise HTTPException(status_code=403, detail="Аккаунт собеседника недоступен")
+                if peer_id != telegram_id:
+                    cur = await db.execute(
+                        """SELECT 1 FROM blocked_users
+                           WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                              OR (owner_telegram_id=? AND blocked_telegram_id=?) LIMIT 1""",
+                        (telegram_id, peer_id, peer_id, telegram_id),
+                    )
+                    if await cur.fetchone():
+                        raise HTTPException(status_code=403, detail="Нельзя работать с черновиком: пользователь в чёрном списке")
+        elif scope == "group":
+            async with aiosqlite.connect(db_path()) as db:
+                await require_group_member(db, peer_id, telegram_id)
+        elif scope == "channel":
+            await require_channel_access(peer_id, telegram_id)
+
     async def current_bot(authorization: str | None) -> dict[str, Any]:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Требуется токен бота")
@@ -1324,7 +1360,7 @@ def build_messenger_router(
                 "profiles", "direct_messages", "saved_messages", "incremental_messages",
                 "channels", "private_channels", "channel_invites",
                 "incremental_channel_posts", "idempotent_writes",
-                "session_refresh", "session_management", "gifts", "gift_inventory", "gift_transfer",
+                "session_refresh", "session_management", "cloud_drafts", "gifts", "gift_inventory", "gift_transfer",
                 "gift_auctions", "auction_bids", "telegram_gift_catalog",
                 "telegram_gift_sticker_proxy", "groups", "group_members", "group_messages",
                 "image_uploads", "document_uploads", "message_media", "private_media_downloads",
@@ -3728,6 +3764,75 @@ def build_messenger_router(
                 await record_event(db, "dm", value, "read", uid, user_a=uid, user_b=int(peer_id))
             await db.commit()
         return {"last_read_id": value}
+
+    @router.get("/api/drafts")
+    async def get_cloud_draft(
+        scope: str = Query(...),
+        peer_id: int = Query(..., gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        uid = int(user["telegram_id"])
+        await require_cloud_draft_access(scope, peer_id, uid)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT scope,peer_id,body,updated_at FROM cloud_drafts
+                   WHERE owner_telegram_id=? AND scope=? AND peer_id=?""",
+                (uid, scope, peer_id),
+            )
+            row = await cur.fetchone()
+        return {"draft": dict(row) if row is not None else None}
+
+    @router.put("/api/drafts")
+    async def save_cloud_draft(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        scope = payload.get("scope")
+        peer_id = payload.get("peer_id")
+        body = payload.get("body")
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        if isinstance(peer_id, bool) or not isinstance(peer_id, int) or peer_id <= 0:
+            raise HTTPException(status_code=400, detail="peer_id должен быть положительным целым числом")
+        if not isinstance(body, str) or not body.strip() or len(body) > MAX_MESSAGE_LENGTH:
+            raise HTTPException(status_code=400, detail=f"Черновик должен содержать 1–{MAX_MESSAGE_LENGTH} символов")
+        uid = int(user["telegram_id"])
+        await require_cloud_draft_access(str(scope), peer_id, uid)
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute(
+                """INSERT INTO cloud_drafts(owner_telegram_id,scope,peer_id,body,updated_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(owner_telegram_id,scope,peer_id) DO UPDATE SET
+                       body=excluded.body,updated_at=excluded.updated_at""",
+                (uid, str(scope), peer_id, body, now),
+            )
+            await db.commit()
+        return {"scope": str(scope), "peer_id": peer_id, "body": body, "updated_at": now}
+
+    @router.delete("/api/drafts")
+    async def delete_cloud_draft(
+        scope: str = Query(...),
+        peer_id: int = Query(..., gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        if scope not in ("dm", "group", "channel"):
+            raise HTTPException(status_code=400, detail="scope: dm, group или channel")
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "DELETE FROM cloud_drafts WHERE owner_telegram_id=? AND scope=? AND peer_id=?",
+                (uid, scope, peer_id),
+            )
+            deleted = cur.rowcount == 1
+            await db.commit()
+        return {"status": "deleted" if deleted else "not_found", "scope": scope, "peer_id": peer_id}
 
     @router.get("/api/events")
     async def message_changes(
