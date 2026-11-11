@@ -190,9 +190,11 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 **Резервный режим:** если `TELEGRAM_API_ID` или `TELEGRAM_API_HASH` не заданы или MTProto временно недоступен, сервис загружает Bot API `getAvailableGifts`. Это только подарки, доступные для отправки AuthBot, а не полный каталог.
 
-В ответе поле `currency` всегда равно `telegram_stars`. Эти значения не конвертируются во внутренние Stars или Gram WaysGram. `auction: true` обозначает тип подарка из каталога Telegram и не включает покупку в этом read-only каталоге.
+В поле `currency` у исходного каталога указывается `telegram_stars`. Это метаданные Telegram и они не означают, что WaysGram списывает Telegram Stars. В WaysGram-магазине используются отдельные значения `price_stars`, `supply` и `sold`, которые задаёт администратор.
 
-Каталог Telegram хранится отдельно от внутреннего `gift_catalog`: внутренние покупки и инвентарь WaysGram продолжают использовать собственные Gram и собственные серийные номера.
+Каталог Telegram хранится отдельно от внутреннего `gift_catalog`. Покупка через `POST /api/telegram/gifts/{gift_id}/purchase` — это внутренняя операция WaysGram: она списывает внутренние WaysGram Stars, уменьшает остаток магазина и записывает в инвентарь Telegram Gift ID исходного подарка. Она не отправляет подарок в Telegram, не передаёт Telegram collectible и не выполняет on-chain NFT-транзакцию. Повтор с тем же `Idempotency-Key` не списывает баланс повторно.
+
+Управление ценой и остатком Telegram-подарков доступно только в админ-панели AuthBot. Для этого используется действие «Добавить по Telegram Gift ID»; REST-маршрута изменения цены или остатка для Android-приложения нет.
 
 ### Баланс и подарки
 
