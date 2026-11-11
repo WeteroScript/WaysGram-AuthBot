@@ -75,7 +75,7 @@ def test_gifts_are_hidden_until_admin_sets_price_and_supply(env) -> None:
             denied_admin = await client.patch("/api/admin/telegram-gifts/g1", headers=headers(ADMIN), json={"price_stars": 40, "supply": 2})
             assert denied_user.status_code in (404, 405)
             assert denied_admin.status_code in (404, 405)
-            run(bot_module.set_telegram_gift_values("g1", price=40, supply=2))
+            await bot_module.set_telegram_gift_values("g1", price=40, supply=2)
 
             shown = (await client.get("/api/telegram/gifts", headers=headers(101))).json()
             assert [g["id"] for g in shown["gifts"]] == ["g1"]
@@ -90,7 +90,7 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
 
     async def scenario() -> None:
         async with await client_for(app) as client:
-            run(bot_module.set_telegram_gift_values("g1", price=40, supply=2))
+            await bot_module.set_telegram_gift_values("g1", price=40, supply=2)
             bought = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
             assert bought.status_code == 201
             assert bought.json()["stars"] == 5000 - 40
@@ -122,12 +122,12 @@ def test_gift_purchase_rules(env) -> None:
         async with await client_for(app) as client:
             # Not priced: cannot be bought.
             assert (await client.post("/api/telegram/gifts/g2/purchase", headers=headers(101), json={})).status_code == 409
-            run(bot_module.set_telegram_gift_values("g2", price=9000, supply=5))
+            await bot_module.set_telegram_gift_values("g2", price=9000, supply=5)
             # More than the 5000 welcome stars.
             poor = await client.post("/api/telegram/gifts/g2/purchase", headers=headers(101), json={})
             assert poor.status_code == 409
             # Unknown recipient.
-            run(bot_module.set_telegram_gift_values("g1", price=1, supply=5))
+            await bot_module.set_telegram_gift_values("g1", price=1, supply=5)
             assert (await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={"recipient_id": 424242})).status_code == 404
             assert (await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={"recipient_id": "x"})).status_code == 400
             # Nothing was charged by the failed attempts.
@@ -216,7 +216,7 @@ def test_telegram_gift_purchase_is_idempotent(env) -> None:
 
     async def scenario() -> None:
         async with await client_for(app) as client:
-            run(bot_module.set_telegram_gift_values("g1", price=40, supply=2))
+            await bot_module.set_telegram_gift_values("g1", price=40, supply=2)
             key = "wg-telegram-gift-buy-0001"
             first = await client.post(
                 "/api/telegram/gifts/g1/purchase",
