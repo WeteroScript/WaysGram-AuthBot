@@ -2063,7 +2063,8 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at
+                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at,
+                          upgrade_level,attributes_json
                    FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
                 (int(user["telegram_id"]),),
             )
@@ -2315,7 +2316,8 @@ def build_messenger_router(
             if row is None:
                 raise HTTPException(status_code=404, detail="Пользователь не найден")
             cur = await db.execute(
-                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at
+                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at,
+                          upgrade_level,attributes_json
                    FROM user_gifts
                    WHERE owner_telegram_id=?
                    ORDER BY id DESC LIMIT 50""",
@@ -3092,6 +3094,13 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
             cur = await db.execute(
+                "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала снимите подарок с продажи")
+            cur = await db.execute(
                 "UPDATE user_gifts SET owner_telegram_id=? WHERE id=? AND owner_telegram_id=?",
                 (target_id, int(gift["id"]), uid),
             )
@@ -3122,7 +3131,8 @@ def build_messenger_router(
         before_id: int = Query(default=0, ge=0),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        await current_user(authorization)
+        viewer = await current_user(authorization)
+        viewer_id = int(viewer["telegram_id"])
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -3136,7 +3146,7 @@ def build_messenger_router(
                    WHERE l.status='active' AND l.seller_telegram_id<>?
                      AND (?=0 OR l.id<?)
                    ORDER BY l.id DESC LIMIT ?""",
-                (int((await current_user(authorization))["telegram_id"]), before_id, before_id, limit),
+                (viewer_id, before_id, before_id, limit),
             )
             rows = await cur.fetchall()
         items = []
@@ -3348,6 +3358,13 @@ def build_messenger_router(
             if gift is None:
                 await db.rollback()
                 raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала снимите подарок с продажи")
             if not str(gift["telegram_gift_id"] or ""):
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Этот подарок нельзя улучшить")
