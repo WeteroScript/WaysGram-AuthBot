@@ -1469,6 +1469,25 @@ def test_private_channels_hide_content_until_invite_join(api_env) -> None:
             assert private["invite_link"].startswith("http://test/api/channels/invites/")
             channel_id = private["id"]
 
+            private_post = await client.post(
+                f"/api/channels/{channel_id}/messages",
+                headers=owner,
+                json={"body": "Private event payload"},
+            )
+            assert private_post.status_code == 201
+            private_event = await client.delete(
+                f"/api/channels/{channel_id}/messages/{private_post.json()['id']}",
+                headers=owner,
+            )
+            assert private_event.status_code == 200
+
+            events_before_join = await client.get("/api/events?after_id=0", headers=guest)
+            assert events_before_join.status_code == 200
+            assert not any(
+                event.get("scope") == "channel" and event.get("chat_id") == channel_id
+                for event in events_before_join.json()["events"]
+            )
+
             preview = await client.get(private["invite_link"])
             assert preview.status_code == 200
             assert preview.json()["channel_id"] == channel_id
@@ -1500,6 +1519,13 @@ def test_private_channels_hide_content_until_invite_join(api_env) -> None:
             assert joined.status_code == 200
             assert joined.json()["joined"] is True
             assert joined.json()["id"] == channel_id
+
+            events_after_join = await client.get("/api/events?after_id=0", headers=guest)
+            assert events_after_join.status_code == 200
+            assert any(
+                event.get("scope") == "channel" and event.get("chat_id") == channel_id
+                for event in events_after_join.json()["events"]
+            )
 
             visible = await client.get("/api/channels", headers=guest)
             assert any(item["id"] == channel_id and item["is_public"] == 0
