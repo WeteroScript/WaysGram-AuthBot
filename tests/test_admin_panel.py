@@ -204,3 +204,26 @@ def test_admin_balance_credit_sends_system_message(panel) -> None:
     assert len(messages) == 2
     assert "Начислено: +125 Stars" in messages[-1][0]
     assert "Текущий баланс: 5125 Stars" in messages[-1][0]
+
+
+
+def test_admin_adds_telegram_gift_by_id(panel) -> None:
+    path, store = panel
+    gifts = [
+        {"id": "g1", "sticker": {"file_id": "f1", "file_unique_id": "u1", "type": "regular",
+                                 "width": 512, "height": 512, "is_animated": False, "is_video": False,
+                                 "emoji": "🎁", "mime_type": "image/webp"}, "star_count": 25},
+        {"id": "g2", "sticker": {"file_id": "f2", "file_unique_id": "u2", "type": "regular",
+                                 "width": 512, "height": 512, "is_animated": False, "is_video": False,
+                                 "emoji": "🧸", "mime_type": "image/webp"}, "star_count": 50},
+    ]
+    run(messenger_api.store_telegram_gifts(path, gifts, int(time.time())))
+
+    prompt = press("wgadm:tgadd")
+    assert "Telegram Gift ID" in prompt.sent[0][0]
+    invalid = type_text("unknown-id")
+    assert "нет в синхронизированном каталоге" in invalid.sent[-1][0]
+    added = type_text("g2")
+    assert "добавлен в управление" in added.sent[0][0]
+    assert "ID: g2" in added.sent[0][0]
+    assert query(path, "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id='g2'") == [(0, 0)]
