@@ -360,6 +360,15 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_contacts_contact
                 ON contacts(contact_telegram_id,owner_telegram_id);
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                owner_telegram_id INTEGER NOT NULL,
+                blocked_telegram_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_telegram_id,blocked_telegram_id),
+                CHECK(owner_telegram_id<>blocked_telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blocked_users_target
+                ON blocked_users(blocked_telegram_id,owner_telegram_id);
             CREATE TABLE IF NOT EXISTS group_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id INTEGER NOT NULL,
@@ -1596,6 +1605,74 @@ def build_messenger_router(
                 raise HTTPException(status_code=404, detail="Контакт не найден")
             await db.commit()
         return {"status": "removed", "user_id": user_id}
+
+    @router.get("/api/blocks")
+    async def list_blocked_users(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT a.telegram_id AS id,a.username,a.display_name,a.avatar_media_id,b.created_at
+                   FROM blocked_users b JOIN accounts a ON a.telegram_id=b.blocked_telegram_id
+                   WHERE b.owner_telegram_id=?
+                   ORDER BY b.created_at DESC,b.blocked_telegram_id""",
+                (uid,),
+            )
+            rows = await cur.fetchall()
+        return {"blocked_users": [dict(row) for row in rows], "count": len(rows)}
+
+    @router.post("/api/blocks", status_code=201)
+    async def block_user(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        target_id = payload.get("user_id")
+        if isinstance(target_id, bool) or not isinstance(target_id, int) or target_id <= 0:
+            raise HTTPException(status_code=400, detail="Укажите корректный ID пользователя")
+        if target_id == uid:
+            raise HTTPException(status_code=400, detail="Нельзя заблокировать себя")
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT telegram_id AS id,username,display_name,avatar_media_id
+                   FROM accounts WHERE telegram_id=? AND is_banned=0""",
+                (target_id,),
+            )
+            target = await cur.fetchone()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Пользователь не найден")
+            cur = await db.execute(
+                """INSERT OR IGNORE INTO blocked_users(owner_telegram_id,blocked_telegram_id,created_at)
+                   VALUES(?,?,?)""",
+                (uid, target_id, int(time.time())),
+            )
+            added = cur.rowcount == 1
+            await db.commit()
+        return {
+            "status": "blocked" if added else "already_blocked",
+            "user": dict(target),
+        }
+
+    @router.delete("/api/blocks/{user_id}")
+    async def unblock_user(
+        user_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                "DELETE FROM blocked_users WHERE owner_telegram_id=? AND blocked_telegram_id=?",
+                (int(user["telegram_id"]), user_id),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=404, detail="Пользователь не найден в чёрном списке")
+            await db.commit()
+        return {"status": "unblocked", "user_id": user_id}
 
     @router.get("/api/users/{user_id}")
     async def get_user_profile(
@@ -2964,6 +3041,16 @@ def build_messenger_router(
             if recipient[0]:
                 await db.rollback()
                 raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                   LIMIT 1""",
+                (uid, recipient_id, recipient_id, uid),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Нельзя отправить сообщение: пользователь находится в чёрном списке")
             reply_to_id = parse_reply_id(payload)
             if reply_to_id:
                 await require_reply_target(
@@ -3050,6 +3137,16 @@ def build_messenger_router(
             if target[0]:
                 await db.rollback()
                 raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                   LIMIT 1""",
+                (uid, recipient_id, recipient_id, uid),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Нельзя переслать сообщение: пользователь находится в чёрном списке")
             cur = await db.execute(
                 "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND created_at>?",
                 (uid, now - 60),
