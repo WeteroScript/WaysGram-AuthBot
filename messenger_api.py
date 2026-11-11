@@ -2869,7 +2869,7 @@ def build_messenger_router(
             raise HTTPException(status_code=400, detail="Текст сообщения не может быть пустым")
         return _message_body(value)
 
-        @router.put("/api/messages/{message_id}")
+    @router.put("/api/messages/{message_id}")
     @router.patch("/api/messages/{message_id}")
     async def edit_message(
         message_id: int,
@@ -2921,7 +2921,7 @@ def build_messenger_router(
             await db.commit()
         return {"id": message_id, "status": "deleted"}
 
-        @router.put("/api/groups/{group_id}/messages/{message_id}")
+    @router.put("/api/groups/{group_id}/messages/{message_id}")
     @router.patch("/api/groups/{group_id}/messages/{message_id}")
     async def edit_group_message(
         group_id: int,
@@ -2990,7 +2990,7 @@ def build_messenger_router(
             raise HTTPException(status_code=404, detail="Сообщение не найдено")
         return await delete_group_message(int(row[0]), message_id, authorization)
 
-        @router.put("/api/channels/{channel_id}/messages/{message_id}")
+    @router.put("/api/channels/{channel_id}/messages/{message_id}")
     @router.patch("/api/channels/{channel_id}/messages/{message_id}")
     async def edit_channel_message(
         channel_id: int,
