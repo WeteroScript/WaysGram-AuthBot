@@ -294,6 +294,8 @@ def test_removed_telegram_gift_cannot_be_purchased(env, monkeypatch: pytest.Monk
             assert "недоступен" in result.json()["detail"].lower()
             balance = (await client.get("/api/me", headers=headers(101))).json()["stars"]
             assert balance == 5000
+            active_admin_rows = await bot_module.telegram_gift_rows()
+            assert [str(row["id"]) for row in active_admin_rows] == ["g2"]
 
         connection = db_split.sqlite_connect(path)
         try:
@@ -303,6 +305,41 @@ def test_removed_telegram_gift_cannot_be_purchased(env, monkeypatch: pytest.Monk
             assert connection.execute(
                 "SELECT is_available FROM telegram_gift_catalog WHERE gift_id='g1'"
             ).fetchone() == (0,)
+        finally:
+            connection.close()
+
+    run(scenario())
+
+
+
+def test_simultaneous_telegram_gift_purchases_cannot_oversell(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=40, supply=1)
+        async with await client_for(app) as client:
+            async def buy(key: str):
+                return await client.post(
+                    "/api/telegram/gifts/g1/purchase",
+                    headers={**headers(101), "Idempotency-Key": key},
+                    json={},
+                )
+
+            first, second = await asyncio.gather(
+                buy("wg-concurrent-gift-buy-0001"),
+                buy("wg-concurrent-gift-buy-0002"),
+            )
+            assert sorted([first.status_code, second.status_code]) == [201, 409]
+            balance = (await client.get("/api/me", headers=headers(101))).json()["stars"]
+            assert balance == 4960
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert len(inventory) == 1 and inventory[0]["telegram_gift_id"] == "g1"
+
+        connection = db_split.sqlite_connect(path)
+        try:
+            assert connection.execute(
+                "SELECT sold FROM telegram_gift_prices WHERE gift_id='g1'"
+            ).fetchone() == (1,)
         finally:
             connection.close()
 
