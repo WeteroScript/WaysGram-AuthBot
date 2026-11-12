@@ -518,3 +518,91 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
             assert mine[0]["attributes"]["upgrade_source"] == "waysgram_internal"
 
     run(scenario())
+
+def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=40, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+
+            upgraded = await client.post(
+                f"/api/gifts/{serial}/upgrade",
+                headers=headers(101),
+            )
+            assert upgraded.status_code == 200
+            assert upgraded.json()["upgrade_level"] == 1
+
+            # An active marketplace listing locks the gift from chat transfers too.
+            listing = await client.post(
+                f"/api/gifts/{serial}/list",
+                headers=headers(101),
+                json={"price_grams": 5},
+            )
+            assert listing.status_code == 201
+            blocked = await client.post(
+                "/api/messages/gift",
+                headers=headers(101),
+                json={"recipient_id": 102, "serial_number": serial},
+            )
+            assert blocked.status_code == 409
+            cancelled = await client.delete(
+                f"/api/gifts/{serial}/list",
+                headers=headers(101),
+            )
+            assert cancelled.status_code == 200
+
+            key = "wg-chat-gift-send-0001"
+            payload = {
+                "recipient_id": 102,
+                "serial_number": serial,
+                "body": "Подарок для тебя",
+            }
+            sent = await client.post(
+                "/api/messages/gift",
+                headers={**headers(101), "Idempotency-Key": key},
+                json=payload,
+            )
+            retried = await client.post(
+                "/api/messages/gift",
+                headers={**headers(101), "Idempotency-Key": key},
+                json=payload,
+            )
+            assert sent.status_code == 201
+            assert retried.status_code == 201 and retried.json() == sent.json()
+            assert sent.json()["type"] == "gift"
+            assert sent.json()["gift_serial_number"] == serial
+            assert sent.json()["gift_upgrade_level"] == 1
+            assert sent.json()["gift_attributes"]["upgrade_source"] == "waysgram_internal"
+
+            sender_inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            recipient_inventory = (await client.get("/api/me/gifts", headers=headers(102))).json()["gifts"]
+            assert sender_inventory == []
+            assert len(recipient_inventory) == 1
+            assert recipient_inventory[0]["serial_number"] == serial
+            assert recipient_inventory[0]["upgrade_level"] == 1
+
+            sender_history = (await client.get("/api/messages?with=102", headers=headers(101))).json()
+            receiver_history = (await client.get("/api/messages?with=101", headers=headers(102))).json()
+            for history in (sender_history, receiver_history):
+                item = next(message for message in history["messages"] if message["id"] == sent.json()["id"])
+                assert item["gift_serial_number"] == serial
+                assert item["gift_name"] == "🎁"
+                assert item["gift_upgrade_level"] == 1
+                assert item["gift_attributes"]["upgrade_source"] == "waysgram_internal"
+
+            profile = (await client.get("/api/users/102", headers=headers(101))).json()
+            public_gift = profile["gifts"][0]
+            assert public_gift["serial_number"] == serial
+            assert public_gift["upgrade_level"] == 1
+            assert public_gift["attributes"]["upgrade_source"] == "waysgram_internal"
+            assert public_gift["is_listed"] == 0
+
+    run(scenario())
