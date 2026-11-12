@@ -249,6 +249,17 @@ async def init_messenger_storage(database_path: Path) -> None:
                 forwarded_from_telegram_id INTEGER,
                 forwarded_from_message_id INTEGER
             );
+            CREATE TABLE IF NOT EXISTS message_gifts (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                serial_number TEXT NOT NULL,
+                gift_name TEXT NOT NULL,
+                telegram_gift_id TEXT NOT NULL DEFAULT '',
+                upgrade_level INTEGER NOT NULL DEFAULT 0,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_gifts_serial
+                ON message_gifts(serial_number);
             CREATE INDEX IF NOT EXISTS idx_api_messages_pair
                 ON messages(sender_telegram_id, recipient_telegram_id, id);
             CREATE INDEX IF NOT EXISTS idx_api_messages_sender_time
@@ -2328,7 +2339,10 @@ def build_messenger_router(
                 raise HTTPException(status_code=404, detail="Пользователь не найден")
             cur = await db.execute(
                 """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,acquired_at,
-                          upgrade_level,attributes_json
+                          upgrade_level,attributes_json,
+                          EXISTS(SELECT 1 FROM gift_market_listings l
+                                 WHERE l.serial_number=user_gifts.serial_number
+                                   AND l.status='active') AS is_listed
                    FROM user_gifts
                    WHERE owner_telegram_id=?
                    ORDER BY id DESC LIMIT 50""",
@@ -3990,8 +4004,15 @@ def build_messenger_router(
                       FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
                             WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                    (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
-                   (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
-            FROM messages WHERE
+                   (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name,
+                   gift_attachment.serial_number AS gift_serial_number,
+                   gift_attachment.gift_name AS gift_name,
+                   gift_attachment.telegram_gift_id AS gift_telegram_gift_id,
+                   gift_attachment.upgrade_level AS gift_upgrade_level,
+                   gift_attachment.attributes_json AS gift_attributes_json
+            FROM messages
+            LEFT JOIN message_gifts gift_attachment ON gift_attachment.message_id=messages.id
+            WHERE
             ((sender_telegram_id=? AND recipient_telegram_id=?) OR
              (sender_telegram_id=? AND recipient_telegram_id=?))
         """
@@ -4023,6 +4044,13 @@ def build_messenger_router(
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
+        for item in items:
+            raw_attributes = item.pop("gift_attributes_json", None)
+            try:
+                attributes = json.loads(raw_attributes or "{}") if raw_attributes else {}
+            except (TypeError, ValueError):
+                attributes = {}
+            item["gift_attributes"] = attributes if isinstance(attributes, dict) else {}
         await attach_my_reactions(items, "dm", 0, uid)
         async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(
@@ -4176,6 +4204,145 @@ def build_messenger_router(
             str(user.get("display_name") or user.get("username") or "Новое сообщение"),
             body,
             {"scope": "dm", "chat_id": str(uid), "message_id": str(message_id)},
+        )
+        return result
+
+
+    @router.post("/api/messages/gift", status_code=201)
+    async def send_gift_message(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        """Transfer a WaysGram-owned gift and persist its collectible snapshot in a DM."""
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            recipient_id = int(payload.get("recipient_id", 0))
+        except (TypeError, ValueError):
+            recipient_id = 0
+        serial = str(payload.get("serial_number") or "").strip().upper()
+        if recipient_id <= 0 or not GIFT_SERIAL_RE.fullmatch(serial):
+            raise HTTPException(status_code=400, detail="Укажите получателя и корректный серийный номер подарка")
+        if recipient_id == uid:
+            raise HTTPException(status_code=400, detail="Нельзя отправить подарок самому себе")
+        caption_value = str(payload.get("body") or "").strip()
+        body = _message_body(caption_value) if caption_value else "Подарок WaysGram"
+        now = int(time.time())
+        scope = "/api/messages/gift"
+        descriptor = idempotency_descriptor(scope, payload, idempotency_key)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
+            cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?",
+                (recipient_id,),
+            )
+            recipient = await cur.fetchone()
+            if recipient is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Получатель не найден")
+            if recipient["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                   LIMIT 1""",
+                (uid, recipient_id, recipient_id, uid),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Нельзя отправить подарок: пользователь находится в чёрном списке")
+            cur = await db.execute(
+                """SELECT id,gift_name,telegram_gift_id,upgrade_level,attributes_json
+                   FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?""",
+                (serial, uid),
+            )
+            gift = await cur.fetchone()
+            if gift is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала снимите подарок с продажи")
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND created_at>?",
+                (uid, now - 60),
+            )
+            if int((await cur.fetchone())[0]) >= DM_MESSAGES_PER_MINUTE:
+                await db.rollback()
+                raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
+            try:
+                attributes = json.loads(str(gift["attributes_json"] or "{}"))
+            except (TypeError, ValueError):
+                attributes = {}
+            if not isinstance(attributes, dict):
+                attributes = {}
+            attributes_json = json.dumps(attributes, ensure_ascii=False, separators=(",", ":"))
+            cur = await db.execute(
+                "UPDATE user_gifts SET owner_telegram_id=? WHERE id=? AND owner_telegram_id=?",
+                (recipient_id, int(gift["id"]), uid),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Владение подарком уже изменилось")
+            cur = await db.execute(
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (uid, recipient_id, body, now),
+            )
+            message_id = int(cur.lastrowid)
+            gift_name = str(gift["gift_name"])
+            telegram_gift_id = str(gift["telegram_gift_id"] or "")
+            upgrade_level = int(gift["upgrade_level"] or 0)
+            await db.execute(
+                """INSERT INTO message_gifts
+                   (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (message_id, serial, gift_name, telegram_gift_id, upgrade_level, attributes_json, now),
+            )
+            await db.execute(
+                """INSERT INTO gift_transactions
+                   (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
+                   VALUES('chat_send',?,?,?,?,?)""",
+                (serial, gift_name, uid, recipient_id, now),
+            )
+            await record_event(
+                db, "dm", message_id, "new_message", uid,
+                user_a=uid, user_b=recipient_id,
+            )
+            result = {
+                "id": message_id,
+                "status": "sent",
+                "type": "gift",
+                "sender_id": uid,
+                "recipient_id": recipient_id,
+                "body": body,
+                "gift_serial_number": serial,
+                "gift_name": gift_name,
+                "gift_telegram_gift_id": telegram_gift_id,
+                "gift_upgrade_level": upgrade_level,
+                "gift_attributes": attributes,
+                "created_at": now,
+            }
+            await idempotency_store(db, uid, scope, descriptor, result, now)
+            await db.commit()
+        await deliver_push_notifications(
+            [recipient_id],
+            str(user.get("display_name") or user.get("username") or "Новый подарок"),
+            f"Подарок WaysGram: {gift_name}",
+            {"scope": "dm", "chat_id": str(uid), "message_id": str(message_id), "type": "gift"},
         )
         return result
 
