@@ -255,8 +255,7 @@ async def init_messenger_storage(database_path: Path) -> None:
                 gift_name TEXT NOT NULL,
                 telegram_gift_id TEXT NOT NULL DEFAULT '',
                 upgrade_level INTEGER NOT NULL DEFAULT 0,
-                attributes_json TEXT NOT NULL DEFAULT '{}',
-                created_at INTEGER NOT NULL
+                attributes_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_message_gifts_serial
                 ON message_gifts(serial_number);
@@ -4308,9 +4307,9 @@ def build_messenger_router(
             upgrade_level = int(gift["upgrade_level"] or 0)
             await db.execute(
                 """INSERT INTO message_gifts
-                   (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json,created_at)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (message_id, serial, gift_name, telegram_gift_id, upgrade_level, attributes_json, now),
+                   (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
+                   VALUES(?,?,?,?,?,?)""",
+                (message_id, serial, gift_name, telegram_gift_id, upgrade_level, attributes_json),
             )
             await db.execute(
                 """INSERT INTO gift_transactions
