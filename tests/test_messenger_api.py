@@ -386,7 +386,7 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
                 assert listing.json()["count"] == 1
                 assert listing.json()["scheduled_messages"][0]["id"] == scheduled_id
 
-                with sqlite3.connect(path) as db:
+                with db_split.sqlite_connect(path) as db:
                     db.execute(
                         "UPDATE scheduled_messages SET scheduled_at=? WHERE id=?",
                         (int(time.time()) - 1, scheduled_id),
@@ -431,7 +431,7 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
                 assert cancelled.status_code == 200
                 assert cancelled.json()["status"] == "cancelled"
 
-                with sqlite3.connect(path) as db:
+                with db_split.sqlite_connect(path) as db:
                     db.execute(
                         "UPDATE scheduled_messages SET scheduled_at=? WHERE id=?",
                         (int(time.time()) - 1, second.json()["id"]),
