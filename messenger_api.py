@@ -2698,6 +2698,25 @@ def build_messenger_router(
                    VALUES('purchase',?,?,NULL,?,?)""",
                 (serial, title, uid, now),
             )
+            # Telegram-style purchase receipt in the buyer's Saved Messages.
+            # It is committed atomically with the balance debit and inventory item.
+            cur = await db.execute(
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (uid, uid, f"Вы приобрели коллекционный подарок «{title}»", now),
+            )
+            saved_message_id = int(cur.lastrowid)
+            await db.execute(
+                """INSERT INTO message_gifts
+                   (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
+                   VALUES(?,?,?,?,0,'{}')""",
+                (saved_message_id, serial, title, gift_id),
+            )
+            await record_event(
+                db, "dm", saved_message_id, "new_message", uid,
+                user_a=uid, user_b=uid,
+            )
             if owner != uid:
                 await db.execute(
                     """INSERT INTO gift_transactions(event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
@@ -2731,7 +2750,7 @@ def build_messenger_router(
         source = str(state[0]) if state else "telegram_bot_api"
         table = "telegram_mtproto_gift_catalog" if source == "telegram_mtproto" else "telegram_gift_catalog"
         cur = await db.execute(
-            f"SELECT title FROM {table} WHERE gift_id=? AND is_available=1",
+            f"SELECT title FROM {table} WHERE gift_id=?",
             (gift_id,),
         )
         row = await cur.fetchone()
@@ -2760,8 +2779,7 @@ def build_messenger_router(
                               gifts_per_round,auction_start_date,upgrade_variants,background_json,
                               sticker_document_id,sticker_dc_id,sticker_size,position,synced_at
                        FROM telegram_mtproto_gift_catalog
-                       WHERE is_available=1
-                       ORDER BY position ASC"""
+                       ORDER BY is_available DESC, position ASC"""
                 )
                 rows = await cur.fetchall()
             else:
@@ -2773,8 +2791,7 @@ def build_messenger_router(
                               unique_gift_variant_count,background_json,publisher_chat_json,
                               position,synced_at
                        FROM telegram_gift_catalog
-                       WHERE is_available=1
-                       ORDER BY position ASC"""
+                       ORDER BY is_available DESC, position ASC"""
                 )
                 rows = await cur.fetchall()
 
