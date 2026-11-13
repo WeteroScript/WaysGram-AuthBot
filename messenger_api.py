@@ -7005,12 +7005,12 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            membership = await require_group_member(db, group_id, uid)
             previous = await idempotency_lookup(db, uid, scope, descriptor, now)
             if previous is not None:
                 await db.rollback()
                 return previous
 
-            membership = await require_group_member(db, group_id, uid)
             cur = await db.execute("SELECT slow_mode_seconds FROM chat_groups WHERE id=?", (group_id,))
             group_settings = await cur.fetchone()
             slow_mode_seconds = int(group_settings[0]) if group_settings else 0
