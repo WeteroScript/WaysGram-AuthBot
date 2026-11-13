@@ -530,6 +530,56 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
 
     run(scenario())
 
+def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=35, supply=2)
+        async with await client_for(app) as client:
+            key = "wg-saved-gift-purchase-0001"
+            purchase_headers = {**headers(101), "Idempotency-Key": key}
+            purchased = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=purchase_headers,
+                json={},
+            )
+            retried = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=purchase_headers,
+                json={},
+            )
+
+            assert purchased.status_code == 201
+            assert retried.status_code == 201
+            assert retried.json() == purchased.json()
+            assert purchased.json()["price_stars"] == 35
+            assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 5000 - 35
+
+            serial = purchased.json()["gift"]["serial_number"]
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert len(inventory) == 1
+            assert inventory[0]["serial_number"] == serial
+            assert inventory[0]["telegram_gift_id"] == "g1"
+
+            saved = await client.get("/api/messages?with=101", headers=headers(101))
+            assert saved.status_code == 200
+            receipts = [
+                message for message in saved.json()["messages"]
+                if message.get("gift_serial_number") == serial
+            ]
+            assert len(receipts) == 1
+            receipt = receipts[0]
+            assert receipt["sender_id"] == 101
+            assert receipt["recipient_id"] == 101
+            assert receipt["body"] == "Вы приобрели коллекционный подарок «🎁»"
+            assert receipt["gift_name"] == "🎁"
+            assert receipt["gift_telegram_gift_id"] == "g1"
+            assert receipt["gift_upgrade_level"] == 0
+            assert receipt["gift_attributes"] == {}
+
+    run(scenario())
+
+
 def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env) -> None:
     path, app = env
 
