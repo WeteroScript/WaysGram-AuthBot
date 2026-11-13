@@ -2936,7 +2936,7 @@ def build_messenger_router(
             async with aiosqlite.connect(db_path()) as db:
                 cur = await db.execute(
                     """SELECT sticker_file_id,sticker_mime_type
-                       FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1""",
+                       FROM telegram_gift_catalog WHERE gift_id=?""",
                     (gift_id,),
                 )
                 row = await cur.fetchone()
