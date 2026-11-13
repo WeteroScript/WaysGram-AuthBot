@@ -6,6 +6,8 @@ import hashlib
 import sqlite3
 import db_split
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -338,6 +340,97 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
  
  
  
+
+
+
+def test_recurring_scheduled_messages_keep_local_time_across_dst() -> None:
+    zone_name = "Europe/Amsterdam"
+    zone = ZoneInfo(zone_name)
+
+    before_spring_dst = datetime(2026, 3, 28, 9, 15, tzinfo=zone)
+    next_day = messenger_api._next_recurring_scheduled_timestamp(
+        int(before_spring_dst.timestamp()),
+        int(before_spring_dst.timestamp()) + 60,
+        86400,
+        zone_name,
+    )
+    spring_local = datetime.fromtimestamp(next_day, zone)
+    assert (spring_local.month, spring_local.day, spring_local.hour, spring_local.minute) == (
+        3, 29, 9, 15
+    )
+    assert spring_local.utcoffset() != before_spring_dst.utcoffset()
+
+    before_autumn_dst = datetime(2026, 10, 24, 9, 15, tzinfo=zone)
+    next_week = messenger_api._next_recurring_scheduled_timestamp(
+        int(before_autumn_dst.timestamp()),
+        int(before_autumn_dst.timestamp()) + 60,
+        604800,
+        zone_name,
+    )
+    autumn_local = datetime.fromtimestamp(next_week, zone)
+    assert (autumn_local.month, autumn_local.day, autumn_local.hour, autumn_local.minute) == (
+        10, 31, 9, 15
+    )
+    assert autumn_local.utcoffset() != before_autumn_dst.utcoffset()
+
+
+def test_scheduled_messages_store_and_validate_iana_time_zone(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89301, "timezone_sender")
+    add_account(api_env, 89302, "timezone_recipient")
+    add_session(path, 89301, "timezone-sender-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            headers = {"Authorization": "Bearer timezone-sender-session"}
+            scheduled = await client.post(
+                "/api/messages/schedule",
+                headers=headers,
+                json={
+                    "recipient_id": 89302,
+                    "body": "timezone reminder",
+                    "scheduled_at": int(time.time()) + 60,
+                    "repeat_interval_seconds": 86400,
+                    "time_zone": "Europe/Amsterdam",
+                },
+            )
+            assert scheduled.status_code == 201
+            assert scheduled.json()["time_zone"] == "Europe/Amsterdam"
+
+            listing = await client.get(
+                "/api/messages/scheduled?with=89302",
+                headers=headers,
+            )
+            assert listing.status_code == 200
+            assert listing.json()["scheduled_messages"][0]["time_zone"] == "Europe/Amsterdam"
+
+            invalid = await client.post(
+                "/api/messages/schedule",
+                headers=headers,
+                json={
+                    "recipient_id": 89302,
+                    "body": "invalid timezone",
+                    "scheduled_at": int(time.time()) + 60,
+                    "repeat_interval_seconds": 0,
+                    "time_zone": "Mars/Olympus_Mons",
+                },
+            )
+            assert invalid.status_code == 400
+
+            old_client = await client.post(
+                "/api/messages/schedule",
+                headers=headers,
+                json={
+                    "recipient_id": 89302,
+                    "body": "legacy client timezone",
+                    "scheduled_at": int(time.time()) + 60,
+                    "repeat_interval_seconds": 0,
+                },
+            )
+            assert old_client.status_code == 201
+            assert old_client.json()["time_zone"] == "UTC"
+
+    run(scenario())
 
 
 def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> None:
