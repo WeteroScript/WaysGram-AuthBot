@@ -1783,6 +1783,140 @@ def test_group_creation_roles_membership_and_messages(api_env) -> None:
     run(scenario())
 
 
+def test_group_and_channel_photo_video_albums_are_atomic_and_idempotent(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89301, "album_owner")
+    add_account(api_env, 89302, "album_member")
+    add_account(api_env, 89303, "album_outsider")
+    add_session(path, 89301, "album-owner-session")
+    add_session(path, 89302, "album-member-session")
+    add_session(path, 89303, "album-outsider-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer album-owner-session"}
+            member = {"Authorization": "Bearer album-member-session"}
+            outsider = {"Authorization": "Bearer album-outsider-session"}
+
+            uploaded_ids: list[str] = []
+            uploaded_urls: list[str] = []
+            for color in ((20, 80, 140), (140, 80, 20)):
+                image_buffer = BytesIO()
+                Image.new("RGB", (6, 5), color).save(image_buffer, format="JPEG")
+                uploaded = await client.post(
+                    "/api/media/images",
+                    headers={**owner, "Content-Type": "image/jpeg"},
+                    content=image_buffer.getvalue(),
+                )
+                assert uploaded.status_code == 201
+                uploaded_ids.append(uploaded.json()["id"])
+                uploaded_urls.append(uploaded.json()["url"])
+
+            group = await client.post(
+                "/api/groups",
+                headers=owner,
+                json={"title": "Album group", "username": "album_group"},
+            )
+            assert group.status_code == 201
+            group_id = group.json()["id"]
+            joined = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=owner,
+                json={"telegram_id": 89302},
+            )
+            assert joined.status_code == 201
+
+            group_headers = {**owner, "Idempotency-Key": "group-album-test-0001"}
+            group_payload = {"media_ids": uploaded_ids, "body": "Group album caption"}
+            group_album = await client.post(
+                f"/api/groups/{group_id}/messages/album",
+                headers=group_headers,
+                json=group_payload,
+            )
+            assert group_album.status_code == 201
+            group_replay = await client.post(
+                f"/api/groups/{group_id}/messages/album",
+                headers=group_headers,
+                json=group_payload,
+            )
+            assert group_replay.status_code == 201
+            assert group_replay.json()["first_message_id"] == group_album.json()["first_message_id"]
+            assert group_replay.json()["album_id"] == group_album.json()["album_id"]
+
+            group_items = group_album.json()["messages"]
+            assert [item["media_id"] for item in group_items] == uploaded_ids
+            assert [item["media_album_index"] for item in group_items] == [0, 1]
+            assert all(item["media_album_count"] == 2 for item in group_items)
+            assert group_items[0]["media_album_id"] == group_items[1]["media_album_id"]
+            assert group_items[0]["body"] == "Group album caption"
+            assert group_items[1]["body"] == ""
+
+            group_history = await client.get(
+                f"/api/groups/{group_id}/messages",
+                headers=member,
+            )
+            assert group_history.status_code == 200
+            assert [item["media_album_index"] for item in group_history.json()["messages"]] == [0, 1]
+            member_download = await client.get(uploaded_urls[0], headers=member)
+            assert member_download.status_code == 200
+            outsider_post = await client.post(
+                f"/api/groups/{group_id}/messages/album",
+                headers=outsider,
+                json={"media_ids": uploaded_ids},
+            )
+            assert outsider_post.status_code == 403
+            outsider_download = await client.get(uploaded_urls[0], headers=outsider)
+            assert outsider_download.status_code == 404
+
+            channel = await client.post(
+                "/api/channels",
+                headers=owner,
+                json={"username": "album_channel", "title": "Album channel"},
+            )
+            assert channel.status_code == 201
+            channel_id = channel.json()["id"]
+
+            channel_headers = {**owner, "Idempotency-Key": "channel-album-test-0001"}
+            channel_payload = {"media_ids": uploaded_ids, "body": "Channel album caption"}
+            channel_album = await client.post(
+                f"/api/channels/{channel_id}/messages/album",
+                headers=channel_headers,
+                json=channel_payload,
+            )
+            assert channel_album.status_code == 201
+            channel_replay = await client.post(
+                f"/api/channels/{channel_id}/messages/album",
+                headers=channel_headers,
+                json=channel_payload,
+            )
+            assert channel_replay.status_code == 201
+            assert channel_replay.json()["first_message_id"] == channel_album.json()["first_message_id"]
+            channel_items = channel_album.json()["messages"]
+            assert [item["media_id"] for item in channel_items] == uploaded_ids
+            assert [item["media_album_index"] for item in channel_items] == [0, 1]
+            assert all(item["media_album_count"] == 2 for item in channel_items)
+            assert channel_items[0]["media_album_id"] == channel_items[1]["media_album_id"]
+            assert channel_items[0]["body"] == "Channel album caption"
+            assert channel_items[1]["body"] == ""
+
+            forbidden_channel_post = await client.post(
+                f"/api/channels/{channel_id}/messages/album",
+                headers=member,
+                json={"media_ids": uploaded_ids},
+            )
+            assert forbidden_channel_post.status_code == 403
+            channel_history = await client.get(
+                f"/api/channels/{channel_id}/messages",
+                headers=outsider,
+            )
+            assert channel_history.status_code == 200
+            assert [item["media_album_index"] for item in channel_history.json()["messages"]] == [0, 1]
+            public_download = await client.get(uploaded_urls[1], headers=outsider)
+            assert public_download.status_code == 200
+
+    run(scenario())
+
+
 def test_internal_botfather_create_commands_and_message_runtime(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 86001, "bot_owner")
