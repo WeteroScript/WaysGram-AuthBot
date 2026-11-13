@@ -1168,6 +1168,22 @@ def _updated_live_location_json(
     return json.dumps(attachment, ensure_ascii=False, separators=(",", ":"))
 
 
+def _stopped_live_location_json(raw_attachment: str | None, now: int | None = None) -> str:
+    timestamp = int(now or time.time())
+    try:
+        attachment = json.loads(raw_attachment or "")
+    except (TypeError, ValueError):
+        attachment = None
+    if not isinstance(attachment, dict) or attachment.get("type") != "location":
+        raise HTTPException(status_code=409, detail="Сообщение не содержит геопозицию")
+    if int(attachment.get("live_until") or 0) <= timestamp:
+        raise HTTPException(status_code=409, detail="Трансляция геопозиции уже завершена")
+    attachment["live_until"] = timestamp
+    attachment["updated_at"] = timestamp
+    attachment["stopped"] = True
+    return json.dumps(attachment, ensure_ascii=False, separators=(",", ":"))
+
+
 def _message_body(value: str) -> str:
     body = str(value).strip()
     if not body or len(body) > MAX_MESSAGE_LENGTH:
@@ -5897,6 +5913,35 @@ def build_messenger_router(
             await db.commit()
         return {"id": message_id, "attachment_json": updated, "updated_at": now}
 
+    @router.post("/api/messages/{message_id}/location/stop")
+    async def stop_direct_live_location(
+        message_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT sender_telegram_id,recipient_telegram_id,attachment_json FROM messages WHERE id=?",
+                (message_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Сообщение не найдено")
+            if int(row["sender_telegram_id"]) != uid:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Остановить трансляцию может только её отправитель")
+            updated = _stopped_live_location_json(row["attachment_json"], now)
+            await db.execute("UPDATE messages SET attachment_json=? WHERE id=?", (updated, message_id))
+            await record_event(db, "dm", message_id, "location_updated", uid,
+                               user_a=uid, user_b=int(row["recipient_telegram_id"]))
+            await db.commit()
+        return {"id": message_id, "attachment_json": updated, "stopped_at": now}
+
     @router.put("/api/messages/{message_id}")
     @router.patch("/api/messages/{message_id}")
     async def edit_message(
@@ -6009,6 +6054,39 @@ def build_messenger_router(
             await db.commit()
         return {"id": message_id, "group_id": group_id, "attachment_json": updated, "updated_at": now}
 
+    @router.post("/api/groups/{group_id}/messages/{message_id}/location/stop")
+    async def stop_group_live_location(
+        group_id: int,
+        message_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            await require_group_member(db, group_id, uid)
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT sender_telegram_id,attachment_json FROM group_messages WHERE id=? AND group_id=?",
+                (message_id, group_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Сообщение не найдено")
+            if int(row["sender_telegram_id"]) != uid:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Остановить трансляцию может только её отправитель")
+            updated = _stopped_live_location_json(row["attachment_json"], now)
+            await db.execute(
+                "UPDATE group_messages SET attachment_json=? WHERE id=? AND group_id=?",
+                (updated, message_id, group_id),
+            )
+            await record_event(db, "group", message_id, "location_updated", uid, chat_id=group_id)
+            await db.commit()
+        return {"id": message_id, "group_id": group_id, "attachment_json": updated, "stopped_at": now}
+
     @router.put("/api/groups/{group_id}/messages/{message_id}")
     @router.patch("/api/groups/{group_id}/messages/{message_id}")
     async def edit_group_message(
@@ -6113,6 +6191,39 @@ def build_messenger_router(
             await record_event(db, "channel", message_id, "location_updated", uid, chat_id=channel_id)
             await db.commit()
         return {"id": message_id, "channel_id": channel_id, "attachment_json": updated, "updated_at": now}
+
+    @router.post("/api/channels/{channel_id}/messages/{message_id}/location/stop")
+    async def stop_channel_live_location(
+        channel_id: int,
+        message_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        await require_channel_access(channel_id, uid)
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT author_telegram_id,attachment_json FROM channel_messages WHERE id=? AND channel_id=?",
+                (message_id, channel_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Сообщение не найдено")
+            if int(row["author_telegram_id"]) != uid:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Остановить трансляцию может только её автор")
+            updated = _stopped_live_location_json(row["attachment_json"], now)
+            await db.execute(
+                "UPDATE channel_messages SET attachment_json=? WHERE id=? AND channel_id=?",
+                (updated, message_id, channel_id),
+            )
+            await record_event(db, "channel", message_id, "location_updated", uid, chat_id=channel_id)
+            await db.commit()
+        return {"id": message_id, "channel_id": channel_id, "attachment_json": updated, "stopped_at": now}
 
     @router.put("/api/channels/{channel_id}/messages/{message_id}")
     @router.patch("/api/channels/{channel_id}/messages/{message_id}")
