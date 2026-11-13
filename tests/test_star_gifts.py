@@ -441,6 +441,9 @@ def test_gift_market_listing_purchase_and_cancellation(env) -> None:
             )
             assert bought.status_code == 201
             serial = bought.json()["gift"]["serial_number"]
+            upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert upgraded.status_code == 200
+            traits = upgraded.json()["attributes"]["collectible_traits"]
 
             listed = await client.post(
                 f"/api/gifts/{serial}/list",
@@ -467,6 +470,7 @@ def test_gift_market_listing_purchase_and_cancellation(env) -> None:
             assert len(market.json()["listings"]) == 1
             assert market.json()["listings"][0]["listing_id"] == listing_id
             assert market.json()["listings"][0]["price_grams"] == 7
+            assert market.json()["listings"][0]["attributes"]["collectible_traits"] == traits
 
             purchased = await client.post(
                 f"/api/gift-market/{listing_id}/purchase",
@@ -478,6 +482,7 @@ def test_gift_market_listing_purchase_and_cancellation(env) -> None:
             assert (await client.get("/api/me", headers=headers(102))).json()["grams"] == 8
             buyer_inventory = (await client.get("/api/me/gifts", headers=headers(102))).json()["gifts"]
             assert len(buyer_inventory) == 1 and buyer_inventory[0]["serial_number"] == serial
+            assert buyer_inventory[0]["attributes"]["collectible_traits"] == traits
             assert (await client.get("/api/gift-market", headers=headers(101))).json()["count"] == 0
 
             # A sold listing cannot be purchased a second time.
