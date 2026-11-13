@@ -4761,7 +4761,7 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 """SELECT id,sender_telegram_id,recipient_telegram_id,body,silent,
-                          repeat_interval_seconds
+                          scheduled_at,repeat_interval_seconds
                    FROM scheduled_messages
                    WHERE status='pending' AND scheduled_at<=?
                    ORDER BY scheduled_at ASC,id ASC LIMIT 100""",
@@ -4769,7 +4769,7 @@ def build_messenger_router(
             )
             due = await cur.fetchall()
             for scheduled in due:
-                scheduled_id, sender_id, recipient_id, body, silent, repeat_interval = scheduled
+                scheduled_id, sender_id, recipient_id, body, silent, scheduled_at, repeat_interval = scheduled
                 cur = await db.execute(
                     "SELECT is_banned FROM accounts WHERE telegram_id=?",
                     (sender_id,),
@@ -4818,11 +4818,14 @@ def build_messenger_router(
                     user_a=int(sender_id), user_b=int(recipient_id),
                 )
                 if int(repeat_interval) > 0:
+                    next_scheduled_at = int(scheduled_at) + int(repeat_interval)
+                    while next_scheduled_at <= now:
+                        next_scheduled_at += int(repeat_interval)
                     await db.execute(
                         """UPDATE scheduled_messages
                            SET scheduled_at=?,created_at=?,message_id=?,error=''
                            WHERE id=? AND status='pending'""",
-                        (now + int(repeat_interval), now, message_id, scheduled_id),
+                        (next_scheduled_at, now, message_id, scheduled_id),
                     )
                 else:
                     await db.execute(
