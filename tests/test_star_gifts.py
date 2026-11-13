@@ -290,21 +290,32 @@ def test_removed_telegram_gift_cannot_be_purchased(env, monkeypatch: pytest.Monk
                 headers=headers(101),
                 json={},
             )
-            assert result.status_code == 409
-            assert "недоступен" in result.json()["detail"].lower()
+            assert result.status_code == 201
+            assert result.json()["gift"]["telegram_gift_id"] == "g1"
             balance = (await client.get("/api/me", headers=headers(101))).json()["stars"]
-            assert balance == 5000
-            active_admin_rows = await bot_module.telegram_gift_rows()
-            assert [str(row["id"]) for row in active_admin_rows] == ["g2"]
+            assert balance == 4960
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert len(inventory) == 1 and inventory[0]["telegram_gift_id"] == "g1"
+            archived_admin_rows = await bot_module.telegram_gift_rows()
+            assert {str(row["id"]) for row in archived_admin_rows} == {"g1", "g2"}
 
         connection = db_split.sqlite_connect(path)
         try:
             assert connection.execute(
                 "SELECT sold FROM telegram_gift_prices WHERE gift_id='g1'"
-            ).fetchone() == (0,)
+            ).fetchone() == (1,)
             assert connection.execute(
                 "SELECT is_available FROM telegram_gift_catalog WHERE gift_id='g1'"
             ).fetchone() == (0,)
+            receipt = connection.execute(
+                """SELECT m.sender_telegram_id,m.recipient_telegram_id,m.body,mg.serial_number,mg.telegram_gift_id
+                   FROM messages m JOIN message_gifts mg ON mg.message_id=m.id
+                   WHERE m.sender_telegram_id=101 AND m.recipient_telegram_id=101"""
+            ).fetchone()
+            assert receipt is not None
+            assert receipt[0:2] == (101, 101)
+            assert "коллекционный подарок" in receipt[2].lower()
+            assert receipt[4] == "g1"
         finally:
             connection.close()
 
