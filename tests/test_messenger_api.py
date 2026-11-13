@@ -337,6 +337,56 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
 
  
  
+ 
+def test_direct_message_export_respects_private_visibility(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89001, "export_sender")
+    add_account(api_env, 89002, "export_recipient")
+    add_session(path, 89001, "export-sender-session")
+    add_session(path, 89002, "export-recipient-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer export-sender-session"}
+            recipient = {"Authorization": "Bearer export-recipient-session"}
+
+            first = await client.post(
+                "/api/messages", headers=sender,
+                json={"recipient_id": 89002, "body": "visible sender message"},
+            )
+            second = await client.post(
+                "/api/messages", headers=recipient,
+                json={"recipient_id": 89001, "body": "hidden reply for sender"},
+            )
+            assert first.status_code == second.status_code == 201
+
+            hidden = await client.delete(
+                f"/api/messages/{second.json()['id']}?for=me",
+                headers=sender,
+            )
+            assert hidden.status_code == 200
+
+            sender_export = await client.get(
+                "/api/messages/export?with=89002", headers=sender
+            )
+            recipient_export = await client.get(
+                "/api/messages/export?with=89001", headers=recipient
+            )
+            assert sender_export.status_code == recipient_export.status_code == 200
+            assert sender_export.json()["count"] == 1
+            assert "visible sender message" in sender_export.json()["text"]
+            assert "hidden reply for sender" not in sender_export.json()["text"]
+            assert recipient_export.json()["count"] == 2
+            assert "hidden reply for sender" in recipient_export.json()["text"]
+
+            missing = await client.get(
+                "/api/messages/export?with=89999", headers=sender
+            )
+            assert missing.status_code == 404
+
+    run(scenario())
+
+
 def test_clear_direct_message_history_only_hides_messages_for_current_account(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 88901, "clear_sender")
