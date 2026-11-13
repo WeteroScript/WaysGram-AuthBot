@@ -4833,6 +4833,58 @@ def build_messenger_router(
             "channel", channel_id, message_id, int(user["telegram_id"]), str(payload.get("reaction") or "")
         )
 
+    @router.delete("/api/conversations/{peer_id}/messages")
+    async def clear_direct_message_history(
+        peer_id: int,
+        delete_for: str = Query(default="me", alias="for"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if peer_id <= 0:
+            raise HTTPException(status_code=400, detail="Укажите корректного собеседника")
+        if delete_for != "me":
+            raise HTTPException(status_code=400, detail="Очистка истории поддерживает только for=me")
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT 1 FROM accounts WHERE telegram_id=?",
+                (peer_id,),
+            )
+            if await cur.fetchone() is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Собеседник не найден")
+            cur = await db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(id),0) FROM messages
+                   WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
+                          (sender_telegram_id=? AND recipient_telegram_id=?))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM message_hidden_for hidden
+                         WHERE hidden.message_id=messages.id AND hidden.telegram_id=?
+                     )""",
+                (uid, peer_id, peer_id, uid, uid),
+            )
+            count, latest_message_id = await cur.fetchone()
+            now = int(time.time())
+            if int(count) > 0:
+                await db.execute(
+                    """INSERT OR IGNORE INTO message_hidden_for(message_id,telegram_id,hidden_at)
+                       SELECT id,?,? FROM messages
+                       WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
+                              (sender_telegram_id=? AND recipient_telegram_id=?))""",
+                    (uid, now, uid, peer_id, peer_id, uid),
+                )
+                await record_event(
+                    db, "dm", int(latest_message_id), "clear_for_me", uid,
+                    user_a=uid, user_b=peer_id,
+                )
+            await db.commit()
+        return {
+            "status": "cleared_for_me",
+            "peer_id": peer_id,
+            "deleted_count": int(count),
+        }
+
     @router.put("/api/messages/{message_id}")
     @router.patch("/api/messages/{message_id}")
     async def edit_message(
@@ -5308,8 +5360,8 @@ def build_messenger_router(
                     """SELECT id,scope,chat_id,user_a,user_b,message_id,kind,actor_id,created_at
                        FROM message_events
                        WHERE id>? AND (
-                           (kind='delete_for_me' AND actor_id=?)
-                           OR (kind<>'delete_for_me' AND actor_id<>?)
+                           (kind IN ('delete_for_me','clear_for_me') AND actor_id=?)
+                           OR (kind NOT IN ('delete_for_me','clear_for_me') AND actor_id<>?)
                        ) AND (
                            (scope='dm' AND (user_a=? OR user_b=?))
                            OR (scope='group' AND chat_id IN (SELECT group_id FROM group_members WHERE telegram_id=?))
