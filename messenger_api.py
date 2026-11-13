@@ -1807,7 +1807,7 @@ def build_messenger_router(
 
         range_header = request.headers.get("range", "").strip()
         if range_header.lower().startswith("bytes="):
-            match = re.fullmatch(r"bytes=(\\d*)-(\\d*)", range_header, flags=re.IGNORECASE)
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header, flags=re.IGNORECASE)
             if match is None or (not match.group(1) and not match.group(2)):
                 return Response(
                     status_code=416,
@@ -1815,6 +1815,11 @@ def build_messenger_router(
                 )
 
             first, last = match.groups()
+            if len(first) > 20 or len(last) > 20:
+                return Response(
+                    status_code=416,
+                    headers={**response_headers, "Content-Range": f"bytes */{file_size}"},
+                )
             if not first:
                 suffix_length = int(last)
                 if suffix_length <= 0 or file_size <= 0:
