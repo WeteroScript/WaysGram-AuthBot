@@ -35,7 +35,9 @@ SCHEMA = "messenger"
 MESSENGER_TABLES = frozenset(
     {
         "messages",
+        "message_hidden_for",
         "message_events",
+        "scheduled_messages",
         "read_markers",
         "media_assets",
         "api_idempotency_records",
