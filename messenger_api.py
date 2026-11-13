@@ -4106,6 +4106,80 @@ def build_messenger_router(
             "next_after_id": items[-1]["id"] if items else 0,
         }
 
+    @router.get("/api/messages/export")
+    async def export_direct_messages(
+        peer: int = Query(alias="with", gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT username,display_name FROM accounts WHERE telegram_id=?",
+                (peer,),
+            )
+            peer_row = await cur.fetchone()
+            if peer_row is None:
+                raise HTTPException(status_code=404, detail="Собеседник не найден")
+            cur = await db.execute(
+                """SELECT m.id,m.sender_telegram_id AS sender_id,
+                          m.recipient_telegram_id AS recipient_id,m.body,m.created_at,
+                          m.edited_at,m.media_id,media.original_name AS media_name,
+                          gift.serial_number AS gift_serial_number,
+                          gift.gift_name AS gift_name,
+                          COALESCE(sender.display_name,sender.username,'Пользователь') AS sender_name
+                   FROM messages m
+                   LEFT JOIN media_assets media ON media.id=m.media_id
+                   LEFT JOIN message_gifts gift ON gift.message_id=m.id
+                   LEFT JOIN accounts sender ON sender.telegram_id=m.sender_telegram_id
+                   WHERE ((m.sender_telegram_id=? AND m.recipient_telegram_id=?) OR
+                          (m.sender_telegram_id=? AND m.recipient_telegram_id=?))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM message_hidden_for hidden
+                         WHERE hidden.message_id=m.id AND hidden.telegram_id=?
+                     )
+                   ORDER BY m.id DESC LIMIT 1000""",
+                (uid, peer, peer, uid, uid),
+            )
+            rows = [dict(row) for row in await cur.fetchall()]
+        rows.reverse()
+        peer_name = str(peer_row["display_name"] or peer_row["username"] or peer)
+        output = [
+            f"WaysGram — экспорт переписки: {peer_name}",
+            "Время указано в UTC.",
+            "",
+        ]
+        truncated = len(rows) == 1000
+        for row in rows:
+            timestamp = time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC",
+                time.gmtime(int(row["created_at"])),
+            )
+            sender_name = str(row["sender_name"] or "Пользователь")
+            body = str(row["body"] or "")
+            line = f"[{timestamp}] {sender_name}: {body}"
+            if row["media_name"]:
+                line += f" [Вложение: {str(row['media_name'])[:160]}]"
+            if row["gift_serial_number"]:
+                line += (
+                    f" [Подарок: {str(row['gift_name'] or 'WaysGram')}"
+                    f" · {str(row['gift_serial_number'])}]"
+                )
+            if row["edited_at"]:
+                line += " [изменено]"
+            if sum(len(part) for part in output) + len(line) + 1 > 200_000:
+                truncated = True
+                break
+            output.append(line)
+        return {
+            "peer_id": peer,
+            "peer_name": peer_name,
+            "count": min(len(rows), max(0, len(output) - 3)),
+            "truncated": truncated,
+            "text": "\n".join(output),
+        }
+
     @router.get("/api/messages/search")
     async def search_messages(
         peer: int = Query(alias="with", gt=0),
