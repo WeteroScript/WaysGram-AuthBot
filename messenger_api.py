@@ -4098,7 +4098,7 @@ def build_messenger_router(
                 db.row_factory = aiosqlite.Row
                 if after_id:
                     cur = await db.execute(
-                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,
+                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,attachment_json,
                                   (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
                                   (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT group_concat(reaction || ':' || reaction_count, ',')
@@ -4113,7 +4113,7 @@ def build_messenger_router(
                     )
                 else:
                     cur = await db.execute(
-                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,
+                        """SELECT id,channel_id,author_telegram_id AS author_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,attachment_json,
                                   (SELECT body FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_body,
                                   (SELECT author_telegram_id FROM channel_messages AS replied WHERE replied.id=channel_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT group_concat(reaction || ':' || reaction_count, ',')
@@ -4173,7 +4173,8 @@ def build_messenger_router(
                                            WHERE scope='channel' AND chat_id=channel_messages.channel_id
                                              AND message_id=channel_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=channel_messages.media_id) AS media_type,
-                          (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name
+                          (SELECT original_name FROM media_assets WHERE id=channel_messages.media_id) AS media_name,
+                          attachment_json
                    FROM channel_messages
                    WHERE channel_id=? AND body LIKE ? COLLATE NOCASE
                    ORDER BY id DESC LIMIT 100""",
@@ -4200,6 +4201,7 @@ def build_messenger_router(
         if not await can_manage_channel(channel_id, uid):
             raise HTTPException(status_code=403, detail="Публиковать в канале может только владелец или администратор")
         now = int(time.time())
+        attachment_json = _message_attachment_json(payload.get("attachment"), now)
         scope = f"/api/channels/{channel_id}/messages"
         descriptor = idempotency_descriptor(scope, payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
@@ -4226,15 +4228,15 @@ def build_messenger_router(
                 raise HTTPException(status_code=429, detail="Превышен лимит публикаций")
             cur = await db.execute(
                 """INSERT INTO channel_messages
-                   (channel_id,author_telegram_id,body,media_id,reply_to_id,created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (channel_id, uid, body, media_id, reply_to_id, now),
+                   (channel_id,author_telegram_id,body,media_id,reply_to_id,attachment_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (channel_id, uid, body, media_id, reply_to_id, attachment_json, now),
             )
             message_id = int(cur.lastrowid)
             await record_event(
                 db, "channel", message_id, "new_message", uid, chat_id=channel_id,
             )
-            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "reply_to_id": reply_to_id, **media_fields, "created_at": now}
+            result = {"id": message_id, "status": "published", "channel_id": channel_id, "author_id": uid, "body": body, "media_id": media_id, "attachment_json": attachment_json, "reply_to_id": reply_to_id, **media_fields, "created_at": now}
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
         async with aiosqlite.connect(db_path()) as db:
@@ -4483,7 +4485,7 @@ def build_messenger_router(
         base = """
             SELECT id,sender_telegram_id AS sender_id,
                    recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
-                   media_album_id,media_album_index,media_album_count,
+                   attachment_json,media_album_id,media_album_index,media_album_count,
                    forwarded_from_telegram_id,forwarded_from_message_id,
                    (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                    (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
@@ -4654,7 +4656,7 @@ def build_messenger_router(
             cur = await db.execute(
                 """SELECT id,sender_telegram_id AS sender_id,
                           recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
-                          forwarded_from_telegram_id,forwarded_from_message_id,
+                          attachment_json,forwarded_from_telegram_id,forwarded_from_message_id,
                           (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                    (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
                    (SELECT sender_telegram_id FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_sender_id,
@@ -4662,7 +4664,8 @@ def build_messenger_router(
                       FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
                             WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                           (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
-                          (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
+                          (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name,
+                          attachment_json
                    FROM messages
                    WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
                           (sender_telegram_id=? AND recipient_telegram_id=?))
@@ -4701,6 +4704,7 @@ def build_messenger_router(
         if not isinstance(silent, bool):
             raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
         now = int(time.time())
+        attachment_json = _message_attachment_json(payload.get("attachment"), now)
         descriptor = idempotency_descriptor("/api/messages", payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -4750,9 +4754,9 @@ def build_messenger_router(
                 raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
             cur = await db.execute(
                 """INSERT INTO messages
-                   (sender_telegram_id,recipient_telegram_id,body,media_id,reply_to_id,created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (uid, recipient_id, body, media_id, reply_to_id, now),
+                   (sender_telegram_id,recipient_telegram_id,body,media_id,reply_to_id,attachment_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (uid, recipient_id, body, media_id, reply_to_id, attachment_json, now),
             )
             message_id = int(cur.lastrowid)
             await record_event(
@@ -4766,6 +4770,7 @@ def build_messenger_router(
                 "recipient_id": recipient_id,
                 "body": body,
                 "media_id": media_id,
+                "attachment_json": attachment_json,
                 "reply_to_id": reply_to_id,
                 **media_fields,
                 "created_at": now,
@@ -6982,7 +6987,7 @@ def build_messenger_router(
                 db.row_factory = aiosqlite.Row
                 if after_id:
                     cur = await db.execute(
-                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,
+                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,attachment_json,
                                   (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
                                   (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT group_concat(reaction || ':' || reaction_count, ',')
@@ -6996,7 +7001,7 @@ def build_messenger_router(
                     )
                 else:
                     cur = await db.execute(
-                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,
+                        """SELECT id,group_id,sender_telegram_id AS sender_id,body,media_id,media_album_id,media_album_index,media_album_count,edited_at,reply_to_id,created_at,attachment_json,
                                   (SELECT body FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_body,
                                   (SELECT sender_telegram_id FROM group_messages AS replied WHERE replied.id=group_messages.reply_to_id) AS reply_to_sender_id,
                                   (SELECT group_concat(reaction || ':' || reaction_count, ',')
@@ -7040,7 +7045,8 @@ def build_messenger_router(
                                            WHERE scope='group' AND chat_id=group_messages.group_id
                                              AND message_id=group_messages.id GROUP BY reaction)) AS reaction_summary,
                                   (SELECT mime_type FROM media_assets WHERE id=group_messages.media_id) AS media_type,
-                          (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name
+                          (SELECT original_name FROM media_assets WHERE id=group_messages.media_id) AS media_name,
+                          attachment_json
                    FROM group_messages
                    WHERE group_id=? AND body LIKE ? COLLATE NOCASE
                    ORDER BY id DESC LIMIT 100""",
@@ -7064,6 +7070,7 @@ def build_messenger_router(
         body_value = str(payload.get("body") or "")
         body = _message_body(body_value) if body_value.strip() or not media_id else ""
         now = int(time.time())
+        attachment_json = _message_attachment_json(payload.get("attachment"), now)
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             membership = await require_group_member(db, group_id, uid)
@@ -7109,9 +7116,9 @@ def build_messenger_router(
                 raise HTTPException(status_code=429, detail="Превышен лимит отправки сообщений")
             cur = await db.execute(
                 """INSERT INTO group_messages
-                   (group_id,sender_telegram_id,body,media_id,reply_to_id,created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (group_id, uid, body, media_id, reply_to_id, now),
+                   (group_id,sender_telegram_id,body,media_id,reply_to_id,attachment_json,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (group_id, uid, body, media_id, reply_to_id, attachment_json, now),
             )
             message_id = int(cur.lastrowid)
             await record_event(
@@ -7136,6 +7143,7 @@ def build_messenger_router(
             "sender_id": uid,
             "body": body,
             "media_id": media_id,
+            "attachment_json": attachment_json,
             "reply_to_id": reply_to_id,
             **media_fields,
             "created_at": now,
