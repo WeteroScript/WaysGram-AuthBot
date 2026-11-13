@@ -4377,7 +4377,11 @@ def build_messenger_router(
         if isinstance(scheduled_at, bool) or not isinstance(scheduled_at, int):
             raise HTTPException(status_code=400, detail="scheduled_at должен быть Unix timestamp")
         repeat_interval = payload.get("repeat_interval_seconds", 0)
-        if isinstance(repeat_interval, bool) or repeat_interval not in (0, 86400, 604800):
+        if (
+            isinstance(repeat_interval, bool)
+            or not isinstance(repeat_interval, int)
+            or repeat_interval not in (0, 86400, 604800)
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="repeat_interval_seconds: 0, 86400 или 604800",
