@@ -4143,6 +4143,9 @@ def build_messenger_router(
         media_id = str(payload.get("media_id") or "").strip() or None
         body_value = str(payload.get("body") or "")
         body = _message_body(body_value) if body_value.strip() or not media_id else ""
+        silent = payload.get("silent", False)
+        if not isinstance(silent, bool):
+            raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
         now = int(time.time())
         descriptor = idempotency_descriptor("/api/messages", payload, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
@@ -4215,12 +4218,13 @@ def build_messenger_router(
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
             await db.commit()
-        await deliver_push_notifications(
-            [recipient_id],
-            str(user.get("display_name") or user.get("username") or "Новое сообщение"),
-            body,
-            {"scope": "dm", "chat_id": str(uid), "message_id": str(message_id)},
-        )
+        if not silent:
+            await deliver_push_notifications(
+                [recipient_id],
+                str(user.get("display_name") or user.get("username") or "Новое сообщение"),
+                body,
+                {"scope": "dm", "chat_id": str(uid), "message_id": str(message_id)},
+            )
         return result
 
 
