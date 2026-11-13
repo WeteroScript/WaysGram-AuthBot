@@ -171,7 +171,7 @@ def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
 def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str, str, str]:
     """Validate an allowlisted document, audio, video or archive without unpacking it."""
     safe_name = str(filename or "document").replace("\\", "/").rsplit("/", 1)[-1]
-    safe_name = re.sub(r"[\\x00-\\x1f\\x7f]", "", safe_name).strip(" .")[:120]
+    safe_name = re.sub(r"[\x00-\x1f\x7f]", "", safe_name).strip(" .")[:120]
     if not safe_name:
         safe_name = "document"
     extension = Path(safe_name).suffix.lower()
@@ -186,8 +186,8 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
             decoded = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ValueError("Текстовые документы должны быть в UTF-8") from exc
-        if "\\x00" in decoded or any(
-            ord(char) < 32 and char not in "\\t\\n\\r" for char in decoded
+        if "\x00" in decoded or any(
+            ord(char) < 32 and char not in "\t\n\r" for char in decoded
         ):
             raise ValueError("Текстовый документ содержит недопустимые управляющие символы")
         normalized = decoded.encode("utf-8")
@@ -201,12 +201,12 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
         return raw, mime_type, extension, safe_name
 
     if extension == ".webm":
-        if len(raw) < 4 or not raw.startswith(b"\\x1a\\x45\\xdf\\xa3"):
+        if len(raw) < 4 or not raw.startswith(b"\x1a\x45\xdf\xa3"):
             raise ValueError("Файл не является корректным WebM")
         return raw, "video/webm", extension, safe_name
 
     if extension == ".mkv":
-        if len(raw) < 4 or not raw.startswith(b"\\x1a\\x45\\xdf\\xa3"):
+        if len(raw) < 4 or not raw.startswith(b"\x1a\x45\xdf\xa3"):
             raise ValueError("Файл не является корректным Matroska")
         return raw, "video/x-matroska", extension, safe_name
 
@@ -233,7 +233,7 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
         return raw, "audio/wav", extension, safe_name
 
     if extension == ".zip":
-        if len(raw) < 4 or raw[:4] not in (b"PK\\x03\\x04", b"PK\\x05\\x06", b"PK\\x07\\x08"):
+        if len(raw) < 4 or raw[:4] not in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
             raise ValueError("Файл не является корректным ZIP-архивом")
         return raw, "application/zip", extension, safe_name
 
@@ -1523,7 +1523,7 @@ def build_messenger_router(
         incoming = bytearray()
         async for chunk in request.stream():
             if len(incoming) + len(chunk) > MAX_DOCUMENT_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="Размер документа превышает 10 МБ")
+                raise HTTPException(status_code=413, detail="Размер вложения превышает 25 МБ")
             incoming.extend(chunk)
         if not incoming:
             raise HTTPException(status_code=400, detail="Файл документа пуст")
