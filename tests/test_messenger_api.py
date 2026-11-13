@@ -447,6 +447,85 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
                     "**scheduled** message"
                 ]
 
+                recurring = await client.post(
+                    "/api/messages/schedule",
+                    headers=sender,
+                    json={
+                        "recipient_id": 89202,
+                        "body": "daily reminder",
+                        "scheduled_at": int(time.time()) + 60,
+                        "repeat_interval_seconds": 86400,
+                        "silent": True,
+                    },
+                )
+                assert recurring.status_code == 201
+                assert recurring.json()["repeat_interval_seconds"] == 86400
+                with db_split.sqlite_connect(path) as db:
+                    db.execute(
+                        "UPDATE scheduled_messages SET scheduled_at=? WHERE id=?",
+                        (int(time.time()) - 1, recurring.json()["id"]),
+                    )
+                    db.commit()
+
+                deadline = time.monotonic() + 4
+                recurring_history = None
+                while time.monotonic() < deadline:
+                    recurring_history = await client.get(
+                        "/api/messages?with=89202",
+                        headers=sender,
+                    )
+                    if recurring_history.status_code == 200 and len(
+                        recurring_history.json()["messages"]
+                    ) >= 2:
+                        break
+                    await asyncio.sleep(0.1)
+                assert recurring_history is not None
+                assert [item["body"] for item in recurring_history.json()["messages"]] == [
+                    "**scheduled** message", "daily reminder"
+                ]
+
+                recurring_list = await client.get(
+                    "/api/messages/scheduled?with=89202",
+                    headers=sender,
+                )
+                assert recurring_list.status_code == 200
+                assert recurring_list.json()["count"] == 1
+                recurring_item = recurring_list.json()["scheduled_messages"][0]
+                assert recurring_item["id"] == recurring.json()["id"]
+                assert recurring_item["status"] == "pending"
+                assert recurring_item["repeat_interval_seconds"] == 86400
+                assert recurring_item["scheduled_at"] >= int(time.time()) + 86390
+
+                recurring_cancel = await client.delete(
+                    f"/api/messages/scheduled/{recurring.json()['id']}",
+                    headers=sender,
+                )
+                assert recurring_cancel.status_code == 200
+                with db_split.sqlite_connect(path) as db:
+                    db.execute(
+                        "UPDATE scheduled_messages SET scheduled_at=? WHERE id=?",
+                        (int(time.time()) - 1, recurring.json()["id"]),
+                    )
+                    db.commit()
+                await asyncio.sleep(1.2)
+                final_history = await client.get(
+                    "/api/messages?with=89202",
+                    headers=sender,
+                )
+                assert len(final_history.json()["messages"]) == 2
+
+                invalid_repeat = await client.post(
+                    "/api/messages/schedule",
+                    headers=sender,
+                    json={
+                        "recipient_id": 89202,
+                        "body": "invalid repeat",
+                        "scheduled_at": int(time.time()) + 60,
+                        "repeat_interval_seconds": 3600,
+                    },
+                )
+                assert invalid_repeat.status_code == 400
+
                 too_soon = await client.post(
                     "/api/messages/schedule",
                     headers=sender,
