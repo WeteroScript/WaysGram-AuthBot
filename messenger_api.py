@@ -299,7 +299,10 @@ async def init_messenger_storage(database_path: Path) -> None:
                 body TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 forwarded_from_telegram_id INTEGER,
-                forwarded_from_message_id INTEGER
+                forwarded_from_message_id INTEGER,
+                media_album_id TEXT,
+                media_album_index INTEGER NOT NULL DEFAULT 0,
+                media_album_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS message_gifts (
                 message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -758,6 +761,18 @@ async def init_messenger_storage(database_path: Path) -> None:
                     await db.execute(f"ALTER TABLE {db_split.SCHEMA}.messages ADD COLUMN forwarded_from_telegram_id INTEGER")
                 if "forwarded_from_message_id" not in columns:
                     await db.execute(f"ALTER TABLE {db_split.SCHEMA}.messages ADD COLUMN forwarded_from_message_id INTEGER")
+                if "media_album_id" not in columns:
+                    await db.execute(f"ALTER TABLE {db_split.SCHEMA}.messages ADD COLUMN media_album_id TEXT")
+                if "media_album_index" not in columns:
+                    await db.execute(
+                        f"ALTER TABLE {db_split.SCHEMA}.messages "
+                        "ADD COLUMN media_album_index INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "media_album_count" not in columns:
+                    await db.execute(
+                        f"ALTER TABLE {db_split.SCHEMA}.messages "
+                        "ADD COLUMN media_album_count INTEGER NOT NULL DEFAULT 0"
+                    )
         # Read marks arrived in a later version: whatever existed before them counts as read, once.
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.user_version")
         if int((await cur.fetchone())[0]) < 1:
@@ -4139,6 +4154,7 @@ def build_messenger_router(
         base = """
             SELECT id,sender_telegram_id AS sender_id,
                    recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
+                   media_album_id,media_album_index,media_album_count,
                    forwarded_from_telegram_id,forwarded_from_message_id,
                    (SELECT display_name FROM accounts WHERE telegram_id=messages.forwarded_from_telegram_id) AS forwarded_from_display_name,
                    (SELECT body FROM messages AS replied WHERE replied.id=messages.reply_to_id) AS reply_to_body,
@@ -4433,6 +4449,170 @@ def build_messenger_router(
                 str(user.get("display_name") or user.get("username") or "Новое сообщение"),
                 body,
                 {"scope": "dm", "chat_id": str(uid), "message_id": str(message_id)},
+            )
+        return result
+
+
+    @router.post("/api/messages/album", status_code=201)
+    async def send_message_album(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        """Create a photo/video album as one atomic send and one push notification."""
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            recipient_id = int(payload.get("recipient_id", payload.get("to", 0)))
+        except (TypeError, ValueError):
+            recipient_id = 0
+        if recipient_id <= 0:
+            raise HTTPException(status_code=400, detail="Укажите корректного получателя")
+
+        raw_media_ids = payload.get("media_ids")
+        if not isinstance(raw_media_ids, list) or not 2 <= len(raw_media_ids) <= 10:
+            raise HTTPException(status_code=400, detail="Альбом должен содержать от 2 до 10 файлов")
+        media_ids: list[str] = []
+        for raw_id in raw_media_ids:
+            media_id = str(raw_id or "").strip()
+            if not re.fullmatch(r"[a-f0-9]{32}", media_id):
+                raise HTTPException(status_code=400, detail="Некорректный ID вложения в альбоме")
+            media_ids.append(media_id)
+        if len(set(media_ids)) != len(media_ids):
+            raise HTTPException(status_code=400, detail="Альбом не должен содержать повторяющиеся файлы")
+
+        body_value = str(payload.get("body") or "")
+        body = _message_body(body_value) if body_value.strip() else "Медиаальбом"
+        silent = payload.get("silent", False)
+        if not isinstance(silent, bool):
+            raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
+        now = int(time.time())
+        scope = "/api/messages/album"
+        descriptor = idempotency_descriptor(scope, payload, idempotency_key)
+        album_id = secrets.token_hex(16)
+        created_messages: list[dict[str, Any]] = []
+
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
+
+            recipient_cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?",
+                (recipient_id,),
+            )
+            recipient = await recipient_cur.fetchone()
+            if recipient is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Получатель не найден")
+            if recipient["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            blocked_cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                   LIMIT 1""",
+                (uid, recipient_id, recipient_id, uid),
+            )
+            if await blocked_cur.fetchone():
+                await db.rollback()
+                raise HTTPException(
+                    status_code=403,
+                    detail="Нельзя отправить альбом: пользователь находится в чёрном списке",
+                )
+
+            reply_to_id = parse_reply_id(payload)
+            if reply_to_id:
+                await require_reply_target(
+                    db,
+                    """SELECT 1 FROM messages WHERE id=? AND
+                       ((sender_telegram_id=? AND recipient_telegram_id=?) OR
+                        (sender_telegram_id=? AND recipient_telegram_id=?))""",
+                    (reply_to_id, uid, recipient_id, recipient_id, uid),
+                )
+
+            checked_media: list[tuple[str, dict[str, str | None]]] = []
+            for media_id in media_ids:
+                owned_id = await require_owned_media(db, media_id, uid)
+                fields = await media_message_fields(db, owned_id)
+                media_type = str(fields.get("media_type") or "").lower()
+                if not (media_type.startswith("image/") or media_type.startswith("video/")):
+                    await db.rollback()
+                    raise HTTPException(
+                        status_code=415,
+                        detail="В медиаальбом можно добавлять только фотографии и видео",
+                    )
+                checked_media.append((media_id, fields))
+
+            rate_cur = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND created_at>?",
+                (uid, now - 60),
+            )
+            sent_recently = int((await rate_cur.fetchone())[0])
+            if sent_recently + len(checked_media) > DM_MESSAGES_PER_MINUTE:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=429,
+                    detail="Превышен лимит отправки сообщений для медиаальбома",
+                )
+
+            for index, (media_id, media_fields) in enumerate(checked_media):
+                item_body = body if index == 0 else ""
+                cur = await db.execute(
+                    """INSERT INTO messages
+                       (sender_telegram_id,recipient_telegram_id,body,media_id,reply_to_id,
+                        media_album_id,media_album_index,media_album_count,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        uid, recipient_id, item_body, media_id, reply_to_id,
+                        album_id, index, len(checked_media), now,
+                    ),
+                )
+                message_id = int(cur.lastrowid)
+                await record_event(
+                    db, "dm", message_id, "new_message", uid,
+                    user_a=uid, user_b=recipient_id,
+                )
+                created_messages.append({
+                    "id": message_id,
+                    "sender_id": uid,
+                    "recipient_id": recipient_id,
+                    "body": item_body,
+                    "media_id": media_id,
+                    "reply_to_id": reply_to_id,
+                    "media_album_id": album_id,
+                    "media_album_index": index,
+                    "media_album_count": len(checked_media),
+                    **media_fields,
+                    "created_at": now,
+                })
+
+            result = {
+                "status": "sent",
+                "album_id": album_id,
+                "count": len(created_messages),
+                "first_message_id": created_messages[0]["id"],
+                "last_message_id": created_messages[-1]["id"],
+                "messages": created_messages,
+            }
+            await idempotency_store(db, uid, scope, descriptor, result, now)
+            await db.commit()
+
+        if not silent:
+            await deliver_push_notifications(
+                [recipient_id],
+                str(user.get("display_name") or user.get("username") or "Новое сообщение"),
+                f"Медиаальбом · {len(created_messages)} вложения",
+                {
+                    "scope": "dm",
+                    "chat_id": str(uid),
+                    "message_id": str(created_messages[-1]["id"]),
+                    "media_album_id": album_id,
+                },
             )
         return result
 
