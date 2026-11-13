@@ -1731,6 +1731,7 @@ def build_messenger_router(
     @router.get("/api/media/{media_id}")
     async def download_media(
         media_id: str,
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> Response:
         user = await current_user(authorization)
@@ -1785,19 +1786,80 @@ def build_messenger_router(
 
         file_path = media_storage_dir() / str(media["storage_name"])
         try:
+            file_size = (await asyncio.to_thread(file_path.stat)).st_size
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Файл изображения отсутствует на сервере") from exc
+
+        mime_type = str(media["mime_type"])
+        original_name = str(media["original_name"] or "document")
+        content_disposition = (
+            "inline"
+            if mime_type.startswith(("image/", "video/", "audio/"))
+            else "attachment; filename=\"" + re.sub(r"[^A-Za-z0-9._-]", "_", original_name)
+                 + "\"; filename*=UTF-8''" + quote(original_name, safe="")
+        )
+        response_headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": content_disposition,
+        }
+
+        range_header = request.headers.get("range", "").strip()
+        if range_header.lower().startswith("bytes="):
+            match = re.fullmatch(r"bytes=(\\d*)-(\\d*)", range_header, flags=re.IGNORECASE)
+            if match is None or (not match.group(1) and not match.group(2)):
+                return Response(
+                    status_code=416,
+                    headers={**response_headers, "Content-Range": f"bytes */{file_size}"},
+                )
+
+            first, last = match.groups()
+            if not first:
+                suffix_length = int(last)
+                if suffix_length <= 0 or file_size <= 0:
+                    return Response(
+                        status_code=416,
+                        headers={**response_headers, "Content-Range": f"bytes */{file_size}"},
+                    )
+                start_byte = max(0, file_size - suffix_length)
+                end_byte = file_size - 1
+            else:
+                start_byte = int(first)
+                end_byte = int(last) if last else file_size - 1
+                if start_byte >= file_size or end_byte < start_byte:
+                    return Response(
+                        status_code=416,
+                        headers={**response_headers, "Content-Range": f"bytes */{file_size}"},
+                    )
+                end_byte = min(end_byte, file_size - 1)
+
+            byte_count = end_byte - start_byte + 1
+
+            def read_media_range() -> bytes:
+                with file_path.open("rb") as media_file:
+                    media_file.seek(start_byte)
+                    return media_file.read(byte_count)
+
+            content = await asyncio.to_thread(read_media_range)
+            return Response(
+                content=content,
+                status_code=206,
+                media_type=mime_type,
+                headers={
+                    **response_headers,
+                    "Content-Range": f"bytes {start_byte}-{end_byte}/{file_size}",
+                },
+            )
+
+        try:
             content = await asyncio.to_thread(file_path.read_bytes)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Файл изображения отсутствует на сервере") from exc
         return Response(
             content=content,
-            media_type=str(media["mime_type"]),
-            headers={
-                "Cache-Control": "private, max-age=3600",
-                "X-Content-Type-Options": "nosniff",
-                "Content-Disposition": (                    "inline" if str(media["mime_type"]).startswith(("image/", "video/", "audio/")) else
-                    "attachment; filename=\"" + re.sub(r"[^A-Za-z0-9._-]", "_", str(media["original_name"] or "document")) + "\"; filename*=UTF-8''" + quote(str(media["original_name"] or "document"), safe="")
-                ),
-            },
+            media_type=mime_type,
+            headers=response_headers,
         )
 
     def idempotency_descriptor(path: str, body: dict[str, Any], key: str | None):
