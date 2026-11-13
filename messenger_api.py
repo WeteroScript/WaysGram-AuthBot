@@ -183,6 +183,11 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
             raise ValueError("Файл не является корректным JPEG")
         return raw, "image/jpeg", extension, safe_name
 
+    if extension == ".gif":
+        if len(raw) < 13 or raw[:6] not in (b"GIF87a", b"GIF89a"):
+            raise ValueError("Файл не является корректным GIF")
+        return raw, "image/gif", extension, safe_name
+
     if extension == ".png":
         if len(raw) < 8 or not raw.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Файл не является корректным PNG")
@@ -1665,7 +1670,7 @@ def build_messenger_router(
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
         allowed_types = {
             "application/pdf", "text/plain", "text/csv", "application/zip",
-            "image/jpeg", "image/png", "image/webp",
+            "image/jpeg", "image/png", "image/webp", "image/gif",
             "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
             "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav",
             "application/octet-stream",
@@ -1673,7 +1678,7 @@ def build_messenger_router(
         if declared_type not in allowed_types:
             raise HTTPException(
                 status_code=415,
-                detail="Поддерживаются JPG, PNG, WebP без сжатия, PDF, TXT, CSV, ZIP, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
+                detail="Поддерживаются JPG, PNG, WebP, GIF, PDF, TXT, CSV, ZIP, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
             )
         declared_length = request.headers.get("content-length")
         if declared_length:
