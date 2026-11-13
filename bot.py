@@ -1854,7 +1854,7 @@ async def admin_text_input(message: Message) -> None:
         row = next((item for item in await telegram_gift_rows() if str(item["id"]) == value), None)
         if row is None:
             await message.answer(
-                "Gift ID отсутствует даже в сохранённой истории каталога. "
+                "Gift ID нет в синхронизированном каталоге и сохранённой истории. "
                 "WaysGram не может восстановить название и изображение только по неизвестному ID."
             )
             return
