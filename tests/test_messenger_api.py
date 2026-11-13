@@ -338,6 +338,38 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
  
  
  
+
+def test_direct_messages_preserve_inline_formatting_markers(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89101, "format_sender")
+    add_account(api_env, 89102, "format_recipient")
+    add_session(path, 89101, "format-sender-session")
+    add_session(path, 89102, "format-recipient-session")
+
+    body = "**bold** *italic* --underlined-- ~~struck~~ ||spoiler|| `monospace`"
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer format-sender-session"}
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 89102, "body": body},
+            )
+            assert sent.status_code == 201
+            assert sent.json()["body"] == body
+
+            history = await client.get("/api/messages?with=89102", headers=sender)
+            assert history.status_code == 200
+            assert history.json()["messages"][0]["body"] == body
+
+            exported = await client.get("/api/messages/export?with=89102", headers=sender)
+            assert exported.status_code == 200
+            assert body in exported.json()["text"]
+
+    run(scenario())
+
+
 def test_direct_message_export_respects_private_visibility(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89001, "export_sender")
