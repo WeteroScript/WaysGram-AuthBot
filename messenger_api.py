@@ -1104,6 +1104,8 @@ def _message_attachment_json(value: Any, now: int | None = None) -> str | None:
         return json.dumps(attachment, ensure_ascii=False, separators=(",", ":"))
 
     if kind == "location":
+        if isinstance(value.get("latitude"), bool) or isinstance(value.get("longitude"), bool):
+            raise HTTPException(status_code=400, detail="Укажите корректные координаты геопозиции")
         try:
             latitude = float(value.get("latitude"))
             longitude = float(value.get("longitude"))
@@ -1148,20 +1150,22 @@ def _updated_live_location_json(
         raise HTTPException(status_code=409, detail="Сообщение не содержит геопозицию")
     if int(attachment.get("live_until") or 0) <= timestamp:
         raise HTTPException(status_code=409, detail="Срок трансляции геопозиции завершён")
-    updated = _message_attachment_json(
-        {
-            "type": "location",
-            "latitude": latitude_value,
-            "longitude": longitude_value,
-            "live_period": int(attachment.get("live_until") or 0) - timestamp,
-        },
-        timestamp,
-    )
-    if updated is None:
-        raise HTTPException(status_code=400, detail="Не удалось обновить геопозицию")
-    value = json.loads(updated)
-    value["live_until"] = int(attachment["live_until"])
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(latitude_value, bool) or isinstance(longitude_value, bool):
+        raise HTTPException(status_code=400, detail="Укажите корректные координаты геопозиции")
+    try:
+        latitude = float(latitude_value)
+        longitude = float(longitude_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Укажите корректные координаты геопозиции")
+    if (
+        not math.isfinite(latitude) or not math.isfinite(longitude)
+        or not -90 <= latitude <= 90 or not -180 <= longitude <= 180
+    ):
+        raise HTTPException(status_code=400, detail="Координаты геопозиции выходят за допустимые пределы")
+    attachment["latitude"] = latitude
+    attachment["longitude"] = longitude
+    attachment["updated_at"] = timestamp
+    return json.dumps(attachment, ensure_ascii=False, separators=(",", ":"))
 
 
 def _message_body(value: str) -> str:
@@ -5871,7 +5875,7 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT sender_telegram_id,attachment_json FROM messages WHERE id=?",
+                "SELECT sender_telegram_id,recipient_telegram_id,attachment_json FROM messages WHERE id=?",
                 (message_id,),
             )
             row = await cur.fetchone()
@@ -5889,7 +5893,7 @@ def build_messenger_router(
                 (updated, message_id),
             )
             await record_event(db, "dm", message_id, "location_updated", uid,
-                               user_a=uid, user_b=0)
+                               user_a=uid, user_b=int(row["recipient_telegram_id"]))
             await db.commit()
         return {"id": message_id, "attachment_json": updated, "updated_at": now}
 
