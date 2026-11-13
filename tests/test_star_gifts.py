@@ -574,7 +574,7 @@ def test_startup_backfills_traits_for_previously_upgraded_gifts(env) -> None:
         finally:
             connection.close()
 
-        run(init_messenger_storage(path))
+        await init_messenger_storage(path)
         async with await client_for(app) as client:
             inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             traits = inventory[0]["attributes"]["collectible_traits"]
@@ -583,7 +583,7 @@ def test_startup_backfills_traits_for_previously_upgraded_gifts(env) -> None:
             assert traits["model"] and traits["symbol"] and traits["backdrop"]
 
         # Startup is idempotent: a second initialization must preserve the assigned traits.
-        run(init_messenger_storage(path))
+        await init_messenger_storage(path)
         async with await client_for(app) as client:
             inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert inventory[0]["attributes"]["collectible_traits"] == traits
