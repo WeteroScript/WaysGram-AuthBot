@@ -194,6 +194,8 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
 
 async def init_messenger_storage(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
+    # Move legacy messenger tables before creating the split-schema versions.
+    await db_split.migrate_legacy(database_path)
     async with aiosqlite.connect(database_path) as db:
         await db.executescript(
             db_split.qualify_ddl(
