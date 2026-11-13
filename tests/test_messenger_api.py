@@ -366,12 +366,29 @@ def test_direct_message_delete_for_me_is_private_and_consistent(api_env) -> None
             )
             assert pinned.status_code == 200
 
+            recipient_event_cursor = await client.get("/api/events", headers=recipient)
+            sender_event_cursor = await client.get("/api/events", headers=sender)
+            assert recipient_event_cursor.status_code == sender_event_cursor.status_code == 200
+
             hidden = await client.delete(
                 f"/api/messages/{message_id}?for=me",
                 headers=recipient,
             )
             assert hidden.status_code == 200
             assert hidden.json()["status"] == "hidden_for_me"
+
+            recipient_events = await client.get(
+                f"/api/events?after_id={recipient_event_cursor.json()['latest_id']}",
+                headers=recipient,
+            )
+            sender_events = await client.get(
+                f"/api/events?after_id={sender_event_cursor.json()['latest_id']}",
+                headers=sender,
+            )
+            assert recipient_events.status_code == sender_events.status_code == 200
+            assert any(event["kind"] == "delete_for_me"
+                       for event in recipient_events.json()["events"])
+            assert sender_events.json()["events"] == []
 
             recipient_history = await client.get("/api/messages?with=88801", headers=recipient)
             assert recipient_history.status_code == 200
