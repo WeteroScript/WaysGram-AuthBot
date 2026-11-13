@@ -339,6 +339,141 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
  
  
 
+
+def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89201, "schedule_sender")
+    add_account(api_env, 89202, "schedule_recipient")
+    add_session(path, 89201, "schedule-sender-session")
+    add_session(path, 89202, "schedule-recipient-session")
+
+    async def scenario() -> None:
+        await app.router.startup()
+        try:
+            async with await client_for(app) as client:
+                sender = {"Authorization": "Bearer schedule-sender-session"}
+                due_at = int(time.time()) + 60
+                headers = {
+                    **sender,
+                    "Idempotency-Key": "scheduled-message-test-001",
+                }
+                payload = {
+                    "recipient_id": 89202,
+                    "body": "**scheduled** message",
+                    "scheduled_at": due_at,
+                    "silent": True,
+                }
+                scheduled = await client.post(
+                    "/api/messages/schedule",
+                    headers=headers,
+                    json=payload,
+                )
+                replay = await client.post(
+                    "/api/messages/schedule",
+                    headers=headers,
+                    json=payload,
+                )
+                assert scheduled.status_code == 201
+                assert scheduled.json()["status"] == "pending"
+                assert replay.json()["id"] == scheduled.json()["id"]
+
+                scheduled_id = scheduled.json()["id"]
+                listing = await client.get(
+                    "/api/messages/scheduled?with=89202",
+                    headers=sender,
+                )
+                assert listing.status_code == 200
+                assert listing.json()["count"] == 1
+                assert listing.json()["scheduled_messages"][0]["id"] == scheduled_id
+
+                with sqlite3.connect(path) as db:
+                    db.execute(
+                        "UPDATE scheduled_messages SET scheduled_at=? WHERE id=?",
+                        (int(time.time()) - 1, scheduled_id),
+                    )
+                    db.commit()
+
+                deadline = time.monotonic() + 4
+                history = None
+                while time.monotonic() < deadline:
+                    history = await client.get(
+                        "/api/messages?with=89202",
+                        headers=sender,
+                    )
+                    if history.status_code == 200 and history.json()["messages"]:
+                        break
+                    await asyncio.sleep(0.1)
+                assert history is not None and history.status_code == 200
+                assert [item["body"] for item in history.json()["messages"]] == [
+                    "**scheduled** message"
+                ]
+
+                listing_after_send = await client.get(
+                    "/api/messages/scheduled?with=89202",
+                    headers=sender,
+                )
+                assert listing_after_send.json()["count"] == 0
+
+                second = await client.post(
+                    "/api/messages/schedule",
+                    headers=sender,
+                    json={
+                        "recipient_id": 89202,
+                        "body": "cancel me",
+                        "scheduled_at": int(time.time()) + 60,
+                    },
+                )
+                assert second.status_code == 201
+                cancelled = await client.delete(
+                    f"/api/messages/scheduled/{second.json()['id']}",
+                    headers=sender,
+                )
+                assert cancelled.status_code == 200
+                assert cancelled.json()["status"] == "cancelled"
+
+                with sqlite3.connect(path) as db:
+                    db.execute(
+                        "UPDATE scheduled_messages SET scheduled_at=? WHERE id=?",
+                        (int(time.time()) - 1, second.json()["id"]),
+                    )
+                    db.commit()
+
+                await asyncio.sleep(1.2)
+                after_cancel = await client.get(
+                    "/api/messages?with=89202",
+                    headers=sender,
+                )
+                assert [item["body"] for item in after_cancel.json()["messages"]] == [
+                    "**scheduled** message"
+                ]
+
+                too_soon = await client.post(
+                    "/api/messages/schedule",
+                    headers=sender,
+                    json={
+                        "recipient_id": 89202,
+                        "body": "too soon",
+                        "scheduled_at": int(time.time()) + 2,
+                    },
+                )
+                assert too_soon.status_code == 400
+
+                too_far = await client.post(
+                    "/api/messages/schedule",
+                    headers=sender,
+                    json={
+                        "recipient_id": 89202,
+                        "body": "too far",
+                        "scheduled_at": int(time.time()) + 31 * 24 * 60 * 60,
+                    },
+                )
+                assert too_far.status_code == 400
+        finally:
+            await app.router.shutdown()
+
+    run(scenario())
+
+
 def test_direct_messages_preserve_inline_formatting_markers(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89101, "format_sender")
