@@ -386,6 +386,8 @@ async def init_messenger_storage(database_path: Path) -> None:
                 recipient_telegram_id INTEGER NOT NULL,
                 body TEXT NOT NULL,
                 scheduled_at INTEGER NOT NULL,
+                repeat_interval_seconds INTEGER NOT NULL DEFAULT 0
+                    CHECK(repeat_interval_seconds IN (0,86400,604800)),
                 created_at INTEGER NOT NULL,
                 silent INTEGER NOT NULL DEFAULT 0 CHECK(silent IN (0,1)),
                 status TEXT NOT NULL DEFAULT 'pending'
@@ -679,6 +681,13 @@ async def init_messenger_storage(database_path: Path) -> None:
         media_columns = {str(row[1]) for row in await cur.fetchall()}
         if "original_name" not in media_columns:
             await db.execute(f"ALTER TABLE {db_split.SCHEMA}.media_assets ADD COLUMN original_name TEXT")
+        cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(scheduled_messages)")
+        scheduled_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "repeat_interval_seconds" not in scheduled_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.scheduled_messages "
+                "ADD COLUMN repeat_interval_seconds INTEGER NOT NULL DEFAULT 0"
+            )
         for table_name in ("messages", "group_messages", "channel_messages"):
             cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info({table_name})")
             columns = {str(row[1]) for row in await cur.fetchall()}
@@ -4367,6 +4376,12 @@ def build_messenger_router(
         scheduled_at = payload.get("scheduled_at")
         if isinstance(scheduled_at, bool) or not isinstance(scheduled_at, int):
             raise HTTPException(status_code=400, detail="scheduled_at должен быть Unix timestamp")
+        repeat_interval = payload.get("repeat_interval_seconds", 0)
+        if isinstance(repeat_interval, bool) or repeat_interval not in (0, 86400, 604800):
+            raise HTTPException(
+                status_code=400,
+                detail="repeat_interval_seconds: 0, 86400 или 604800",
+            )
         silent = payload.get("silent", False)
         if not isinstance(silent, bool):
             raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
@@ -4407,9 +4422,10 @@ def build_messenger_router(
                     raise HTTPException(status_code=403, detail="Нельзя запланировать сообщение: пользователь находится в чёрном списке")
             cur = await db.execute(
                 """INSERT INTO scheduled_messages
-                   (sender_telegram_id,recipient_telegram_id,body,scheduled_at,created_at,silent)
-                   VALUES(?,?,?,?,?,?)""",
-                (uid, recipient_id, body, scheduled_at, now, int(silent)),
+                   (sender_telegram_id,recipient_telegram_id,body,scheduled_at,
+                    repeat_interval_seconds,created_at,silent)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (uid, recipient_id, body, scheduled_at, repeat_interval, now, int(silent)),
             )
             scheduled_id = int(cur.lastrowid)
             result = {
@@ -4419,6 +4435,7 @@ def build_messenger_router(
                 "recipient_id": recipient_id,
                 "body": body,
                 "scheduled_at": scheduled_at,
+                "repeat_interval_seconds": repeat_interval,
                 "silent": silent,
                 "created_at": now,
             }
@@ -4443,7 +4460,7 @@ def build_messenger_router(
                 raise HTTPException(status_code=404, detail="Собеседник не найден")
             cur = await db.execute(
                 """SELECT id,recipient_telegram_id AS recipient_id,body,scheduled_at,
-                          created_at,silent,status,message_id,error
+                          repeat_interval_seconds,created_at,silent,status,message_id,error
                    FROM scheduled_messages
                    WHERE sender_telegram_id=? AND recipient_telegram_id=?
                      AND status IN ('pending','failed')
@@ -4743,7 +4760,8 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                """SELECT id,sender_telegram_id,recipient_telegram_id,body,silent
+                """SELECT id,sender_telegram_id,recipient_telegram_id,body,silent,
+                          repeat_interval_seconds
                    FROM scheduled_messages
                    WHERE status='pending' AND scheduled_at<=?
                    ORDER BY scheduled_at ASC,id ASC LIMIT 100""",
@@ -4751,7 +4769,7 @@ def build_messenger_router(
             )
             due = await cur.fetchall()
             for scheduled in due:
-                scheduled_id, sender_id, recipient_id, body, silent = scheduled
+                scheduled_id, sender_id, recipient_id, body, silent, repeat_interval = scheduled
                 cur = await db.execute(
                     "SELECT is_banned FROM accounts WHERE telegram_id=?",
                     (sender_id,),
@@ -4799,12 +4817,20 @@ def build_messenger_router(
                     db, "dm", message_id, "new_message", int(sender_id),
                     user_a=int(sender_id), user_b=int(recipient_id),
                 )
-                await db.execute(
-                    """UPDATE scheduled_messages
-                       SET status='sent',message_id=?,error=''
-                       WHERE id=? AND status='pending'""",
-                    (message_id, scheduled_id),
-                )
+                if int(repeat_interval) > 0:
+                    await db.execute(
+                        """UPDATE scheduled_messages
+                           SET scheduled_at=?,created_at=?,message_id=?,error=''
+                           WHERE id=? AND status='pending'""",
+                        (now + int(repeat_interval), now, message_id, scheduled_id),
+                    )
+                else:
+                    await db.execute(
+                        """UPDATE scheduled_messages
+                           SET status='sent',message_id=?,error=''
+                           WHERE id=? AND status='pending'""",
+                        (message_id, scheduled_id),
+                    )
                 if not bool(silent):
                     notifications.append((
                         int(recipient_id), int(sender_id),
