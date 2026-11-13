@@ -334,6 +334,52 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
     run(scenario())
 
 
+
+def test_silent_direct_messages_skip_push_delivery(api_env, monkeypatch) -> None:
+    _path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88701, "silent_sender")
+    add_account(api_env, 88702, "silent_recipient")
+    add_session(_path, 88701, "silent-sender-session")
+    add_session(_path, 88702, "silent-recipient-session")
+
+    deliveries: list[tuple] = []
+
+    async def capture_push(*args, **kwargs) -> None:
+        deliveries.append(args)
+
+    monkeypatch.setattr(messenger_api, "deliver_push_notifications", capture_push)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            headers = {"Authorization": "Bearer silent-sender-session"}
+            silent = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={"recipient_id": 88702, "body": "quiet message", "silent": True},
+            )
+            assert silent.status_code == 201
+            assert silent.json()["body"] == "quiet message"
+            assert deliveries == []
+
+            normal = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={"recipient_id": 88702, "body": "normal message"},
+            )
+            assert normal.status_code == 201
+            assert len(deliveries) == 1
+            assert deliveries[0][0] == [88702]
+
+            invalid = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={"recipient_id": 88702, "body": "invalid flag", "silent": "true"},
+            )
+            assert invalid.status_code == 400
+
+    run(scenario())
+
+
 def test_direct_messages_and_channel_permissions(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 82001, "sender")
