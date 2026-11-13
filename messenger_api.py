@@ -169,12 +169,28 @@ def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
 
 
 def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str, str, str]:
-    """Validate an allowlisted document, audio, video or archive without unpacking it."""
+    """Validate allowlisted documents and uncompressed image, audio, video or archive bytes."""
     safe_name = str(filename or "document").replace("\\", "/").rsplit("/", 1)[-1]
     safe_name = re.sub(r"[\x00-\x1f\x7f]", "", safe_name).strip(" .")[:120]
     if not safe_name:
         safe_name = "document"
     extension = Path(safe_name).suffix.lower()
+
+    # Raw image uploads through this endpoint preserve the original bytes exactly.
+    if extension in {".jpg", ".jpeg"}:
+        if len(raw) < 3 or not raw.startswith(b"\xff\xd8\xff"):
+            raise ValueError("Файл не является корректным JPEG")
+        return raw, "image/jpeg", extension, safe_name
+
+    if extension == ".png":
+        if len(raw) < 8 or not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Файл не является корректным PNG")
+        return raw, "image/png", extension, safe_name
+
+    if extension == ".webp":
+        if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+            raise ValueError("Файл не является корректным WebP")
+        return raw, "image/webp", extension, safe_name
 
     if extension == ".pdf":
         if len(raw) < 16 or not raw.startswith(b"%PDF-") or b"%%EOF" not in raw[-2048:]:
@@ -1541,6 +1557,7 @@ def build_messenger_router(
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
         allowed_types = {
             "application/pdf", "text/plain", "text/csv", "application/zip",
+            "image/jpeg", "image/png", "image/webp",
             "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
             "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav",
             "application/octet-stream",
@@ -1548,7 +1565,7 @@ def build_messenger_router(
         if declared_type not in allowed_types:
             raise HTTPException(
                 status_code=415,
-                detail="Поддерживаются PDF, TXT, CSV, ZIP, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
+                detail="Поддерживаются JPG, PNG, WebP без сжатия, PDF, TXT, CSV, ZIP, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
             )
         declared_length = request.headers.get("content-length")
         if declared_length:
