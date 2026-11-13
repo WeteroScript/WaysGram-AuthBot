@@ -342,12 +342,15 @@ def test_silent_direct_messages_skip_push_delivery(api_env, monkeypatch) -> None
     add_session(_path, 88701, "silent-sender-session")
     add_session(_path, 88702, "silent-recipient-session")
 
-    deliveries: list[tuple] = []
+    push_credential_checks: list[bool] = []
 
-    async def capture_push(*args, **kwargs) -> None:
-        deliveries.append(args)
+    def capture_push_setup():
+        push_credential_checks.append(True)
+        return None
 
-    monkeypatch.setattr(messenger_api, "deliver_push_notifications", capture_push)
+    # deliver_push_notifications is a router-local helper. Observe its first
+    # module-level dependency instead of trying to patch the closed-over helper.
+    monkeypatch.setattr(messenger_api, "_firebase_service_account", capture_push_setup)
 
     async def scenario() -> None:
         async with await client_for(app) as client:
@@ -359,7 +362,7 @@ def test_silent_direct_messages_skip_push_delivery(api_env, monkeypatch) -> None
             )
             assert silent.status_code == 201
             assert silent.json()["body"] == "quiet message"
-            assert deliveries == []
+            assert push_credential_checks == []
 
             normal = await client.post(
                 "/api/messages",
@@ -367,8 +370,7 @@ def test_silent_direct_messages_skip_push_delivery(api_env, monkeypatch) -> None
                 json={"recipient_id": 88702, "body": "normal message"},
             )
             assert normal.status_code == 201
-            assert len(deliveries) == 1
-            assert deliveries[0][0] == [88702]
+            assert len(push_credential_checks) == 1
 
             invalid = await client.post(
                 "/api/messages",
