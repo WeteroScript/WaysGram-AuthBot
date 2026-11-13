@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import math
 import mimetypes
 import os
 import hmac
@@ -313,6 +314,7 @@ async def init_messenger_storage(database_path: Path) -> None:
                 sender_telegram_id INTEGER NOT NULL,
                 recipient_telegram_id INTEGER NOT NULL,
                 body TEXT NOT NULL,
+                attachment_json TEXT,
                 created_at INTEGER NOT NULL,
                 forwarded_from_telegram_id INTEGER,
                 forwarded_from_message_id INTEGER,
@@ -422,6 +424,7 @@ async def init_messenger_storage(database_path: Path) -> None:
                 channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
                 author_telegram_id INTEGER NOT NULL,
                 body TEXT NOT NULL,
+                attachment_json TEXT,
                 created_at INTEGER NOT NULL,
                 media_album_id TEXT,
                 media_album_index INTEGER NOT NULL DEFAULT 0,
@@ -654,6 +657,7 @@ async def init_messenger_storage(database_path: Path) -> None:
                 group_id INTEGER NOT NULL,
                 sender_telegram_id INTEGER NOT NULL,
                 body TEXT NOT NULL,
+                attachment_json TEXT,
                 created_at INTEGER NOT NULL,
                 media_album_id TEXT,
                 media_album_index INTEGER NOT NULL DEFAULT 0,
@@ -774,6 +778,8 @@ async def init_messenger_storage(database_path: Path) -> None:
             columns = {str(row[1]) for row in await cur.fetchall()}
             if "media_id" not in columns:
                 await db.execute(f"ALTER TABLE {db_split.SCHEMA}.{table_name} ADD COLUMN media_id TEXT")
+            if "attachment_json" not in columns:
+                await db.execute(f"ALTER TABLE {db_split.SCHEMA}.{table_name} ADD COLUMN attachment_json TEXT")
             if "edited_at" not in columns:
                 await db.execute(f"ALTER TABLE {db_split.SCHEMA}.{table_name} ADD COLUMN edited_at INTEGER")
             if "reply_to_id" not in columns:
@@ -1074,6 +1080,88 @@ async def fetch_telegram_sticker(bot: Any, file_id: str, preferred_mime: str = "
             raise ValueError("Telegram sticker file exceeds the supported size")
     media_type = preferred_mime or mimetypes.guess_type(file_path)[0] or "application/octet-stream"
     return content, media_type
+
+
+def _message_attachment_json(value: Any, now: int | None = None) -> str | None:
+    """Validate and serialize a contact card or location attachment for a message."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Некорректные данные вложения сообщения")
+
+    kind = str(value.get("type") or "").strip().lower()
+    timestamp = int(now or time.time())
+    if kind == "contact":
+        name = str(value.get("name") or "").strip()[:160]
+        phone = str(value.get("phone") or "").strip()[:80]
+        email = str(value.get("email") or "").strip()[:160]
+        if not name or not (phone or email):
+            raise HTTPException(status_code=400, detail="Для карточки контакта нужны имя и телефон или почта")
+        attachment = {"type": "contact", "name": name, "phone": phone, "email": email}
+        user_id = _optional_int(value.get("user_id"))
+        if user_id is not None and user_id > 0:
+            attachment["user_id"] = user_id
+        return json.dumps(attachment, ensure_ascii=False, separators=(",", ":"))
+
+    if kind == "location":
+        try:
+            latitude = float(value.get("latitude"))
+            longitude = float(value.get("longitude"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Укажите корректные координаты геопозиции")
+        if (
+            not math.isfinite(latitude) or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90 or not -180 <= longitude <= 180
+        ):
+            raise HTTPException(status_code=400, detail="Координаты геопозиции выходят за допустимые пределы")
+        live_period = value.get("live_period", 0)
+        if isinstance(live_period, bool) or not isinstance(live_period, int):
+            raise HTTPException(status_code=400, detail="Некорректная длительность трансляции геопозиции")
+        if live_period != 0 and not 60 <= live_period <= 86400:
+            raise HTTPException(status_code=400, detail="Трансляция геопозиции должна длиться от 1 минуты до 24 часов")
+        attachment = {
+            "type": "location",
+            "latitude": latitude,
+            "longitude": longitude,
+            "live_period": live_period,
+            "live_until": timestamp + live_period if live_period else 0,
+            "updated_at": timestamp,
+        }
+        return json.dumps(attachment, ensure_ascii=False, separators=(",", ":"))
+
+    raise HTTPException(status_code=400, detail="Поддерживаются карточки контактов и геопозиция")
+
+
+def _updated_live_location_json(
+    raw_attachment: str | None,
+    latitude_value: Any,
+    longitude_value: Any,
+    now: int | None = None,
+) -> str:
+    """Update coordinates only while the sender's live-location period remains active."""
+    timestamp = int(now or time.time())
+    try:
+        attachment = json.loads(raw_attachment or "")
+    except (TypeError, ValueError):
+        attachment = None
+    if not isinstance(attachment, dict) or attachment.get("type") != "location":
+        raise HTTPException(status_code=409, detail="Сообщение не содержит геопозицию")
+    if int(attachment.get("live_until") or 0) <= timestamp:
+        raise HTTPException(status_code=409, detail="Срок трансляции геопозиции завершён")
+    updated = _message_attachment_json(
+        {
+            "type": "location",
+            "latitude": latitude_value,
+            "longitude": longitude_value,
+            "live_period": int(attachment.get("live_until") or 0) - timestamp,
+        },
+        timestamp,
+    )
+    if updated is None:
+        raise HTTPException(status_code=400, detail="Не удалось обновить геопозицию")
+    value = json.loads(updated)
+    value["live_until"] = int(attachment["live_until"])
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _message_body(value: str) -> str:
