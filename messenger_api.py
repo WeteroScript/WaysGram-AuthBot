@@ -265,6 +265,14 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON messages(sender_telegram_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_api_messages_recipient_time
                 ON messages(recipient_telegram_id, created_at);
+            CREATE TABLE IF NOT EXISTS message_hidden_for (
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                telegram_id INTEGER NOT NULL,
+                hidden_at INTEGER NOT NULL,
+                PRIMARY KEY(message_id,telegram_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_hidden_for_user
+                ON message_hidden_for(telegram_id,message_id);
             CREATE TABLE IF NOT EXISTS message_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scope TEXT NOT NULL,
@@ -1509,10 +1517,14 @@ def build_messenger_router(
                         FROM messages m JOIN media_assets a ON a.id=m.media_id
                         WHERE ((m.sender_telegram_id=? AND m.recipient_telegram_id=?) OR
                                (m.sender_telegram_id=? AND m.recipient_telegram_id=?))
+                          AND NOT EXISTS (
+                              SELECT 1 FROM message_hidden_for hidden
+                              WHERE hidden.message_id=m.id AND hidden.telegram_id=?
+                          )
                           AND m.media_id IS NOT NULL AND (?=0 OR m.id<?)
                           {mime_clause}
                         ORDER BY m.id DESC LIMIT ?""",
-                    (uid, peer_id, peer_id, uid, before_id, before_id, limit),
+                    (uid, peer_id, peer_id, uid, uid, before_id, before_id, limit),
                 )
             elif scope == "group":
                 await require_group_member(db, peer_id, uid)
@@ -4008,7 +4020,7 @@ def build_messenger_router(
             if not await cur.fetchone():
                 raise HTTPException(status_code=404, detail="Собеседник не найден")
 
-        params: tuple[Any, ...] = (uid, peer, peer, uid)
+        params: tuple[Any, ...] = (uid, peer, peer, uid, uid)
         base = """
             SELECT id,sender_telegram_id AS sender_id,
                    recipient_telegram_id AS recipient_id,body,media_id,edited_at,reply_to_id,created_at,
@@ -4031,6 +4043,10 @@ def build_messenger_router(
             WHERE
             ((sender_telegram_id=? AND recipient_telegram_id=?) OR
              (sender_telegram_id=? AND recipient_telegram_id=?))
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_hidden_for hidden
+                  WHERE hidden.message_id=messages.id AND hidden.telegram_id=?
+              )
         """
         deadline = time.monotonic() + (wait_seconds if after_id and not before_id else 0)
         rows = []
@@ -4116,9 +4132,13 @@ def build_messenger_router(
                    FROM messages
                    WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
                           (sender_telegram_id=? AND recipient_telegram_id=?))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM message_hidden_for hidden
+                         WHERE hidden.message_id=messages.id AND hidden.telegram_id=?
+                     )
                      AND body LIKE ? COLLATE NOCASE
                    ORDER BY id DESC LIMIT 100""",
-                (uid, peer, peer, uid, f"%{term}%"),
+                (uid, peer, peer, uid, uid, f"%{term}%"),
             )
             rows = await cur.fetchall()
         items = [dict(row) for row in rows]
@@ -4717,8 +4737,12 @@ def build_messenger_router(
                        WHERE p.scope='dm' AND p.chat_id=0 AND
                          ((m.sender_telegram_id=? AND m.recipient_telegram_id=?) OR
                           (m.sender_telegram_id=? AND m.recipient_telegram_id=?))
+                         AND NOT EXISTS (
+                             SELECT 1 FROM message_hidden_for hidden
+                             WHERE hidden.message_id=m.id AND hidden.telegram_id=?
+                         )
                        ORDER BY p.created_at DESC,p.message_id DESC LIMIT 100""",
-                    (uid, peer_id, peer_id, uid),
+                    (uid, peer_id, peer_id, uid, uid),
                 )
             elif scope == "group":
                 cur = await db.execute(
@@ -4835,26 +4859,46 @@ def build_messenger_router(
     @router.delete("/api/messages/{message_id}")
     async def delete_message(
         message_id: int,
+        delete_for: str = Query(default="all", alias="for"),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
+        if delete_for not in ("me", "all"):
+            raise HTTPException(status_code=400, detail="for должен быть me или all")
+        now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                "SELECT sender_telegram_id,recipient_telegram_id FROM messages WHERE id=?", (message_id,)
+                "SELECT sender_telegram_id,recipient_telegram_id FROM messages WHERE id=?",
+                (message_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 await db.rollback()
                 raise HTTPException(status_code=404, detail="Сообщение не найдено")
-            if int(row[0]) != uid:
+            sender_id, recipient_id = int(row[0]), int(row[1])
+            if uid not in (sender_id, recipient_id):
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Сообщение не найдено")
+            if delete_for == "me":
+                await db.execute(
+                    """INSERT OR IGNORE INTO message_hidden_for(message_id,telegram_id,hidden_at)
+                       VALUES(?,?,?)""",
+                    (message_id, uid, now),
+                )
+                await db.commit()
+                return {"id": message_id, "status": "hidden_for_me"}
+            if sender_id != uid:
                 await db.rollback()
                 raise HTTPException(status_code=403, detail="Удалять для всех можно только свои сообщения")
             await db.execute("DELETE FROM messages WHERE id=?", (message_id,))
-            await record_event(db, "dm", message_id, "delete", uid, user_a=int(row[0]), user_b=int(row[1]))
+            await record_event(
+                db, "dm", message_id, "delete", uid,
+                user_a=sender_id, user_b=recipient_id,
+            )
             await db.commit()
-        return {"id": message_id, "status": "deleted"}
+        return {"id": message_id, "status": "deleted_for_all"}
 
     @router.put("/api/groups/{group_id}/messages/{message_id}")
     @router.patch("/api/groups/{group_id}/messages/{message_id}")
@@ -5287,7 +5331,11 @@ def build_messenger_router(
                                 ELSE sender_telegram_id END AS peer_id,
                            MAX(id) AS last_message_id
                     FROM messages
-                    WHERE sender_telegram_id=? OR recipient_telegram_id=?
+                    WHERE (sender_telegram_id=? OR recipient_telegram_id=?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM message_hidden_for hidden
+                          WHERE hidden.message_id=messages.id AND hidden.telegram_id=?
+                      )
                     GROUP BY peer_id
                 )
                 SELECT peer.telegram_id AS id,peer.username,peer.display_name,peer.avatar_media_id,
@@ -5301,6 +5349,10 @@ def build_messenger_router(
                        (SELECT COUNT(*) FROM messages um
                         WHERE um.sender_telegram_id=peer.telegram_id AND um.recipient_telegram_id=?
                           AND um.sender_telegram_id<>um.recipient_telegram_id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM message_hidden_for hidden
+                              WHERE hidden.message_id=um.id AND hidden.telegram_id=?
+                          )
                           AND um.id>COALESCE((SELECT rm.last_read_id FROM read_markers rm
                                               WHERE rm.telegram_id=? AND rm.scope='dm'
                                                 AND rm.peer_id=peer.telegram_id),0)) AS unread_count
@@ -5308,7 +5360,7 @@ def build_messenger_router(
                 JOIN accounts AS peer ON peer.telegram_id=recent.peer_id
                 JOIN messages AS message ON message.id=recent.last_message_id
                 ORDER BY message.id DESC LIMIT 100""",
-                (uid, uid, uid, uid, uid, uid, uid),
+                (uid, uid, uid, uid, uid, uid, uid, uid, uid),
             )
             rows = await cur.fetchall()
         return {"conversations": [dict(row) for row in rows]}
