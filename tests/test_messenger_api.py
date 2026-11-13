@@ -1800,17 +1800,32 @@ def test_group_and_channel_photo_video_albums_are_atomic_and_idempotent(api_env)
 
             uploaded_ids: list[str] = []
             uploaded_urls: list[str] = []
-            for color in ((20, 80, 140), (140, 80, 20)):
-                image_buffer = BytesIO()
-                Image.new("RGB", (6, 5), color).save(image_buffer, format="JPEG")
-                uploaded = await client.post(
-                    "/api/media/images",
-                    headers={**owner, "Content-Type": "image/jpeg"},
-                    content=image_buffer.getvalue(),
-                )
-                assert uploaded.status_code == 201
-                uploaded_ids.append(uploaded.json()["id"])
-                uploaded_urls.append(uploaded.json()["url"])
+            image_buffer = BytesIO()
+            Image.new("RGB", (6, 5), (20, 80, 140)).save(image_buffer, format="JPEG")
+            uploaded_image = await client.post(
+                "/api/media/images",
+                headers={**owner, "Content-Type": "image/jpeg"},
+                content=image_buffer.getvalue(),
+            )
+            assert uploaded_image.status_code == 201
+            uploaded_ids.append(uploaded_image.json()["id"])
+            uploaded_urls.append(uploaded_image.json()["url"])
+
+            # Minimal ISO BMFF header exercises the MP4 upload and album MIME path.
+            video_bytes = b"\x00\x00\x00\x18ftypisom" + (b"\x00" * 8)
+            uploaded_video = await client.post(
+                "/api/media/documents",
+                headers={
+                    **owner,
+                    "Content-Type": "video/mp4",
+                    "X-Filename": "album-clip.mp4",
+                },
+                content=video_bytes,
+            )
+            assert uploaded_video.status_code == 201
+            assert uploaded_video.json()["mime_type"] == "video/mp4"
+            uploaded_ids.append(uploaded_video.json()["id"])
+            uploaded_urls.append(uploaded_video.json()["url"])
 
             group = await client.post(
                 "/api/groups",
@@ -1845,6 +1860,7 @@ def test_group_and_channel_photo_video_albums_are_atomic_and_idempotent(api_env)
 
             group_items = group_album.json()["messages"]
             assert [item["media_id"] for item in group_items] == uploaded_ids
+            assert [item["media_type"] for item in group_items] == ["image/jpeg", "video/mp4"]
             assert [item["media_album_index"] for item in group_items] == [0, 1]
             assert all(item["media_album_count"] == 2 for item in group_items)
             assert group_items[0]["media_album_id"] == group_items[1]["media_album_id"]
@@ -1893,6 +1909,7 @@ def test_group_and_channel_photo_video_albums_are_atomic_and_idempotent(api_env)
             assert channel_replay.json()["first_message_id"] == channel_album.json()["first_message_id"]
             channel_items = channel_album.json()["messages"]
             assert [item["media_id"] for item in channel_items] == uploaded_ids
+            assert [item["media_type"] for item in channel_items] == ["image/jpeg", "video/mp4"]
             assert [item["media_album_index"] for item in channel_items] == [0, 1]
             assert all(item["media_album_count"] == 2 for item in channel_items)
             assert channel_items[0]["media_album_id"] == channel_items[1]["media_album_id"]
