@@ -1003,7 +1003,7 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
             f"""SELECT g.gift_id AS id,g.title AS title,
                        COALESCE(p.price_stars,0) AS price_stars,COALESCE(p.supply,0) AS supply,COALESCE(p.sold,0) AS sold
                 FROM {table} g LEFT JOIN telegram_gift_prices p ON p.gift_id=g.gift_id
-                WHERE g.is_available=1
+                WHERE 1=1
                 ORDER BY (COALESCE(p.price_stars,0)>0 AND COALESCE(p.supply,0)>COALESCE(p.sold,0)) DESC, g.gift_id"""
         )
         return [dict(row) for row in await cur.fetchall()]
@@ -1853,7 +1853,10 @@ async def admin_text_input(message: Message) -> None:
             return
         row = next((item for item in await telegram_gift_rows() if str(item["id"]) == value), None)
         if row is None:
-            await message.answer("Такого ID нет в синхронизированном каталоге Telegram. Обновите каталог и проверьте ID.")
+            await message.answer(
+                "Gift ID отсутствует даже в сохранённой истории каталога. "
+                "WaysGram не может восстановить название и изображение только по неизвестному ID."
+            )
             return
         async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute(
