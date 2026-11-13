@@ -4022,14 +4022,27 @@ def test_direct_message_media_album_is_atomic_grouped_and_private(api_env) -> No
             intruder = {"Authorization": "Bearer album-intruder-session"}
 
             media_ids = []
-            for index in range(2):
-                uploaded = await client.post(
-                    "/api/media/images",
-                    headers={**sender, "Content-Type": "image/png"},
-                    content=image_payload,
-                )
-                assert uploaded.status_code == 201
-                media_ids.append(uploaded.json()["id"])
+            uploaded_image = await client.post(
+                "/api/media/images",
+                headers={**sender, "Content-Type": "image/png"},
+                content=image_payload,
+            )
+            assert uploaded_image.status_code == 201
+            media_ids.append(uploaded_image.json()["id"])
+
+            video_bytes = b"\x00\x00\x00\x18ftypisom" + (b"\x00" * 8)
+            uploaded_video = await client.post(
+                "/api/media/documents",
+                headers={
+                    **sender,
+                    "Content-Type": "video/mp4",
+                    "X-Filename": "direct-album-clip.mp4",
+                },
+                content=video_bytes,
+            )
+            assert uploaded_video.status_code == 201
+            assert uploaded_video.json()["mime_type"] == "video/mp4"
+            media_ids.append(uploaded_video.json()["id"])
 
             payload = {
                 "recipient_id": 89502,
@@ -4049,6 +4062,7 @@ def test_direct_message_media_album_is_atomic_grouped_and_private(api_env) -> No
             album_id = album["album_id"]
             assert len(album_id) == 32
             assert [item["media_album_index"] for item in album["messages"]] == [0, 1]
+            assert [item["media_type"] for item in album["messages"]] == ["image/png", "video/mp4"]
             assert all(item["media_album_id"] == album_id for item in album["messages"])
             assert all(item["media_album_count"] == 2 for item in album["messages"])
             assert album["messages"][0]["body"] == "Фото с поездки"
