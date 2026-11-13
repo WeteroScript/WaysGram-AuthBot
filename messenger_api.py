@@ -34,7 +34,7 @@ CHANNEL_POSTS_PER_MINUTE = 20
 LOGIN_REQUESTS_PER_IP_PER_HOUR = 100
 MAX_MESSAGE_LENGTH = 4000
 MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
-MAX_DOCUMENT_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
@@ -169,29 +169,77 @@ def _normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str]:
 
 
 def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str, str, str]:
-    """Validate a small passive document and return safe storage metadata."""
+    """Validate an allowlisted document, audio, video or archive without unpacking it."""
     safe_name = str(filename or "document").replace("\\", "/").rsplit("/", 1)[-1]
-    safe_name = re.sub(r"[\x00-\x1f\x7f]", "", safe_name).strip(" .")[:120]
+    safe_name = re.sub(r"[\\x00-\\x1f\\x7f]", "", safe_name).strip(" .")[:120]
     if not safe_name:
         safe_name = "document"
     extension = Path(safe_name).suffix.lower()
+
     if extension == ".pdf":
         if len(raw) < 16 or not raw.startswith(b"%PDF-") or b"%%EOF" not in raw[-2048:]:
             raise ValueError("Файл не является корректным PDF")
         return raw, "application/pdf", ".pdf", safe_name
+
     if extension in {".txt", ".csv"}:
         try:
             decoded = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ValueError("Текстовые документы должны быть в UTF-8") from exc
-        if "\x00" in decoded or any(
-            ord(char) < 32 and char not in "\t\n\r" for char in decoded
+        if "\\x00" in decoded or any(
+            ord(char) < 32 and char not in "\\t\\n\\r" for char in decoded
         ):
             raise ValueError("Текстовый документ содержит недопустимые управляющие символы")
         normalized = decoded.encode("utf-8")
         mime_type = "text/csv" if extension == ".csv" else "text/plain"
         return normalized, mime_type, extension, safe_name
-    raise ValueError("Разрешены только документы PDF, TXT и CSV")
+
+    if extension in {".mp4", ".m4v", ".mov"}:
+        if len(raw) < 12 or raw[4:8] != b"ftyp":
+            raise ValueError("Файл не является корректным MP4/MOV")
+        mime_type = "video/quicktime" if extension == ".mov" else "video/mp4"
+        return raw, mime_type, extension, safe_name
+
+    if extension == ".webm":
+        if len(raw) < 4 or not raw.startswith(b"\\x1a\\x45\\xdf\\xa3"):
+            raise ValueError("Файл не является корректным WebM")
+        return raw, "video/webm", extension, safe_name
+
+    if extension == ".mkv":
+        if len(raw) < 4 or not raw.startswith(b"\\x1a\\x45\\xdf\\xa3"):
+            raise ValueError("Файл не является корректным Matroska")
+        return raw, "video/x-matroska", extension, safe_name
+
+    if extension == ".mp3":
+        has_id3 = raw.startswith(b"ID3")
+        has_frame_sync = len(raw) >= 2 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0
+        if not (has_id3 or has_frame_sync):
+            raise ValueError("Файл не является корректным MP3")
+        return raw, "audio/mpeg", extension, safe_name
+
+    if extension == ".m4a":
+        if len(raw) < 12 or raw[4:8] != b"ftyp":
+            raise ValueError("Файл не является корректным M4A")
+        return raw, "audio/mp4", extension, safe_name
+
+    if extension == ".ogg":
+        if len(raw) < 4 or not raw.startswith(b"OggS"):
+            raise ValueError("Файл не является корректным OGG")
+        return raw, "audio/ogg", extension, safe_name
+
+    if extension == ".wav":
+        if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+            raise ValueError("Файл не является корректным WAV")
+        return raw, "audio/wav", extension, safe_name
+
+    if extension == ".zip":
+        if len(raw) < 4 or raw[:4] not in (b"PK\\x03\\x04", b"PK\\x05\\x06", b"PK\\x07\\x08"):
+            raise ValueError("Файл не является корректным ZIP-архивом")
+        return raw, "application/zip", extension, safe_name
+
+    raise ValueError(
+        "Поддерживаются PDF, TXT, CSV, ZIP, MP4, M4V, MOV, WebM, MKV, MP3, M4A, OGG и WAV"
+    )
 
 
 async def init_messenger_storage(database_path: Path) -> None:
@@ -1453,14 +1501,22 @@ def build_messenger_router(
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
-        allowed_types = {"application/pdf", "text/plain", "text/csv", "application/octet-stream"}
+        allowed_types = {
+            "application/pdf", "text/plain", "text/csv", "application/zip",
+            "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
+            "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav",
+            "application/octet-stream",
+        }
         if declared_type not in allowed_types:
-            raise HTTPException(status_code=415, detail="Разрешены документы PDF, TXT и CSV")
+            raise HTTPException(
+                status_code=415,
+                detail="Поддерживаются PDF, TXT, CSV, ZIP, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
+            )
         declared_length = request.headers.get("content-length")
         if declared_length:
             try:
                 if int(declared_length) > MAX_DOCUMENT_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Размер документа превышает 10 МБ")
+                    raise HTTPException(status_code=413, detail="Размер вложения превышает 25 МБ")
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Некорректный Content-Length") from exc
 
@@ -1700,7 +1756,7 @@ def build_messenger_router(
             headers={
                 "Cache-Control": "private, max-age=3600",
                 "X-Content-Type-Options": "nosniff",
-                "Content-Disposition": (                    "inline" if str(media["mime_type"]).startswith("image/") else
+                "Content-Disposition": (                    "inline" if str(media["mime_type"]).startswith(("image/", "video/", "audio/")) else
                     "attachment; filename=\"" + re.sub(r"[^A-Za-z0-9._-]", "_", str(media["original_name"] or "document")) + "\"; filename*=UTF-8''" + quote(str(media["original_name"] or "document"), safe="")
                 ),
             },
