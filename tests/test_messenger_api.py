@@ -1875,6 +1875,19 @@ def test_group_and_channel_photo_video_albums_are_atomic_and_idempotent(api_env)
             assert [item["media_album_index"] for item in group_history.json()["messages"]] == [0, 1]
             member_download = await client.get(uploaded_urls[0], headers=member)
             assert member_download.status_code == 200
+            member_video_range = await client.get(
+                uploaded_urls[1],
+                headers={**member, "Range": "bytes=0-7"},
+            )
+            assert member_video_range.status_code == 206
+            assert member_video_range.content == video_bytes[:8]
+            assert member_video_range.headers["content-range"] == f"bytes 0-7/{len(video_bytes)}"
+            invalid_video_range = await client.get(
+                uploaded_urls[1],
+                headers={**member, "Range": f"bytes={len(video_bytes)}-"},
+            )
+            assert invalid_video_range.status_code == 416
+            assert invalid_video_range.headers["content-range"] == f"bytes */{len(video_bytes)}"
             outsider_post = await client.post(
                 f"/api/groups/{group_id}/messages/album",
                 headers=outsider,
