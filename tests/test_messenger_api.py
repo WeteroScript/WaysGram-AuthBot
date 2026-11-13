@@ -348,7 +348,7 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
     add_session(path, 89202, "schedule-recipient-session")
 
     async def scenario() -> None:
-        await app.router.startup()
+        await app.router._startup()
         try:
             async with await client_for(app) as client:
                 sender = {"Authorization": "Bearer schedule-sender-session"}
@@ -469,7 +469,7 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
                 )
                 assert too_far.status_code == 400
         finally:
-            await app.router.shutdown()
+            await app.router._shutdown()
 
     run(scenario())
 
