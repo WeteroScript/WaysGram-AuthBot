@@ -335,6 +335,111 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
 
 
 
+ 
+def test_direct_message_delete_for_me_is_private_and_consistent(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88801, "delete_sender")
+    add_account(api_env, 88802, "delete_recipient")
+    add_account(api_env, 88803, "delete_outsider")
+    add_session(path, 88801, "delete-sender-session")
+    add_session(path, 88802, "delete-recipient-session")
+    add_session(path, 88803, "delete-outsider-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer delete-sender-session"}
+            recipient = {"Authorization": "Bearer delete-recipient-session"}
+            outsider = {"Authorization": "Bearer delete-outsider-session"}
+
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 88802, "body": "private deletion check"},
+            )
+            assert sent.status_code == 201
+            message_id = sent.json()["id"]
+
+            pinned = await client.post(
+                "/api/pins",
+                headers=recipient,
+                json={"scope": "dm", "peer_id": 88801, "message_id": message_id},
+            )
+            assert pinned.status_code == 200
+
+            hidden = await client.delete(
+                f"/api/messages/{message_id}?for=me",
+                headers=recipient,
+            )
+            assert hidden.status_code == 200
+            assert hidden.json()["status"] == "hidden_for_me"
+
+            recipient_history = await client.get("/api/messages?with=88801", headers=recipient)
+            assert recipient_history.status_code == 200
+            assert recipient_history.json()["messages"] == []
+
+            recipient_search = await client.get(
+                "/api/messages/search?with=88801&q=private",
+                headers=recipient,
+            )
+            assert recipient_search.status_code == 200
+            assert recipient_search.json()["messages"] == []
+
+            recipient_conversations = await client.get("/api/conversations", headers=recipient)
+            assert recipient_conversations.status_code == 200
+            assert recipient_conversations.json()["conversations"] == []
+
+            recipient_pins = await client.get(
+                "/api/pins?scope=dm&peer_id=88801",
+                headers=recipient,
+            )
+            assert recipient_pins.status_code == 200
+            assert recipient_pins.json()["pinned_messages"] == []
+
+            sender_history = await client.get("/api/messages?with=88802", headers=sender)
+            assert sender_history.status_code == 200
+            assert [item["body"] for item in sender_history.json()["messages"]] == [
+                "private deletion check"
+            ]
+
+            sender_pins = await client.get(
+                "/api/pins?scope=dm&peer_id=88802",
+                headers=sender,
+            )
+            assert sender_pins.status_code == 200
+            assert len(sender_pins.json()["pinned_messages"]) == 1
+
+            outsider_delete = await client.delete(
+                f"/api/messages/{message_id}?for=me",
+                headers=outsider,
+            )
+            assert outsider_delete.status_code == 404
+
+            forbidden_delete_all = await client.delete(
+                f"/api/messages/{message_id}?for=all",
+                headers=recipient,
+            )
+            assert forbidden_delete_all.status_code == 403
+
+            invalid_mode = await client.delete(
+                f"/api/messages/{message_id}?for=everyone",
+                headers=recipient,
+            )
+            assert invalid_mode.status_code == 400
+
+            delete_all = await client.delete(
+                f"/api/messages/{message_id}?for=all",
+                headers=sender,
+            )
+            assert delete_all.status_code == 200
+            assert delete_all.json()["status"] == "deleted_for_all"
+
+            sender_after_all = await client.get("/api/messages?with=88802", headers=sender)
+            assert sender_after_all.status_code == 200
+            assert sender_after_all.json()["messages"] == []
+
+    run(scenario())
+
+
 def test_silent_direct_messages_skip_push_delivery(api_env, monkeypatch) -> None:
     _path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 88701, "silent_sender")
