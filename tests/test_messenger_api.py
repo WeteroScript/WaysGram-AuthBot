@@ -336,6 +336,77 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
 
 
  
+ 
+def test_clear_direct_message_history_only_hides_messages_for_current_account(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88901, "clear_sender")
+    add_account(api_env, 88902, "clear_recipient")
+    add_session(path, 88901, "clear-sender-session")
+    add_session(path, 88902, "clear-recipient-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer clear-sender-session"}
+            recipient = {"Authorization": "Bearer clear-recipient-session"}
+
+            first = await client.post(
+                "/api/messages", headers=sender,
+                json={"recipient_id": 88902, "body": "first message"},
+            )
+            second = await client.post(
+                "/api/messages", headers=recipient,
+                json={"recipient_id": 88901, "body": "second message"},
+            )
+            assert first.status_code == second.status_code == 201
+
+            recipient_cursor = await client.get("/api/events", headers=recipient)
+            sender_cursor = await client.get("/api/events", headers=sender)
+            assert recipient_cursor.status_code == sender_cursor.status_code == 200
+
+            cleared = await client.delete(
+                "/api/conversations/88901/messages?for=me",
+                headers=recipient,
+            )
+            assert cleared.status_code == 200
+            assert cleared.json()["status"] == "cleared_for_me"
+            assert cleared.json()["deleted_count"] == 2
+
+            recipient_history = await client.get("/api/messages?with=88901", headers=recipient)
+            sender_history = await client.get("/api/messages?with=88902", headers=sender)
+            assert recipient_history.status_code == sender_history.status_code == 200
+            assert recipient_history.json()["messages"] == []
+            assert [item["body"] for item in sender_history.json()["messages"]] == [
+                "first message", "second message"
+            ]
+
+            recipient_events = await client.get(
+                f"/api/events?after_id={recipient_cursor.json()['latest_id']}",
+                headers=recipient,
+            )
+            sender_events = await client.get(
+                f"/api/events?after_id={sender_cursor.json()['latest_id']}",
+                headers=sender,
+            )
+            assert any(event["kind"] == "clear_for_me"
+                       for event in recipient_events.json()["events"])
+            assert sender_events.json()["events"] == []
+
+            cleared_again = await client.delete(
+                "/api/conversations/88901/messages?for=me",
+                headers=recipient,
+            )
+            assert cleared_again.status_code == 200
+            assert cleared_again.json()["deleted_count"] == 0
+
+            denied = await client.delete(
+                "/api/conversations/88901/messages?for=all",
+                headers=recipient,
+            )
+            assert denied.status_code == 400
+
+    run(scenario())
+
+
 def test_direct_message_delete_for_me_is_private_and_consistent(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 88801, "delete_sender")
