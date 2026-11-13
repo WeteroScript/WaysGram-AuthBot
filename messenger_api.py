@@ -242,6 +242,74 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
     )
 
 
+COLLECTIBLE_TRAITS_VERSION = 1
+COLLECTIBLE_TRAIT_TIERS = (
+    (6000, "Обычная", {
+        "models": ("Искра", "Полярный свет", "Призма", "Лунный отблеск", "Северное сияние"),
+        "symbols": ("✦", "✧", "❖", "☾", "✺"),
+        "backdrops": (
+            "Аметистовый · #7C4DFF", "Лазурный · #168AAD", "Изумрудный · #2A9D8F",
+            "Рубиновый · #D62828", "Сапфировый · #4361EE",
+        ),
+    }),
+    (2500, "Необычная", {
+        "models": ("Комета", "Кристальный сад", "Солнечный ореол", "Звёздный след"),
+        "symbols": ("✵", "❈", "♢", "☼"),
+        "backdrops": (
+            "Бирюзовый · #20B2AA", "Янтарный · #FFB703",
+            "Лавандовый · #B8A1E3", "Малахитовый · #00A676",
+        ),
+    }),
+    (1000, "Редкая", {
+        "models": ("Небесный феникс", "Драконий камень", "Галактическая корона"),
+        "symbols": ("♛", "☄", "❂"),
+        "backdrops": ("Опаловый · #A8DADC", "Кобальтовый · #0047AB", "Гранатовый · #800020"),
+    }),
+    (400, "Эпическая", {
+        "models": ("Королевская реликвия", "Сердце кометы"),
+        "symbols": ("♜", "✹"),
+        "backdrops": ("Платиновый · #E5E4E2", "Затмение · #191970"),
+    }),
+    (100, "Легендарная", {
+        "models": ("Вечное пламя",),
+        "symbols": ("✷",),
+        "backdrops": ("Золотой · #D4AF37",),
+    }),
+)
+
+
+def _generate_collectible_traits() -> dict[str, Any]:
+    """Create one immutable, server-generated trait set for a WaysGram collectible."""
+    roll = secrets.randbelow(10_000)
+    boundary = 0
+    selected_tier = COLLECTIBLE_TRAIT_TIERS[-1]
+    for tier in COLLECTIBLE_TRAIT_TIERS:
+        boundary += tier[0]
+        if roll < boundary:
+            selected_tier = tier
+            break
+    rarity, traits = selected_tier[1], selected_tier[2]
+    return {
+        "version": COLLECTIBLE_TRAITS_VERSION,
+        "rarity": rarity,
+        "model": secrets.choice(traits["models"]),
+        "symbol": secrets.choice(traits["symbols"]),
+        "backdrop": secrets.choice(traits["backdrops"]),
+    }
+
+
+def _has_collectible_traits(attributes: Any) -> bool:
+    if not isinstance(attributes, dict):
+        return False
+    traits = attributes.get("collectible_traits")
+    if not isinstance(traits, dict) or traits.get("version") != COLLECTIBLE_TRAITS_VERSION:
+        return False
+    return all(
+        isinstance(traits.get(key), str) and bool(traits[key].strip())
+        for key in ("rarity", "model", "symbol", "backdrop")
+    )
+
+
 async def init_messenger_storage(database_path: Path) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     # Move legacy messenger tables before creating the split-schema versions.
@@ -837,6 +905,28 @@ async def init_messenger_storage(database_path: Path) -> None:
             await db.execute(
                 "UPDATE gift_transactions SET serial_number=? WHERE serial_number=?",
                 (new_serial, old_serial),
+            )
+
+        # Previously upgraded gifts did not have collectible traits. Backfill
+        # them once so existing owners keep their upgrades and receive the new
+        # collectible metadata without paying for another upgrade.
+        cur = await db.execute(
+            "SELECT id,attributes_json FROM user_gifts WHERE upgrade_level>0"
+        )
+        upgraded_gifts = await cur.fetchall()
+        for gift_id, raw_attributes in upgraded_gifts:
+            try:
+                attributes = json.loads(str(raw_attributes or "{}"))
+            except (TypeError, ValueError):
+                attributes = {}
+            if not isinstance(attributes, dict):
+                attributes = {}
+            if _has_collectible_traits(attributes):
+                continue
+            attributes["collectible_traits"] = _generate_collectible_traits()
+            await db.execute(
+                "UPDATE user_gifts SET attributes_json=? WHERE id=?",
+                (json.dumps(attributes, ensure_ascii=False, separators=(",", ":")), gift_id),
             )
         await db.commit()
 
@@ -3699,6 +3789,10 @@ def build_messenger_router(
                 "last_upgraded_at": now,
                 "upgrade_source": "waysgram_internal",
             })
+            if not _has_collectible_traits(attributes):
+                # Traits are generated once on the first successful upgrade and
+                # remain unchanged on subsequent upgrades, transfers and sales.
+                attributes["collectible_traits"] = _generate_collectible_traits()
             await db.execute(
                 "UPDATE accounts SET stars=?,updated_at=? WHERE telegram_id=?",
                 (new_balance, now, uid),
