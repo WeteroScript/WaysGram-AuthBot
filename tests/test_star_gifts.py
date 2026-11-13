@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -524,9 +525,68 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
             assert upgraded.json()["upgrade_level"] == 1
             assert upgraded.json()["price_stars"] == 10
             assert upgraded.json()["stars_balance"] == 4970
+            traits = upgraded.json()["attributes"]["collectible_traits"]
+            assert traits["version"] == 1
+            assert traits["rarity"] in {"Обычная", "Необычная", "Редкая", "Эпическая", "Легендарная"}
+            assert traits["model"] and traits["symbol"] and traits["backdrop"]
+
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert mine[0]["upgrade_level"] == 1
             assert mine[0]["attributes"]["upgrade_source"] == "waysgram_internal"
+            assert mine[0]["attributes"]["collectible_traits"] == traits
+
+            # A later level-up changes the level but never rerolls the collectible traits.
+            second_upgrade = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert second_upgrade.status_code == 200
+            assert second_upgrade.json()["upgrade_level"] == 2
+            assert second_upgrade.json()["attributes"]["collectible_traits"] == traits
+
+    run(scenario())
+
+
+def test_startup_backfills_traits_for_previously_upgraded_gifts(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            serial = bought.json()["gift"]["serial_number"]
+            upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert upgraded.status_code == 200
+
+        # Simulate the attributes JSON written by the previous backend version.
+        connection = db_split.sqlite_connect(path)
+        try:
+            connection.execute(
+                "UPDATE user_gifts SET attributes_json=? WHERE serial_number=?",
+                (json.dumps({
+                    "upgrade_level": 1,
+                    "last_upgraded_at": 123,
+                    "upgrade_source": "waysgram_internal",
+                }), serial),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        run(init_messenger_storage(path))
+        async with await client_for(app) as client:
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            traits = inventory[0]["attributes"]["collectible_traits"]
+            assert traits["version"] == 1
+            assert traits["rarity"] in {"Обычная", "Необычная", "Редкая", "Эпическая", "Легендарная"}
+            assert traits["model"] and traits["symbol"] and traits["backdrop"]
+
+        # Startup is idempotent: a second initialization must preserve the assigned traits.
+        run(init_messenger_storage(path))
+        async with await client_for(app) as client:
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert inventory[0]["attributes"]["collectible_traits"] == traits
 
     run(scenario())
 
@@ -642,6 +702,8 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
             assert sent.json()["gift_serial_number"] == serial
             assert sent.json()["gift_upgrade_level"] == 1
             assert sent.json()["gift_attributes"]["upgrade_source"] == "waysgram_internal"
+            traits = upgraded.json()["attributes"]["collectible_traits"]
+            assert sent.json()["gift_attributes"]["collectible_traits"] == traits
 
             sender_inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             recipient_inventory = (await client.get("/api/me/gifts", headers=headers(102))).json()["gifts"]
@@ -658,12 +720,14 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
                 assert item["gift_name"] == "🎁"
                 assert item["gift_upgrade_level"] == 1
                 assert item["gift_attributes"]["upgrade_source"] == "waysgram_internal"
+                assert item["gift_attributes"]["collectible_traits"] == traits
 
             profile = (await client.get("/api/users/102", headers=headers(101))).json()
             public_gift = profile["gifts"][0]
             assert public_gift["serial_number"] == serial
             assert public_gift["upgrade_level"] == 1
             assert public_gift["attributes"]["upgrade_source"] == "waysgram_internal"
+            assert public_gift["attributes"]["collectible_traits"] == traits
             assert public_gift["is_listed"] == 0
 
     run(scenario())
