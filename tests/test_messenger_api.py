@@ -646,14 +646,17 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
     run(scenario())
 
 
-def test_direct_messages_preserve_inline_formatting_markers(api_env) -> None:
+def test_direct_messages_preserve_telegram_html_formatting(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89101, "format_sender")
     add_account(api_env, 89102, "format_recipient")
     add_session(path, 89101, "format-sender-session")
     add_session(path, 89102, "format-recipient-session")
 
-    body = "**bold** *italic* --underlined-- ~~struck~~ ||spoiler|| `monospace`"
+    body = (
+        "<b>bold</b> <i>italic</i> <u>underlined</u> "
+        "<s>struck</s> <tg-spoiler>spoiler</tg-spoiler> <code>monospace</code>"
+    )
 
     async def scenario() -> None:
         async with await client_for(app) as client:
@@ -675,7 +678,6 @@ def test_direct_messages_preserve_inline_formatting_markers(api_env) -> None:
             assert body in exported.json()["text"]
 
     run(scenario())
-
 
 def test_direct_message_export_respects_private_visibility(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
