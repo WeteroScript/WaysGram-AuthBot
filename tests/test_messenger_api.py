@@ -2323,6 +2323,73 @@ def test_private_channel_title_updates_preserve_internal_usernames(api_env) -> N
     run(scenario())
 
 
+
+def test_video_audio_and_zip_uploads_are_validated_and_private(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89211, "media_sender")
+    add_account(api_env, 89212, "media_recipient")
+    add_account(api_env, 89213, "media_intruder")
+    add_session(path, 89211, "media-sender-session")
+    add_session(path, 89212, "media-recipient-session")
+    add_session(path, 89213, "media-intruder-session")
+
+    fixtures = (
+        ("video/mp4", "clip.mp4", b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00", "video/mp4", "inline"),
+        ("audio/mpeg", "voice.mp3", b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb", "audio/mpeg", "inline"),
+        ("application/zip", "bundle.zip", b"PK\x03\x04\x14\x00\x00\x00\x00\x00", "application/zip", "attachment"),
+    )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer media-sender-session"}
+            recipient = {"Authorization": "Bearer media-recipient-session"}
+            intruder = {"Authorization": "Bearer media-intruder-session"}
+
+            invalid_video = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "video/mp4", "X-Filename": "fake.mp4"},
+                content=b"not a video",
+            )
+            assert invalid_video.status_code == 415
+
+            for index, (declared_type, filename, payload, expected_type, disposition) in enumerate(fixtures):
+                uploaded = await client.post(
+                    "/api/media/documents",
+                    headers={
+                        **sender,
+                        "Content-Type": declared_type,
+                        "X-Filename": filename,
+                    },
+                    content=payload,
+                )
+                assert uploaded.status_code == 201
+                media = uploaded.json()
+                assert media["mime_type"] == expected_type
+
+                sent = await client.post(
+                    "/api/messages",
+                    headers=sender,
+                    json={
+                        "recipient_id": 89212,
+                        "body": "media attachment " + str(index),
+                        "media_id": media["id"],
+                    },
+                )
+                assert sent.status_code == 201
+                assert sent.json()["media_type"] == expected_type
+
+                downloaded = await client.get(media["url"], headers=recipient)
+                assert downloaded.status_code == 200
+                assert downloaded.headers["content-type"].startswith(expected_type)
+                assert downloaded.headers["content-disposition"].startswith(disposition + ";")
+                assert downloaded.content == payload
+
+                forbidden = await client.get(media["url"], headers=intruder)
+                assert forbidden.status_code == 404
+
+    run(scenario())
+
+
 def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 82301
