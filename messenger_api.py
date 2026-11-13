@@ -11,6 +11,8 @@ import json
 import re
 import secrets
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from io import BytesIO
 from urllib.parse import quote, unquote, urlsplit
 from pathlib import Path
@@ -390,6 +392,7 @@ async def init_messenger_storage(database_path: Path) -> None:
                     CHECK(repeat_interval_seconds IN (0,86400,604800)),
                 created_at INTEGER NOT NULL,
                 silent INTEGER NOT NULL DEFAULT 0 CHECK(silent IN (0,1)),
+                time_zone TEXT NOT NULL DEFAULT 'UTC',
                 status TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN ('pending','sent','cancelled','failed')),
                 message_id INTEGER,
@@ -688,6 +691,11 @@ async def init_messenger_storage(database_path: Path) -> None:
                 f"ALTER TABLE {db_split.SCHEMA}.scheduled_messages "
                 "ADD COLUMN repeat_interval_seconds INTEGER NOT NULL DEFAULT 0"
             )
+        if "time_zone" not in scheduled_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.scheduled_messages "
+                "ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC'"
+            )
         for table_name in ("messages", "group_messages", "channel_messages"):
             cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info({table_name})")
             columns = {str(row[1]) for row in await cur.fetchall()}
@@ -971,6 +979,24 @@ def _message_body(value: str) -> str:
     if not body or len(body) > MAX_MESSAGE_LENGTH:
         raise HTTPException(status_code=400, detail="Текст сообщения должен содержать 1–4000 символов")
     return body
+
+
+def _next_recurring_scheduled_timestamp(
+    scheduled_at: int,
+    now: int,
+    repeat_interval_seconds: int,
+    time_zone: str,
+) -> int:
+    """Advance a daily/weekly recurrence in its original local time zone."""
+    if repeat_interval_seconds not in (86400, 604800):
+        raise ValueError("Unsupported recurring schedule interval")
+    zone = ZoneInfo(time_zone)
+    local_schedule = datetime.fromtimestamp(int(scheduled_at), tz=zone)
+    interval_days = 1 if repeat_interval_seconds == 86400 else 7
+    next_local = local_schedule + timedelta(days=interval_days)
+    while int(next_local.timestamp()) <= int(now):
+        next_local += timedelta(days=interval_days)
+    return int(next_local.timestamp())
 
 
 def build_messenger_router(
@@ -4389,6 +4415,14 @@ def build_messenger_router(
         silent = payload.get("silent", False)
         if not isinstance(silent, bool):
             raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
+        time_zone = payload.get("time_zone", "UTC")
+        if not isinstance(time_zone, str) or not time_zone.strip() or len(time_zone) > 64:
+            raise HTTPException(status_code=400, detail="time_zone должен содержать IANA-идентификатор часового пояса")
+        time_zone = time_zone.strip()
+        try:
+            ZoneInfo(time_zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise HTTPException(status_code=400, detail="Неизвестный часовой пояс")
         now = int(time.time())
         if scheduled_at < now + 10:
             raise HTTPException(status_code=400, detail="Отправка должна быть запланирована минимум через 10 секунд")
@@ -4427,9 +4461,9 @@ def build_messenger_router(
             cur = await db.execute(
                 """INSERT INTO scheduled_messages
                    (sender_telegram_id,recipient_telegram_id,body,scheduled_at,
-                    repeat_interval_seconds,created_at,silent)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (uid, recipient_id, body, scheduled_at, repeat_interval, now, int(silent)),
+                    repeat_interval_seconds,created_at,silent,time_zone)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (uid, recipient_id, body, scheduled_at, repeat_interval, now, int(silent), time_zone),
             )
             scheduled_id = int(cur.lastrowid)
             result = {
@@ -4441,6 +4475,7 @@ def build_messenger_router(
                 "scheduled_at": scheduled_at,
                 "repeat_interval_seconds": repeat_interval,
                 "silent": silent,
+                "time_zone": time_zone,
                 "created_at": now,
             }
             await idempotency_store(db, uid, scope, descriptor, result, now)
@@ -4464,7 +4499,7 @@ def build_messenger_router(
                 raise HTTPException(status_code=404, detail="Собеседник не найден")
             cur = await db.execute(
                 """SELECT id,recipient_telegram_id AS recipient_id,body,scheduled_at,
-                          repeat_interval_seconds,created_at,silent,status,message_id,error
+                          repeat_interval_seconds,created_at,silent,time_zone,status,message_id,error
                    FROM scheduled_messages
                    WHERE sender_telegram_id=? AND recipient_telegram_id=?
                      AND status IN ('pending','failed')
@@ -4765,7 +4800,7 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 """SELECT id,sender_telegram_id,recipient_telegram_id,body,silent,
-                          scheduled_at,repeat_interval_seconds
+                          scheduled_at,repeat_interval_seconds,time_zone
                    FROM scheduled_messages
                    WHERE status='pending' AND scheduled_at<=?
                    ORDER BY scheduled_at ASC,id ASC LIMIT 100""",
@@ -4773,7 +4808,7 @@ def build_messenger_router(
             )
             due = await cur.fetchall()
             for scheduled in due:
-                scheduled_id, sender_id, recipient_id, body, silent, scheduled_at, repeat_interval = scheduled
+                scheduled_id, sender_id, recipient_id, body, silent, scheduled_at, repeat_interval, time_zone = scheduled
                 cur = await db.execute(
                     "SELECT is_banned FROM accounts WHERE telegram_id=?",
                     (sender_id,),
@@ -4822,9 +4857,9 @@ def build_messenger_router(
                     user_a=int(sender_id), user_b=int(recipient_id),
                 )
                 if int(repeat_interval) > 0:
-                    next_scheduled_at = int(scheduled_at) + int(repeat_interval)
-                    while next_scheduled_at <= now:
-                        next_scheduled_at += int(repeat_interval)
+                    next_scheduled_at = _next_recurring_scheduled_timestamp(
+                        int(scheduled_at), now, int(repeat_interval), str(time_zone or "UTC")
+                    )
                     await db.execute(
                         """UPDATE scheduled_messages
                            SET scheduled_at=?,created_at=?,message_id=?,error=''
