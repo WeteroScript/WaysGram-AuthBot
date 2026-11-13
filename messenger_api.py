@@ -1605,8 +1605,13 @@ def build_messenger_router(
                 cur = await db.execute(
                     """SELECT 1 FROM messages
                        WHERE media_id=? AND
-                       (sender_telegram_id=? OR recipient_telegram_id=?) LIMIT 1""",
-                    (media_id, uid, uid),
+                       (sender_telegram_id=? OR recipient_telegram_id=?)
+                         AND NOT EXISTS (
+                             SELECT 1 FROM message_hidden_for hidden
+                             WHERE hidden.message_id=messages.id AND hidden.telegram_id=?
+                         )
+                       LIMIT 1""",
+                    (media_id, uid, uid, uid),
                 )
                 allowed = await cur.fetchone() is not None
             if not allowed:
@@ -4887,6 +4892,10 @@ def build_messenger_router(
                        VALUES(?,?,?)""",
                     (message_id, uid, now),
                 )
+                await record_event(
+                    db, "dm", message_id, "delete_for_me", uid,
+                    user_a=sender_id, user_b=recipient_id,
+                )
                 await db.commit()
                 return {"id": message_id, "status": "hidden_for_me"}
             if sender_id != uid:
@@ -5298,7 +5307,10 @@ def build_messenger_router(
                 cur = await db.execute(
                     """SELECT id,scope,chat_id,user_a,user_b,message_id,kind,actor_id,created_at
                        FROM message_events
-                       WHERE id>? AND actor_id<>? AND (
+                       WHERE id>? AND (
+                           (kind='delete_for_me' AND actor_id=?)
+                           OR (kind<>'delete_for_me' AND actor_id<>?)
+                       ) AND (
                            (scope='dm' AND (user_a=? OR user_b=?))
                            OR (scope='group' AND chat_id IN (SELECT group_id FROM group_members WHERE telegram_id=?))
                            OR (scope='channel' AND chat_id IN (
@@ -5310,7 +5322,7 @@ def build_messenger_router(
                                             WHERE cm.channel_id=ch.id AND cm.telegram_id=?)
                            )))
                        ORDER BY id ASC LIMIT 200""",
-                    (after_id, uid, uid, uid, uid, uid, uid, uid),
+                    (after_id, uid, uid, uid, uid, uid, uid, uid, uid),
                 )
                 rows = [dict(row) for row in await cur.fetchall()]
             if rows or time.monotonic() >= deadline:
