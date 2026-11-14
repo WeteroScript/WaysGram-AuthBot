@@ -3534,6 +3534,12 @@ def build_messenger_router(
             row = await cur.fetchone()
             if row and str(row[0]).strip():
                 return str(row[0])
+        cur = await db.execute(
+            "SELECT 1 FROM telegram_gift_prices WHERE gift_id=?",
+            (gift_id,),
+        )
+        if await cur.fetchone():
+            return f"Telegram Gift {gift_id}"
         return ""
 
     @router.get("/api/telegram/gifts")
@@ -3784,6 +3790,53 @@ def build_messenger_router(
                         "synced_at": int(row["synced_at"]),
                     })
                     known_ids.add(gift_id)
+
+        # Gifts added by the WaysGram administrator by ID remain usable even when
+        # Telegram metadata is absent from both current and historical catalogs.
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                """SELECT p.gift_id FROM telegram_gift_prices p
+                   WHERE NOT EXISTS (SELECT 1 FROM telegram_gift_catalog c WHERE c.gift_id=p.gift_id)
+                     AND NOT EXISTS (SELECT 1 FROM telegram_mtproto_gift_catalog m WHERE m.gift_id=p.gift_id)"""
+            )
+            manual_rows = await cur.fetchall()
+        known_ids = {str(gift["id"]) for gift in gifts}
+        for row in manual_rows:
+            gift_id = str(row[0])
+            if gift_id in known_ids:
+                continue
+            gifts.append({
+                "id": gift_id,
+                "source": "telegram",
+                "catalog_source": "waysgram_manual",
+                "title": f"Telegram Gift {gift_id}",
+                "emoji": "",
+                "star_count": 0,
+                "currency": "telegram_stars",
+                "upgrade_star_count": None,
+                "is_premium": False,
+                "has_colors": False,
+                "is_limited": False,
+                "total_count": None,
+                "remaining_count": None,
+                "personal_total_count": None,
+                "personal_remaining_count": None,
+                "unique_gift_variant_count": 0,
+                "background": None,
+                "publisher_chat": None,
+                "sticker": {
+                    "type": "regular",
+                    "set_name": "",
+                    "width": None,
+                    "height": None,
+                    "is_animated": False,
+                    "is_video": False,
+                    "mime_type": "application/octet-stream",
+                    "url": f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker",
+                },
+                "synced_at": int(time.time()),
+            })
+            known_ids.add(gift_id)
 
         prices = await gift_prices()
         for gift in gifts:
