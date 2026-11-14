@@ -484,6 +484,15 @@ def test_gift_market_listing_purchase_and_cancellation(env) -> None:
             buyer_inventory = (await client.get("/api/me/gifts", headers=headers(102))).json()["gifts"]
             assert len(buyer_inventory) == 1 and buyer_inventory[0]["serial_number"] == serial
             assert buyer_inventory[0]["attributes"]["collectible_traits"] == traits
+            saved = await client.get("/api/messages?with=102", headers=headers(102))
+            purchase_receipts = [
+                message for message in saved.json()["messages"]
+                if message.get("gift_serial_number") == serial
+            ]
+            assert len(purchase_receipts) == 1
+            assert purchase_receipts[0]["gift_name"] == buyer_inventory[0]["gift_name"]
+            assert purchase_receipts[0]["gift_telegram_gift_id"] == "g1"
+            assert purchase_receipts[0]["gift_attributes"] == {"event_type": "purchase"}
             assert (await client.get("/api/gift-market", headers=headers(101))).json()["count"] == 0
 
             # A sold listing cannot be purchased a second time.
