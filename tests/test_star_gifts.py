@@ -545,6 +545,20 @@ def test_collectible_gift_auction_refunds_outbidder_and_settles_ownership(env) -
             assert upgraded.status_code == 200
             traits = upgraded.json()["attributes"]["collectible_traits"]
 
+            # This model is registered as an original Telegram auction release.
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute(
+                    """INSERT INTO telegram_auction_gift_registry
+                       (gift_id,title,auction_slug,auction_start_date,gifts_per_round,
+                        discovered_at,source_payload)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    ("g1", "🎁", "historic-g1", 1700000000, 1000, 1700000001, "{}"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
             created = await client.post(
                 f"/api/gifts/{serial}/auction",
                 headers=headers(101),
@@ -905,3 +919,66 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
             assert public_gift["is_listed"] == 0
 
     run(scenario())
+
+def test_waysgram_auction_requires_historical_telegram_auction_origin(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+            upgraded = await client.post(
+                f"/api/gifts/{serial}/upgrade", headers=headers(101)
+            )
+            assert upgraded.status_code == 200
+
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert inventory[0]["auction_eligible"] == 0
+
+            # Being upgraded/collectible is not sufficient on its own.
+            rejected = await client.post(
+                f"/api/gifts/{serial}/auction",
+                headers=headers(101),
+                json={"starting_price_grams": 5, "duration_seconds": 3600},
+            )
+            assert rejected.status_code == 409
+            assert "исторически" in rejected.json()["detail"].lower()
+
+            # Historical provenance is stored independently from live catalogue availability.
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute(
+                    """INSERT INTO telegram_auction_gift_registry
+                       (gift_id,title,auction_slug,auction_start_date,gifts_per_round,
+                        discovered_at,source_payload)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    ("g1", "🎁", "historic-g1", 1700000000, 1000, 1700000001, "{}"),
+                )
+                connection.execute(
+                    "UPDATE telegram_gift_catalog SET is_available=0 WHERE gift_id='g1'"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert inventory[0]["auction_eligible"] == 1
+            profile = (await client.get("/api/users/101", headers=headers(102))).json()
+            assert profile["gifts"][0]["auction_eligible"] == 1
+
+            # No current Telegram sale/auction is required for a WaysGram auction.
+            created = await client.post(
+                f"/api/gifts/{serial}/auction",
+                headers=headers(101),
+                json={"starting_price_grams": 5, "duration_seconds": 3600},
+            )
+            assert created.status_code == 201
+
+    run(scenario())
+
