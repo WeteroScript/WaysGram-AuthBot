@@ -399,9 +399,13 @@ def test_message_waits_until_recipient_becomes_online(api_env) -> None:
                 assert queued.json()["status"] == "pending"
                 assert queued.json()["trigger"] == "when_online"
 
-                before_online = await client.get("/api/messages?with=89501", headers=recipient)
-                assert before_online.status_code == 200
-                assert before_online.json()["messages"] == []
+                with db_split.sqlite_connect(_path) as db:
+                    before_online_count = db.execute(
+                        """SELECT COUNT(*) FROM messages
+                           WHERE sender_telegram_id=? AND recipient_telegram_id=?""",
+                        (89501, 89502),
+                    ).fetchone()[0]
+                assert before_online_count == 0
 
                 # This authenticated request is the recipient's first online activity.
                 profile = await client.get("/api/me", headers=recipient)
