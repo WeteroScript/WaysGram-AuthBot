@@ -2695,7 +2695,10 @@ def build_messenger_router(
                           upgrade_level,attributes_json,
                           EXISTS(SELECT 1 FROM gift_market_listings l
                                  WHERE l.serial_number=user_gifts.serial_number
-                                   AND l.status='active') AS is_listed
+                                   AND l.status='active') AS is_listed,
+                          EXISTS(SELECT 1 FROM gift_collectible_auctions a
+                                 WHERE a.serial_number=user_gifts.serial_number
+                                   AND a.status='active') AS is_auctioned
                    FROM user_gifts
                    WHERE owner_telegram_id=?
                    ORDER BY id DESC LIMIT 50""",
