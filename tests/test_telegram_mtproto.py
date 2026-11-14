@@ -74,10 +74,14 @@ class FakeMTProtoClient:
         )
         self.requests = []
         self.download_calls = []
+        self.gifts = [self.gift]
+        self.not_modified = False
 
     async def __call__(self, request):
         self.requests.append(request)
-        return SimpleNamespace(gifts=[self.gift])
+        if self.not_modified:
+            return type("StarGiftsNotModified", (), {})()
+        return SimpleNamespace(gifts=self.gifts)
 
     async def download_media(self, document, file=bytes):
         self.download_calls.append(document)
@@ -118,6 +122,10 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
             sync_state = db.execute(
                 "SELECT source,gift_count FROM telegram_gift_sync_state WHERE id=1"
             ).fetchone()
+            auction_registry = db.execute(
+                """SELECT gift_id,title,auction_slug,auction_start_date,gifts_per_round
+                   FROM telegram_auction_gift_registry"""
+            ).fetchone()
 
         assert row == (
             "123456789",
@@ -138,6 +146,10 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
             "image/webp",
         )
         assert sync_state == ("telegram_mtproto", 1)
+        assert auction_registry == (
+            "123456789", "WaysGram catalog test gift", "gift-auction-slug",
+            1700000300, 50,
+        )
 
         sticker, mime_type = await provider.download_sticker("123456789")
         assert sticker == b"telegram-mtproto-sticker"
@@ -149,5 +161,58 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
         assert second_sticker == sticker
         assert second_mime == mime_type
         assert len(client.download_calls) == 1
+
+    asyncio.run(scenario())
+
+
+
+def test_mtproto_registry_records_only_started_auctions_and_is_append_only(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "waysgram.sqlite3"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(database) as db:
+            await db.execute(
+                "CREATE TABLE user_gifts (id INTEGER PRIMARY KEY, serial_number TEXT)"
+            )
+            await db.execute("CREATE TABLE gift_transactions (serial_number TEXT)")
+            await db.commit()
+        await init_messenger_storage(database)
+
+        client = FakeMTProtoClient()
+        client.gift.auction_start_date = 4_000_000_000
+        provider = TelegramMTProtoGiftCatalog(client)
+
+        await provider.sync(database)
+        with db_split.sqlite_connect(database) as db:
+            assert db.execute(
+                "SELECT COUNT(*) FROM telegram_auction_gift_registry"
+            ).fetchone() == (0,)
+
+        # The metadata is already cached. The next Telegram response is
+        # StarGiftsNotModified, but the start date has now passed.
+        client.gift.auction_start_date = 1_700_000_300
+        client.not_modified = True
+        await provider.sync(database)
+        with db_split.sqlite_connect(database) as db:
+            registry = db.execute(
+                """SELECT gift_id,auction_slug,auction_start_date,gifts_per_round
+                   FROM telegram_auction_gift_registry"""
+            ).fetchone()
+        assert registry == ("123456789", "gift-auction-slug", 1_700_000_300, 50)
+
+        # Telegram can later omit the model from its live catalogue. The
+        # availability flag changes, but historical auction provenance remains.
+        client.not_modified = False
+        client.gifts = []
+        await provider.sync(database)
+        with db_split.sqlite_connect(database) as db:
+            availability = db.execute(
+                "SELECT is_available FROM telegram_mtproto_gift_catalog WHERE gift_id='123456789'"
+            ).fetchone()
+            persisted = db.execute(
+                "SELECT COUNT(*) FROM telegram_auction_gift_registry WHERE gift_id='123456789'"
+            ).fetchone()
+        assert availability == (0,)
+        assert persisted == (1,)
 
     asyncio.run(scenario())
