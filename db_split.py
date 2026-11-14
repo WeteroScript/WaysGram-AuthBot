@@ -69,6 +69,7 @@ MESSENGER_TABLES = frozenset(
         "telegram_gift_prices",
         "telegram_gift_sync_state",
         "telegram_mtproto_gift_catalog",
+        "telegram_auction_gift_registry",
     }
 )
 
