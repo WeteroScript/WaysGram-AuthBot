@@ -221,8 +221,13 @@ def test_admin_adds_telegram_gift_by_id(panel) -> None:
 
     prompt = press("wgadm:tgadd")
     assert "Telegram Gift ID" in prompt.sent[0][0]
-    invalid = type_text("unknown-id")
-    assert "не найден ни в текущем, ни в сохранённом историческом каталоге" in invalid.sent[-1][0]
+    added_unknown = type_text("unknown-id")
+    assert "добавлен в управление WaysGram" in added_unknown.sent[0][0]
+    assert "ID: unknown-id" in added_unknown.sent[0][0]
+    assert "метаданные Telegram не найдены" in added_unknown.sent[0][0]
+    assert query(path, "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id='unknown-id'") == [(0, 0)]
+
+    press("wgadm:tgadd")
     added = type_text("g2")
     assert "добавлен в управление" in added.sent[0][0]
     assert "ID: g2" in added.sent[0][0]
