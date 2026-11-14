@@ -343,6 +343,37 @@ def test_direct_message_long_poll_returns_new_message(api_env) -> None:
 
 
 
+def test_mentions_and_hashtag_search_support_chat_links(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89401, "link_sender")
+    add_account(api_env, 89402, "find_me")
+    add_session(path, 89401, "chat-links-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            headers = {"Authorization": "Bearer chat-links-session"}
+            mention = await client.get("/api/users?q=%40find_me", headers=headers)
+            assert mention.status_code == 200
+            assert any(user["username"] == "find_me" for user in mention.json()["users"])
+
+            sent = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={"recipient_id": 89402, "body": "Hello @find_me #featurecheck"},
+            )
+            assert sent.status_code == 201
+
+            hashtag = await client.get(
+                "/api/messages/search?with=89402&q=%23featurecheck",
+                headers=headers,
+            )
+            assert hashtag.status_code == 200
+            assert hashtag.json()["count"] == 1
+            assert hashtag.json()["messages"][0]["id"] == sent.json()["id"]
+
+    run(scenario())
+
+
 def test_recurring_scheduled_messages_keep_local_time_across_dst() -> None:
     zone_name = "Europe/Amsterdam"
     zone = ZoneInfo(zone_name)
