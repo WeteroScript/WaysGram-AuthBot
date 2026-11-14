@@ -3482,8 +3482,9 @@ def build_messenger_router(
             await db.execute(
                 """INSERT INTO message_gifts
                    (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
-                   VALUES(?,?,?,?,0,'{}')""",
-                (saved_message_id, serial, title, gift_id),
+                   VALUES(?,?,?,?,0,?)""",
+                (saved_message_id, serial, title, gift_id,
+                 json.dumps({"event_type": "purchase"}, separators=(",", ":"))),
             )
             await record_event(
                 db, "dm", saved_message_id, "new_message", uid,
@@ -4554,7 +4555,7 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 """SELECT l.id,l.serial_number,l.seller_telegram_id,l.price_grams,
-                          g.id AS gift_instance_id,g.gift_name
+                          g.id AS gift_instance_id,g.gift_name,g.telegram_gift_id
                    FROM gift_market_listings l
                    JOIN user_gifts g ON g.serial_number=l.serial_number
                    WHERE l.id=? AND l.status='active'
@@ -4625,6 +4626,26 @@ def build_messenger_router(
                    (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
                    VALUES('market_sale',?,?,?,?,?)""",
                 (serial, str(listing["gift_name"]), seller_id, buyer_id, now),
+            )
+            cur = await db.execute(
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (buyer_id, buyer_id,
+                 f"Вы приобрели коллекционный подарок «{listing['gift_name']}»", now),
+            )
+            saved_message_id = int(cur.lastrowid)
+            await db.execute(
+                """INSERT INTO message_gifts
+                   (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
+                   VALUES(?,?,?,?,0,?)""",
+                (saved_message_id, serial, str(listing["gift_name"]),
+                 str(listing["telegram_gift_id"] or ""),
+                 json.dumps({"event_type": "purchase"}, separators=(",", ":"))),
+            )
+            await record_event(
+                db, "dm", saved_message_id, "new_message", buyer_id,
+                user_a=buyer_id, user_b=buyer_id,
             )
             await db.commit()
         return {
