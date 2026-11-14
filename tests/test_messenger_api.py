@@ -2985,6 +2985,96 @@ def test_direct_messages_support_structured_contact_cards(api_env) -> None:
     run(scenario())
 
 
+def test_direct_messages_support_explicit_location_sharing(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89601, "location_sender")
+    add_account(api_env, 89602, "location_recipient")
+    add_session(path, 89601, "location-sender-session")
+    add_session(path, 89602, "location-recipient-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer location-sender-session"}
+            recipient = {"Authorization": "Bearer location-recipient-session"}
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89602,
+                    "location": {
+                        "latitude": 51.5074,
+                        "longitude": -0.1278,
+                        "label": "London",
+                    },
+                },
+            )
+            assert sent.status_code == 201
+            assert sent.json()["body"] == "London"
+            assert sent.json()["location"] == {
+                "latitude": 51.5074,
+                "longitude": -0.1278,
+                "label": "London",
+            }
+
+            history = await client.get("/api/messages?with=89601", headers=recipient)
+            assert history.status_code == 200
+            message = history.json()["messages"][-1]
+            assert message["location_latitude"] == 51.5074
+            assert message["location_longitude"] == -0.1278
+            assert message["location_label"] == "London"
+
+            search = await client.get(
+                "/api/messages/search?with=89601&q=London",
+                headers=recipient,
+            )
+            assert search.status_code == 200
+            assert search.json()["messages"][-1]["location_latitude"] == 51.5074
+
+            invalid_latitude = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89602,
+                    "location": {"latitude": 91, "longitude": 0},
+                },
+            )
+            assert invalid_latitude.status_code == 400
+
+            invalid_longitude = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89602,
+                    "location": {"latitude": 0, "longitude": 181},
+                },
+            )
+            assert invalid_longitude.status_code == 400
+
+            invalid_nan = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89602,
+                    "location": {"latitude": float("nan"), "longitude": 0},
+                },
+            )
+            assert invalid_nan.status_code == 400
+
+            mixed = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89602,
+                    "body": "Location with contact",
+                    "location": {"latitude": 0, "longitude": 0},
+                    "contact": {"name": "Sample", "phone": "+31 6 12345678"},
+                },
+            )
+            assert mixed.status_code == 400
+
+    run(scenario())
+
+
 def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 82301
