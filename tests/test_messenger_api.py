@@ -3055,7 +3055,7 @@ def test_direct_messages_support_explicit_location_sharing(api_env) -> None:
                 headers=sender,
                 json={
                     "recipient_id": 89602,
-                    "location": {"latitude": float("nan"), "longitude": 0},
+                    "location": {"latitude": "NaN", "longitude": 0},
                 },
             )
             assert invalid_nan.status_code == 400
