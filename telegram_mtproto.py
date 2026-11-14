@@ -203,7 +203,9 @@ class TelegramMTProtoGiftCatalog:
                            WHERE auction=1
                              AND TRIM(COALESCE(auction_slug,''))<>''
                              AND auction_start_date IS NOT NULL
-                             AND COALESCE(gifts_per_round,0)>0"""
+                              AND auction_start_date<=?
+                             AND COALESCE(gifts_per_round,0)>0""",
+                        (now,),
                     )
                     await db.commit()
                 return {
@@ -283,7 +285,9 @@ class TelegramMTProtoGiftCatalog:
                        WHERE auction=1
                          AND TRIM(COALESCE(auction_slug,''))<>''
                          AND auction_start_date IS NOT NULL
-                         AND COALESCE(gifts_per_round,0)>0"""
+                              AND auction_start_date<=?
+                         AND COALESCE(gifts_per_round,0)>0""",
+                    (now,),
                 )
                 await db.commit()
 
