@@ -3644,6 +3644,7 @@ def build_messenger_router(
     async def process_due_collectible_auctions() -> int:
         now = int(time.time())
         async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             settled = await settle_due_collectible_auctions(db, now)
             await db.commit()
@@ -3717,14 +3718,25 @@ def build_messenger_router(
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            await settle_due_collectible_auctions(db, now)
             cur = await db.execute(
-                "SELECT id,gift_name FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?",
+                "SELECT id,gift_name,upgrade_level,attributes_json FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?",
                 (serial, uid),
             )
             gift = await cur.fetchone()
             if gift is None:
                 await db.rollback()
                 raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
+            try:
+                gift_attributes = json.loads(str(gift["attributes_json"] or "{}"))
+            except (TypeError, ValueError):
+                gift_attributes = {}
+            if (
+                int(gift["upgrade_level"] or 0) < 1
+                or not _has_collectible_traits(gift_attributes)
+            ):
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала улучшите подарок до коллекционного")
             cur = await db.execute(
                 "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
                 (serial,),
@@ -3826,7 +3838,8 @@ def build_messenger_router(
             )
             auction = await cur.fetchone()
             if auction is None or int(auction["ends_at"]) <= now:
-                await db.rollback()
+                # Keep any due-auction settlement performed above.
+                await db.commit()
                 raise HTTPException(status_code=409, detail="Аукцион уже завершён или недоступен")
             seller_id = int(auction["seller_telegram_id"])
             if uid == seller_id:
