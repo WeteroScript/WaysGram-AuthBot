@@ -4942,3 +4942,66 @@ def test_direct_message_media_album_is_atomic_grouped_and_private(api_env) -> No
                 assert denied.status_code == 404
 
     run(scenario())
+
+
+def test_retired_mtproto_gift_is_available_from_historical_catalog(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88101, "retired_gift_user")
+    add_session(path, 88101, "retired-gift-session")
+    now = int(time.time())
+    with db_split.sqlite_connect(path) as db:
+        db.execute(
+            """INSERT INTO telegram_gift_sync_state(id,last_synced_at,gift_count,source)
+               VALUES(1,?,0,'telegram_bot_api')""",
+            (now,),
+        )
+        db.execute(
+            """INSERT INTO telegram_mtproto_gift_catalog
+               (gift_id,title,source_payload,is_available,synced_at)
+               VALUES(?,?,?,?,?)""",
+            (
+                "retired_987654",
+                "Исторический подарок",
+                '{"id":"retired_987654","title":"Исторический подарок"}',
+                0,
+                now - 86400,
+            ),
+        )
+        db.execute(
+            """INSERT INTO telegram_gift_prices
+               (gift_id,price_stars,supply,sold,updated_at)
+               VALUES(?,50,2,0,?)""",
+            ("retired_987654", now),
+        )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = {"Authorization": "Bearer retired-gift-session"}
+            catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
+            assert catalog.status_code == 200
+            gift = next(
+                item for item in catalog.json()["gifts"]
+                if item["id"] == "retired_987654"
+            )
+            assert gift["title"] == "Исторический подарок"
+            assert gift["catalog_source"] == "telegram_mtproto"
+            assert gift["for_sale"] is True
+
+            purchase = await client.post(
+                "/api/telegram/gifts/retired_987654/purchase",
+                headers={**auth, "Idempotency-Key": "retired-gift-purchase-0001"},
+                json={},
+            )
+            assert purchase.status_code == 201
+            assert purchase.json()["gift"]["gift_name"] == "Исторический подарок"
+
+            inventory = await client.get("/api/me/gifts", headers=auth)
+            assert inventory.status_code == 200
+            assert inventory.json()["gifts"][0]["telegram_gift_id"] == "retired_987654"
+
+    run(scenario())
+
+    admin_rows = run(bot_module.telegram_gift_rows())
+    retired = next(row for row in admin_rows if row["id"] == "retired_987654")
+    assert retired["catalog_source"] == "telegram_mtproto"
+    assert retired["telegram_available"] is False
