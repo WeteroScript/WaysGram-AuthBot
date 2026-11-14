@@ -5374,9 +5374,13 @@ def build_messenger_router(
         if location_value is not None:
             if not isinstance(location_value, dict):
                 raise HTTPException(status_code=400, detail="Геолокация должна быть объектом")
+            raw_latitude = location_value.get("latitude")
+            raw_longitude = location_value.get("longitude")
+            if isinstance(raw_latitude, bool) or isinstance(raw_longitude, bool):
+                raise HTTPException(status_code=400, detail="Координаты должны быть числовыми значениями")
             try:
-                latitude = float(location_value.get("latitude"))
-                longitude = float(location_value.get("longitude"))
+                latitude = float(raw_latitude)
+                longitude = float(raw_longitude)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="Укажите корректные координаты")
             if not (-90.0 <= latitude <= 90.0) or not (-180.0 <= longitude <= 180.0):
