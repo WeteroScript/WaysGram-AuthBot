@@ -4948,6 +4948,8 @@ def test_retired_mtproto_gift_is_available_from_historical_catalog(api_env) -> N
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 88101, "retired_gift_user")
     add_session(path, 88101, "retired-gift-session")
+    with db_split.sqlite_connect(path) as db:
+        db.execute("UPDATE accounts SET stars=200 WHERE telegram_id=88101")
     now = int(time.time())
     with db_split.sqlite_connect(path) as db:
         db.execute(
