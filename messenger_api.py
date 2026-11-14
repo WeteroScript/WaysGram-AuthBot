@@ -546,6 +546,35 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON gift_market_listings(status,created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_gift_market_seller
                 ON gift_market_listings(seller_telegram_id,status);
+            CREATE TABLE IF NOT EXISTS gift_collectible_auctions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                serial_number TEXT NOT NULL,
+                seller_telegram_id INTEGER NOT NULL,
+                starting_price_grams INTEGER NOT NULL CHECK(starting_price_grams > 0),
+                current_bid_grams INTEGER NOT NULL DEFAULT 0 CHECK(current_bid_grams >= 0),
+                highest_bidder_telegram_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active','sold','ended','cancelled')),
+                starts_at INTEGER NOT NULL,
+                ends_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                settled_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_gift_collectible_auctions_status_end
+                ON gift_collectible_auctions(status,ends_at);
+            CREATE INDEX IF NOT EXISTS idx_gift_collectible_auctions_serial
+                ON gift_collectible_auctions(serial_number,status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_collectible_auctions_active_serial
+                ON gift_collectible_auctions(serial_number) WHERE status='active';
+            CREATE TABLE IF NOT EXISTS gift_collectible_auction_bids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                auction_id INTEGER NOT NULL,
+                bidder_telegram_id INTEGER NOT NULL,
+                amount_grams INTEGER NOT NULL CHECK(amount_grams > 0),
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_gift_collectible_auction_bids
+                ON gift_collectible_auction_bids(auction_id,id DESC);
             CREATE TABLE IF NOT EXISTS telegram_gift_catalog (
                 gift_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -2399,7 +2428,10 @@ def build_messenger_router(
                           upgrade_level,attributes_json,
                           EXISTS(SELECT 1 FROM gift_market_listings l
                                  WHERE l.serial_number=user_gifts.serial_number
-                                   AND l.status='active') AS is_listed
+                                   AND l.status='active') AS is_listed,
+                          EXISTS(SELECT 1 FROM gift_collectible_auctions a
+                                 WHERE a.serial_number=user_gifts.serial_number
+                                   AND a.status='active') AS is_auctioned
                    FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
                 (int(user["telegram_id"]),),
             )
@@ -3469,6 +3501,13 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Сначала снимите подарок с продажи")
             cur = await db.execute(
+                "SELECT 1 FROM gift_collectible_auctions WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала отмените аукцион подарка")
+            cur = await db.execute(
                 "UPDATE user_gifts SET owner_telegram_id=? WHERE id=? AND owner_telegram_id=?",
                 (target_id, int(gift["id"]), uid),
             )
@@ -3492,6 +3531,383 @@ def build_messenger_router(
             await idempotency_store(db, uid, "/api/gifts/transfer", descriptor, result, now)
             await db.commit()
         return result
+
+    async def settle_due_collectible_auctions(db: Any, now: int) -> int:
+        cur = await db.execute(
+            """SELECT id,serial_number,seller_telegram_id,current_bid_grams,
+                      highest_bidder_telegram_id
+               FROM gift_collectible_auctions
+               WHERE status='active' AND ends_at<=?
+               ORDER BY ends_at,id""",
+            (now,),
+        )
+        due = await cur.fetchall()
+        settled = 0
+        for auction in due:
+            auction_id = int(auction["id"])
+            serial = str(auction["serial_number"])
+            seller_id = int(auction["seller_telegram_id"])
+            bidder_value = auction["highest_bidder_telegram_id"]
+            bid = int(auction["current_bid_grams"])
+            if bidder_value is None or bid <= 0:
+                await db.execute(
+                    "UPDATE gift_collectible_auctions SET status='ended',settled_at=? WHERE id=? AND status='active'",
+                    (now, auction_id),
+                )
+                settled += 1
+                continue
+
+            bidder_id = int(bidder_value)
+            cur = await db.execute(
+                "SELECT id,gift_name FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?",
+                (serial, seller_id),
+            )
+            gift = await cur.fetchone()
+            cur = await db.execute(
+                "SELECT grams,is_banned FROM accounts WHERE telegram_id=?",
+                (seller_id,),
+            )
+            seller = await cur.fetchone()
+            cur = await db.execute(
+                "SELECT grams,is_banned FROM accounts WHERE telegram_id=?",
+                (bidder_id,),
+            )
+            bidder = await cur.fetchone()
+
+            if gift is None or seller is None or bidder is None or seller["is_banned"] or bidder["is_banned"]:
+                if bidder is not None:
+                    refunded_balance = int(bidder["grams"]) + bid
+                    await db.execute(
+                        "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                        (refunded_balance, now, bidder_id),
+                    )
+                    await db.execute(
+                        """INSERT INTO economy_transactions
+                           (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                           VALUES(?,'grams',?,?,?,NULL,?)""",
+                        (bidder_id, bid, refunded_balance, f"gift_auction_refund:{auction_id}", now),
+                    )
+                await db.execute(
+                    "UPDATE gift_collectible_auctions SET status='cancelled',settled_at=? WHERE id=? AND status='active'",
+                    (now, auction_id),
+                )
+                settled += 1
+                continue
+
+            cur = await db.execute(
+                "UPDATE user_gifts SET owner_telegram_id=? WHERE id=? AND owner_telegram_id=?",
+                (bidder_id, int(gift["id"]), seller_id),
+            )
+            if cur.rowcount != 1:
+                refunded_balance = int(bidder["grams"]) + bid
+                await db.execute(
+                    "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                    (refunded_balance, now, bidder_id),
+                )
+                await db.execute(
+                    """INSERT INTO economy_transactions
+                       (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                       VALUES(?,'grams',?,?,?,NULL,?)""",
+                    (bidder_id, bid, refunded_balance, f"gift_auction_refund:{auction_id}", now),
+                )
+                await db.execute(
+                    "UPDATE gift_collectible_auctions SET status='cancelled',settled_at=? WHERE id=? AND status='active'",
+                    (now, auction_id),
+                )
+                settled += 1
+                continue
+
+            seller_balance = int(seller["grams"]) + bid
+            await db.execute(
+                "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                (seller_balance, now, seller_id),
+            )
+            await db.execute(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,'grams',?,?,?,NULL,?)""",
+                (seller_id, bid, seller_balance, f"gift_auction_sale:{auction_id}", now),
+            )
+            await db.execute(
+                """INSERT INTO gift_transactions
+                   (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
+                   VALUES('auction_sale',?,?,?,?,?)""",
+                (serial, str(gift["gift_name"]), seller_id, bidder_id, now),
+            )
+            await db.execute(
+                "UPDATE gift_collectible_auctions SET status='sold',settled_at=? WHERE id=? AND status='active'",
+                (now, auction_id),
+            )
+            settled += 1
+        return settled
+
+    async def process_due_collectible_auctions() -> int:
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            settled = await settle_due_collectible_auctions(db, now)
+            await db.commit()
+        return settled
+
+    @router.get("/api/gift-auctions")
+    async def list_collectible_gift_auctions(
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        viewer = await current_user(authorization)
+        viewer_id = int(viewer["telegram_id"])
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            settled = await settle_due_collectible_auctions(db, now)
+            cur = await db.execute(
+                """SELECT a.id AS auction_id,a.serial_number,a.seller_telegram_id,
+                          a.starting_price_grams,a.current_bid_grams,
+                          a.highest_bidder_telegram_id,a.starts_at,a.ends_at,
+                          g.gift_name,g.telegram_gift_id,g.upgrade_level,g.attributes_json,
+                          seller.username AS seller_username,seller.display_name AS seller_display_name,
+                          (SELECT COUNT(*) FROM gift_collectible_auction_bids b
+                           WHERE b.auction_id=a.id) AS bid_count,
+                          CASE WHEN a.current_bid_grams=0 THEN a.starting_price_grams
+                               ELSE a.current_bid_grams+1 END AS minimum_bid_grams
+                   FROM gift_collectible_auctions a
+                   JOIN user_gifts g ON g.serial_number=a.serial_number
+                   JOIN accounts seller ON seller.telegram_id=a.seller_telegram_id
+                   WHERE a.status='active'
+                   ORDER BY a.ends_at ASC,a.id ASC LIMIT 100"""
+            )
+            rows = await cur.fetchall()
+            await db.commit()
+        auctions = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["attributes"] = json.loads(item.pop("attributes_json") or "{}")
+            except (TypeError, ValueError):
+                item["attributes"] = {}
+            item["is_own_auction"] = int(item["seller_telegram_id"]) == viewer_id
+            auctions.append(item)
+        return {"auctions": auctions, "count": len(auctions), "settled_count": settled, "currency": "grams"}
+
+    @router.post("/api/gifts/{serial_number}/auction", status_code=201)
+    async def create_collectible_gift_auction(
+        serial_number: str,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        serial = serial_number.strip().upper()
+        if not GIFT_SERIAL_RE.fullmatch(serial):
+            raise HTTPException(status_code=400, detail="Некорректный серийный номер подарка")
+        raw_start = payload.get("starting_price_grams")
+        raw_duration = payload.get("duration_seconds", 86400)
+        if isinstance(raw_start, bool) or isinstance(raw_duration, bool):
+            raise HTTPException(status_code=400, detail="Цена и срок аукциона должны быть целыми числами")
+        try:
+            starting_price = int(raw_start)
+            duration = int(raw_duration)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Укажите стартовую цену и срок аукциона")
+        if not 1 <= starting_price <= 1_000_000_000:
+            raise HTTPException(status_code=400, detail="Стартовая цена должна быть от 1 до 1000000000 Gram")
+        if duration not in (3600, 21600, 86400, 259200, 604800):
+            raise HTTPException(status_code=400, detail="Срок аукциона: 1, 6, 24, 72 или 168 часов")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT id,gift_name FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?",
+                (serial, uid),
+            )
+            gift = await cur.fetchone()
+            if gift is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Подарок не найден в вашем инвентаре")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала снимите подарок с фиксированной продажи")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_collectible_auctions WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Подарок уже выставлен на аукцион")
+            ends_at = now + duration
+            cur = await db.execute(
+                """INSERT INTO gift_collectible_auctions
+                   (serial_number,seller_telegram_id,starting_price_grams,current_bid_grams,
+                    highest_bidder_telegram_id,status,starts_at,ends_at,created_at)
+                   VALUES(?,?,?,0,NULL,'active',?,?,?)""",
+                (serial, uid, starting_price, now, ends_at, now),
+            )
+            auction_id = int(cur.lastrowid)
+            await db.commit()
+        return {
+            "status": "created",
+            "auction_id": auction_id,
+            "serial_number": serial,
+            "gift_name": str(gift["gift_name"]),
+            "starting_price_grams": starting_price,
+            "current_bid_grams": 0,
+            "minimum_bid_grams": starting_price,
+            "starts_at": now,
+            "ends_at": ends_at,
+            "currency": "grams",
+        }
+
+    @router.delete("/api/gifts/{serial_number}/auction")
+    async def cancel_collectible_gift_auction(
+        serial_number: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        serial = serial_number.strip().upper()
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT id,current_bid_grams,highest_bidder_telegram_id
+                   FROM gift_collectible_auctions
+                   WHERE serial_number=? AND seller_telegram_id=? AND status='active'""",
+                (serial, uid),
+            )
+            auction = await cur.fetchone()
+            if auction is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Активный аукцион не найден")
+            if auction["highest_bidder_telegram_id"] is not None or int(auction["current_bid_grams"]) > 0:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Нельзя отменить аукцион после первой ставки")
+            await db.execute(
+                "UPDATE gift_collectible_auctions SET status='cancelled',settled_at=? WHERE id=? AND status='active'",
+                (now, int(auction["id"])),
+            )
+            await db.commit()
+        return {"status": "cancelled", "serial_number": serial, "auction_id": int(auction["id"])}
+
+    @router.post("/api/gift-auctions/{auction_id}/bid", status_code=201)
+    async def place_collectible_gift_auction_bid(
+        auction_id: int,
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if auction_id <= 0:
+            raise HTTPException(status_code=400, detail="Некорректный ID аукциона")
+        raw_amount = payload.get("amount_grams")
+        if isinstance(raw_amount, bool):
+            raise HTTPException(status_code=400, detail="Ставка должна быть целым числом Gram")
+        try:
+            amount = int(raw_amount)
+        except (TypeError, ValueError):
+            amount = 0
+        if not 1 <= amount <= 1_000_000_000:
+            raise HTTPException(status_code=400, detail="Ставка должна быть от 1 до 1000000000 Gram")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await settle_due_collectible_auctions(db, now)
+            cur = await db.execute(
+                """SELECT id,serial_number,seller_telegram_id,starting_price_grams,
+                          current_bid_grams,highest_bidder_telegram_id,ends_at
+                   FROM gift_collectible_auctions WHERE id=? AND status='active'""",
+                (auction_id,),
+            )
+            auction = await cur.fetchone()
+            if auction is None or int(auction["ends_at"]) <= now:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Аукцион уже завершён или недоступен")
+            seller_id = int(auction["seller_telegram_id"])
+            if uid == seller_id:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Нельзя делать ставку на собственный подарок")
+            current_bid = int(auction["current_bid_grams"])
+            previous_bidder_value = auction["highest_bidder_telegram_id"]
+            previous_bidder = int(previous_bidder_value) if previous_bidder_value is not None else None
+            minimum = int(auction["starting_price_grams"]) if current_bid == 0 else current_bid + 1
+            if amount < minimum:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail=f"Минимальная следующая ставка: {minimum} Gram")
+            cur = await db.execute(
+                "SELECT grams,is_banned FROM accounts WHERE telegram_id=?",
+                (uid,),
+            )
+            bidder = await cur.fetchone()
+            if bidder is None or bidder["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Аккаунт недоступен")
+            available = int(bidder["grams"]) + (current_bid if previous_bidder == uid else 0)
+            if available < amount:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Недостаточно Gram для ставки")
+            if previous_bidder is not None and current_bid > 0:
+                cur = await db.execute(
+                    "SELECT grams FROM accounts WHERE telegram_id=?",
+                    (previous_bidder,),
+                )
+                previous_account = await cur.fetchone()
+                if previous_account is not None:
+                    refund_balance = int(previous_account["grams"]) + current_bid
+                    await db.execute(
+                        "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                        (refund_balance, now, previous_bidder),
+                    )
+                    await db.execute(
+                        """INSERT INTO economy_transactions
+                           (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                           VALUES(?,'grams',?,?,?,NULL,?)""",
+                        (previous_bidder, current_bid, refund_balance,
+                         f"gift_auction_outbid_refund:{auction_id}", now),
+                    )
+            cur = await db.execute("SELECT grams FROM accounts WHERE telegram_id=?", (uid,))
+            current_account = await cur.fetchone()
+            new_balance = int(current_account["grams"]) - amount
+            if new_balance < 0:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Недостаточно Gram для ставки")
+            await db.execute(
+                "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                (new_balance, now, uid),
+            )
+            await db.execute(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,'grams',?,?,?,NULL,?)""",
+                (uid, -amount, new_balance, f"gift_auction_bid:{auction_id}", now),
+            )
+            await db.execute(
+                """INSERT INTO gift_collectible_auction_bids
+                   (auction_id,bidder_telegram_id,amount_grams,created_at)
+                   VALUES(?,?,?,?)""",
+                (auction_id, uid, amount, now),
+            )
+            await db.execute(
+                """UPDATE gift_collectible_auctions
+                   SET current_bid_grams=?,highest_bidder_telegram_id=?
+                   WHERE id=? AND status='active'""",
+                (amount, uid, auction_id),
+            )
+            await db.commit()
+        return {
+            "status": "accepted",
+            "auction_id": auction_id,
+            "serial_number": str(auction["serial_number"]),
+            "bid_grams": amount,
+            "minimum_next_bid_grams": amount + 1,
+            "grams_balance": new_balance,
+            "ends_at": int(auction["ends_at"]),
+        }
 
     @router.get("/api/gift-market")
     async def list_gift_market(
@@ -3567,6 +3983,13 @@ def build_messenger_router(
             if previous_listing and str(previous_listing["status"]) == "active":
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Подарок уже выставлен на продажу")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_collectible_auctions WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала отмените аукцион подарка")
             if previous_listing:
                 listing_id = int(previous_listing["id"])
                 await db.execute(
@@ -3744,6 +4167,13 @@ def build_messenger_router(
             if await cur.fetchone():
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Сначала снимите подарок с продажи")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_collectible_auctions WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала отмените аукцион подарка")
             if not str(gift["telegram_gift_id"] or ""):
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Этот подарок нельзя улучшить")
@@ -5152,6 +5582,13 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Сначала снимите подарок с продажи")
             cur = await db.execute(
+                "SELECT 1 FROM gift_collectible_auctions WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Сначала отмените аукцион подарка")
+            cur = await db.execute(
                 "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND created_at>?",
                 (uid, now - 60),
             )
@@ -5449,12 +5886,17 @@ def build_messenger_router(
     scheduled_worker_task: asyncio.Task | None = None
 
     async def scheduled_message_worker() -> None:
+        last_auction_settlement = 0
         while True:
             try:
                 await process_due_scheduled_messages()
+                now = int(time.time())
+                if now - last_auction_settlement >= 5:
+                    await process_due_collectible_auctions()
+                    last_auction_settlement = now
             except Exception as exc:
                 LOGGER.warning(
-                    "Scheduled message processing failed (%s)",
+                    "Scheduled message or collectible auction processing failed (%s)",
                     type(exc).__name__,
                 )
             await asyncio.sleep(1.0)
