@@ -448,6 +448,12 @@ async def init_messenger_storage(database_path: Path) -> None:
                 upgrade_level INTEGER NOT NULL DEFAULT 0,
                 attributes_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS message_contacts (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                contact_name TEXT NOT NULL,
+                contact_phone TEXT NOT NULL,
+                contact_email TEXT NOT NULL DEFAULT ''
+            );
             CREATE INDEX IF NOT EXISTS idx_message_gifts_serial
                 ON message_gifts(serial_number);
             CREATE INDEX IF NOT EXISTS idx_api_messages_pair
@@ -5140,6 +5146,9 @@ def build_messenger_router(
                    (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                    (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name,
                    (SELECT media_kind FROM media_assets WHERE id=messages.media_id) AS media_kind,
+                   (SELECT contact_name FROM message_contacts WHERE message_id=messages.id) AS contact_name,
+                   (SELECT contact_phone FROM message_contacts WHERE message_id=messages.id) AS contact_phone,
+                   (SELECT contact_email FROM message_contacts WHERE message_id=messages.id) AS contact_email,
                    gift_attachment.serial_number AS gift_serial_number,
                    gift_attachment.gift_name AS gift_name,
                    gift_attachment.telegram_gift_id AS gift_telegram_gift_id,
@@ -5310,7 +5319,10 @@ def build_messenger_router(
                             WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                           (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                           (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name,
-                          (SELECT media_kind FROM media_assets WHERE id=messages.media_id) AS media_kind
+                          (SELECT media_kind FROM media_assets WHERE id=messages.media_id) AS media_kind,
+                          (SELECT contact_name FROM message_contacts WHERE message_id=messages.id) AS contact_name,
+                          (SELECT contact_phone FROM message_contacts WHERE message_id=messages.id) AS contact_phone,
+                          (SELECT contact_email FROM message_contacts WHERE message_id=messages.id) AS contact_email
                    FROM messages
                    WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
                           (sender_telegram_id=? AND recipient_telegram_id=?))
@@ -5343,8 +5355,33 @@ def build_messenger_router(
         if recipient_id <= 0:
             raise HTTPException(status_code=400, detail="Укажите корректного получателя")
         media_id = str(payload.get("media_id") or "").strip() or None
+        contact_value = payload.get("contact")
+        contact_payload: dict[str, str] | None = None
+        if contact_value is not None:
+            if not isinstance(contact_value, dict):
+                raise HTTPException(status_code=400, detail="Контакт должен быть объектом")
+            contact_name = str(contact_value.get("name") or "").strip()
+            contact_phone = str(contact_value.get("phone") or "").strip()
+            contact_email = str(contact_value.get("email") or "").strip()
+            if not contact_name or len(contact_name) > 120:
+                raise HTTPException(status_code=400, detail="Укажите имя контакта до 120 символов")
+            if not re.fullmatch(r"[+0-9(). -]{5,32}", contact_phone):
+                raise HTTPException(status_code=400, detail="Некорректный номер телефона контакта")
+            if len(contact_email) > 254 or (
+                contact_email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", contact_email)
+            ):
+                raise HTTPException(status_code=400, detail="Некорректный адрес электронной почты контакта")
+            if media_id:
+                raise HTTPException(status_code=400, detail="Нельзя отправлять контакт вместе с файлом")
+            contact_payload = {
+                "name": contact_name,
+                "phone": contact_phone,
+                "email": contact_email,
+            }
         body_value = str(payload.get("body") or "")
         body = _message_body(body_value) if body_value.strip() or not media_id else ""
+        if contact_payload and not body:
+            body = "Контакт: " + contact_payload["name"]
         silent = payload.get("silent", False)
         if not isinstance(silent, bool):
             raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
@@ -5403,6 +5440,18 @@ def build_messenger_router(
                 (uid, recipient_id, body, media_id, reply_to_id, now),
             )
             message_id = int(cur.lastrowid)
+            if contact_payload:
+                await db.execute(
+                    """INSERT INTO message_contacts
+                       (message_id,contact_name,contact_phone,contact_email)
+                       VALUES(?,?,?,?)""",
+                    (
+                        message_id,
+                        contact_payload["name"],
+                        contact_payload["phone"],
+                        contact_payload["email"],
+                    ),
+                )
             await record_event(
                 db, "dm", message_id, "new_message", uid,
                 user_a=uid, user_b=recipient_id,
@@ -5415,6 +5464,7 @@ def build_messenger_router(
                 "body": body,
                 "media_id": media_id,
                 "reply_to_id": reply_to_id,
+                "contact": contact_payload,
                 **media_fields,
                 "created_at": now,
             }
