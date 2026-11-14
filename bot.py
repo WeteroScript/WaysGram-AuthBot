@@ -281,7 +281,7 @@ class Store:
                 """INSERT INTO users(telegram_id, chat_id, username, created_at)
                    VALUES(?, ?, ?, ?) ON CONFLICT(telegram_id)
                    DO UPDATE SET chat_id=excluded.chat_id,
-                       username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE users.username END""",
+                       username=excluded.username""",
                 (telegram_id, chat_id, username.lstrip("@").lower()[:32], int(time.time())),
             )
             await db.commit()
