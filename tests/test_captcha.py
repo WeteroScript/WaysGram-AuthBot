@@ -149,6 +149,7 @@ def test_language_button_does_not_repeat_captcha_for_verified_user(store):
 
 def test_stale_captcha_button_does_not_restart_verification_after_success(store):
     run(store.set_verified(5, True))
+    run(store.set_language(5, "en"))
     message = FakeMessage()
     callback = FakeCallback(5, "cap:already-used:0", message)
     run(bot_module.captcha_handler(callback))
