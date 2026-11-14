@@ -836,7 +836,7 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["gift_name"] == "🎁"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
-            assert receipt["gift_attributes"] == {}
+            assert receipt["gift_attributes"] == {"event_type": "purchase"}
 
     run(scenario())
 
