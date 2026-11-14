@@ -2041,13 +2041,6 @@ def build_messenger_router(
         if not re.fullmatch(r"[a-f0-9]{32}", media_id):
             raise HTTPException(status_code=404, detail="Аудиофайл не найден")
 
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="Расшифровка пока не настроена на сервере WaysGram",
-            )
-
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -2092,6 +2085,13 @@ def build_messenger_router(
                 "cached": True,
                 "created_at": int(cached["created_at"]),
             }
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Расшифровка пока не настроена на сервере WaysGram",
+            )
 
         if int(media["size_bytes"]) > MAX_DOCUMENT_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail="Аудиофайл превышает лимит расшифровки 25 МБ")
