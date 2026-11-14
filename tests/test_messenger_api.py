@@ -382,7 +382,8 @@ def test_message_waits_until_recipient_becomes_online(api_env) -> None:
     add_session(_path, 89502, "online-recipient-session")
 
     async def scenario() -> None:
-        await app.router.startup()
+        for startup_handler in app.router.on_startup:
+            await startup_handler()
         try:
             async with await client_for(app) as client:
                 sender = {"Authorization": "Bearer online-sender-session"}
@@ -440,7 +441,8 @@ def test_message_waits_until_recipient_becomes_online(api_env) -> None:
                 assert cancelled.status_code == 200
                 assert cancelled.json()["status"] == "cancelled"
         finally:
-            await app.router.shutdown()
+            for shutdown_handler in reversed(app.router.on_shutdown):
+                await shutdown_handler()
 
     run(scenario())
 
