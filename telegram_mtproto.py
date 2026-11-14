@@ -276,14 +276,14 @@ class TelegramMTProtoGiftCatalog:
                 await db.execute(
                     """INSERT OR IGNORE INTO telegram_auction_gift_registry
                        (gift_id,title,auction_slug,auction_start_date,gifts_per_round,
-                discovered_at,source_payload)
+                        discovered_at,source_payload)
                        SELECT gift_id,title,auction_slug,auction_start_date,gifts_per_round,
-                      synced_at,source_payload
+                              synced_at,source_payload
                        FROM telegram_mtproto_gift_catalog
                        WHERE auction=1
-                 AND TRIM(COALESCE(auction_slug,''))<>''
-                 AND auction_start_date IS NOT NULL
-                 AND COALESCE(gifts_per_round,0)>0"""
+                         AND TRIM(COALESCE(auction_slug,''))<>''
+                         AND auction_start_date IS NOT NULL
+                         AND COALESCE(gifts_per_round,0)>0"""
                 )
                 await db.commit()
 
