@@ -1575,6 +1575,40 @@ def test_document_upload_attachment_and_private_download(api_env) -> None:
             assert text_download.headers["content-disposition"].startswith("attachment;")
             assert text_download.content == text_bytes
 
+            archive_fixtures = [
+                ("backup.rar", "application/vnd.rar", b"Rar!\x1a\x07\x00" + b"\x00" * 32),
+                ("backup.7z", "application/x-7z-compressed", b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32),
+                ("backup.tar", "application/x-tar", b"\x00" * 257 + b"ustar" + b"\x00" * 250),
+                ("backup.gz", "application/gzip", b"\x1f\x8b\x08" + b"\x00" * 20),
+                ("backup.bz2", "application/x-bzip2", b"BZh9" + b"\x00" * 20),
+                ("backup.xz", "application/x-xz", b"\xfd7zXZ\x00" + b"\x00" * 20),
+                ("backup.tar.gz", "application/gzip", b"\x1f\x8b\x08" + b"\x00" * 20),
+            ]
+            for archive_name, mime_type, archive_bytes in archive_fixtures:
+                archive_upload = await client.post(
+                    "/api/media/documents",
+                    headers={
+                        **sender,
+                        "Content-Type": mime_type,
+                        "X-Filename": archive_name,
+                    },
+                    content=archive_bytes,
+                )
+                assert archive_upload.status_code == 201, archive_name
+                archive_media = archive_upload.json()
+                assert archive_media["mime_type"] == mime_type
+                assert archive_media["name"] == archive_name
+                archive_download = await client.get(archive_media["url"], headers=sender)
+                assert archive_download.status_code == 200, archive_name
+                assert archive_download.content == archive_bytes, archive_name
+
+            invalid_rar = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "application/vnd.rar", "X-Filename": "broken.rar"},
+                content=b"not a RAR archive",
+            )
+            assert invalid_rar.status_code == 415
+
     run(scenario())
 
 def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> None:
