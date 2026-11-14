@@ -324,6 +324,12 @@ async def init_messenger_storage(database_path: Path) -> None:
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS api_user_presence (
+                telegram_id INTEGER PRIMARY KEY,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_user_presence_seen
+                ON api_user_presence(last_seen_at);
             CREATE TABLE IF NOT EXISTS push_devices (
                 token_hash TEXT PRIMARY KEY,
                 token_value TEXT NOT NULL,
@@ -524,6 +530,22 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON scheduled_messages(status,scheduled_at,id);
             CREATE INDEX IF NOT EXISTS idx_scheduled_messages_owner
                 ON scheduled_messages(sender_telegram_id,recipient_telegram_id,status);
+            CREATE TABLE IF NOT EXISTS online_scheduled_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_telegram_id INTEGER NOT NULL,
+                recipient_telegram_id INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                silent INTEGER NOT NULL DEFAULT 0 CHECK(silent IN (0,1)),
+                created_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','sent','cancelled','failed')),
+                message_id INTEGER,
+                error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_online_scheduled_status
+                ON online_scheduled_messages(status,created_at,id);
+            CREATE INDEX IF NOT EXISTS idx_online_scheduled_owner
+                ON online_scheduled_messages(sender_telegram_id,recipient_telegram_id,status);
             CREATE TABLE IF NOT EXISTS telegram_gift_prices (
                 gift_id TEXT PRIMARY KEY,
                 price_stars INTEGER NOT NULL DEFAULT 0 CHECK(price_stars >= 0),
@@ -1422,8 +1444,15 @@ def build_messenger_router(
                 await db.commit()
                 raise HTTPException(status_code=401, detail="Сессия истекла или недействительна")
             user = dict(row)
-        if user["is_banned"]:
-            raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+            if user["is_banned"]:
+                raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+            await db.execute(
+                """INSERT INTO api_user_presence(telegram_id,last_seen_at) VALUES(?,?)
+                   ON CONFLICT(telegram_id) DO UPDATE SET last_seen_at=excluded.last_seen_at
+                   WHERE api_user_presence.last_seen_at <= excluded.last_seen_at - 10""",
+                (int(user["telegram_id"]), now),
+            )
+            await db.commit()
         return user
 
     def public_session_id(token_hash: str) -> str:
@@ -5584,6 +5613,123 @@ def build_messenger_router(
             await db.commit()
         return result
 
+    @router.post("/api/messages/when-online", status_code=201)
+    async def schedule_message_when_online(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            recipient_id = int(payload.get("recipient_id", 0))
+        except (TypeError, ValueError):
+            recipient_id = 0
+        if recipient_id <= 0 or recipient_id == uid:
+            raise HTTPException(status_code=400, detail="Укажите другого получателя")
+        body_value = payload.get("body")
+        if not isinstance(body_value, str):
+            raise HTTPException(status_code=400, detail="Укажите текст сообщения")
+        body = _message_body(body_value)
+        silent = payload.get("silent", False)
+        if not isinstance(silent, bool):
+            raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
+        now = int(time.time())
+        scope = "/api/messages/when-online"
+        descriptor = idempotency_descriptor(scope, payload, idempotency_key)
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
+            cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?", (recipient_id,)
+            )
+            recipient = await cur.fetchone()
+            if recipient is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Получатель не найден")
+            if recipient[0]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?) LIMIT 1""",
+                (uid, recipient_id, recipient_id, uid),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Нельзя отправить сообщение: пользователь находится в чёрном списке")
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM online_scheduled_messages WHERE sender_telegram_id=? AND status='pending'",
+                (uid,),
+            )
+            if int((await cur.fetchone())[0]) >= 100:
+                await db.rollback()
+                raise HTTPException(status_code=429, detail="Слишком много сообщений ожидают появления получателей онлайн")
+            cur = await db.execute(
+                """INSERT INTO online_scheduled_messages
+                   (sender_telegram_id,recipient_telegram_id,body,silent,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (uid, recipient_id, body, int(silent), now),
+            )
+            scheduled_id = int(cur.lastrowid)
+            result = {
+                "id": scheduled_id,
+                "status": "pending",
+                "trigger": "when_online",
+                "sender_id": uid,
+                "recipient_id": recipient_id,
+                "body": body,
+                "silent": silent,
+                "created_at": now,
+            }
+            await idempotency_store(db, uid, scope, descriptor, result, now)
+            await db.commit()
+        return result
+
+    @router.get("/api/messages/when-online")
+    async def list_messages_waiting_for_online(
+        peer: int = Query(alias="with", gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,recipient_telegram_id AS recipient_id,body,silent,created_at,status,message_id,error
+                   FROM online_scheduled_messages
+                   WHERE sender_telegram_id=? AND recipient_telegram_id=?
+                     AND status IN ('pending','failed')
+                   ORDER BY created_at,id LIMIT 100""",
+                (uid, peer),
+            )
+            rows = [dict(row) for row in await cur.fetchall()]
+        return {"scheduled_messages": rows, "count": len(rows)}
+
+    @router.delete("/api/messages/when-online/{scheduled_id}")
+    async def cancel_message_waiting_for_online(
+        scheduled_id: int,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """UPDATE online_scheduled_messages SET status='cancelled'
+                   WHERE id=? AND sender_telegram_id=? AND status='pending'""",
+                (scheduled_id, uid),
+            )
+            if cur.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Сообщение, ожидающее онлайна, не найдено или уже обработано")
+            await db.commit()
+        return {"id": scheduled_id, "status": "cancelled"}
+
     @router.get("/api/messages/scheduled")
     async def list_scheduled_messages(
         peer: int = Query(alias="with", gt=0),
@@ -6001,6 +6147,87 @@ def build_messenger_router(
                 },
             )
 
+    async def process_messages_waiting_for_online() -> None:
+        now = int(time.time())
+        notifications: list[tuple[int, int, str, int]] = []
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT queued.id,queued.sender_telegram_id,queued.recipient_telegram_id,
+                          queued.body,queued.silent
+                   FROM online_scheduled_messages queued
+                   JOIN api_user_presence presence
+                     ON presence.telegram_id=queued.recipient_telegram_id
+                   WHERE queued.status='pending'
+                     AND presence.last_seen_at>=queued.created_at
+                     AND presence.last_seen_at>=?
+                   ORDER BY queued.created_at,queued.id LIMIT 100""",
+                (now - 45,),
+            )
+            due = await cur.fetchall()
+            for queued in due:
+                scheduled_id, sender_id, recipient_id, body, silent = queued
+                cur = await db.execute(
+                    "SELECT is_banned FROM accounts WHERE telegram_id=?", (sender_id,)
+                )
+                sender = await cur.fetchone()
+                cur = await db.execute(
+                    "SELECT is_banned FROM accounts WHERE telegram_id=?", (recipient_id,)
+                )
+                recipient = await cur.fetchone()
+                failure = ""
+                if sender is None or sender[0]:
+                    failure = "Аккаунт отправителя недоступен"
+                elif recipient is None or recipient[0]:
+                    failure = "Получатель недоступен"
+                else:
+                    cur = await db.execute(
+                        """SELECT 1 FROM blocked_users
+                           WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                              OR (owner_telegram_id=? AND blocked_telegram_id=?) LIMIT 1""",
+                        (sender_id, recipient_id, recipient_id, sender_id),
+                    )
+                    if await cur.fetchone():
+                        failure = "Пользователь находится в чёрном списке"
+                if failure:
+                    await db.execute(
+                        "UPDATE online_scheduled_messages SET status='failed',error=? WHERE id=? AND status='pending'",
+                        (failure, scheduled_id),
+                    )
+                    continue
+                cur = await db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE sender_telegram_id=? AND created_at>?",
+                    (sender_id, now - 60),
+                )
+                if int((await cur.fetchone())[0]) >= DM_MESSAGES_PER_MINUTE:
+                    continue
+                cur = await db.execute(
+                    """INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at)
+                       VALUES(?,?,?,?)""",
+                    (sender_id, recipient_id, body, now),
+                )
+                message_id = int(cur.lastrowid)
+                await record_event(
+                    db, "dm", message_id, "new_message", int(sender_id),
+                    user_a=int(sender_id), user_b=int(recipient_id),
+                )
+                await db.execute(
+                    """UPDATE online_scheduled_messages
+                       SET status='sent',message_id=?,error=''
+                       WHERE id=? AND status='pending'""",
+                    (message_id, scheduled_id),
+                )
+                if not bool(silent):
+                    notifications.append((int(recipient_id), int(sender_id), str(body), message_id))
+            await db.commit()
+        for recipient_id, sender_id, body, message_id in notifications:
+            await deliver_push_notifications(
+                [recipient_id],
+                "Отложенное сообщение",
+                body,
+                {"scope": "dm", "chat_id": str(sender_id), "message_id": str(message_id)},
+            )
+
     scheduled_worker_task: asyncio.Task | None = None
 
     async def scheduled_message_worker() -> None:
@@ -6008,6 +6235,7 @@ def build_messenger_router(
         while True:
             try:
                 await process_due_scheduled_messages()
+                await process_messages_waiting_for_online()
                 now = int(time.time())
                 if now - last_auction_settlement >= 5:
                     await process_due_collectible_auctions()
