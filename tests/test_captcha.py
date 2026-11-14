@@ -24,7 +24,7 @@ class FakeMessage:
 
 class FakeCallback:
     def __init__(self, user_id, data, message, fail_answer=False):
-        self.from_user = SimpleNamespace(id=user_id)
+        self.from_user = SimpleNamespace(id=user_id, username="test_user")
         self.data = data
         self.message = message
         self.answers = []
@@ -125,3 +125,34 @@ def test_expired_challenge_asks_again(store):
     run(bot_module.captcha_handler(FakeCallback(5, "cap:oldone:0", message)))
     assert run(store.get_user(5))["verified"] == 0
     assert len(message.sent) == 1
+
+
+
+def test_changing_language_preserves_completed_verification(store):
+    run(store.set_verified(5, True))
+    run(store.set_language(5, "en"))
+    user = run(store.get_user(5))
+    assert user["language"] == "en"
+    assert user["verified"] == 1
+
+
+def test_language_button_does_not_repeat_captcha_for_verified_user(store):
+    run(store.set_verified(5, True))
+    message = FakeMessage()
+    callback = FakeCallback(5, "lang:en", message)
+    run(bot_module.language_handler(callback))
+
+    assert run(store.get_user(5))["verified"] == 1
+    assert len(message.sent) == 1
+    assert "Verification passed" in message.sent[0][0]
+
+
+def test_stale_captcha_button_does_not_restart_verification_after_success(store):
+    run(store.set_verified(5, True))
+    message = FakeMessage()
+    callback = FakeCallback(5, "cap:already-used:0", message)
+    run(bot_module.captcha_handler(callback))
+
+    assert run(store.get_user(5))["verified"] == 1
+    assert len(message.sent) == 1
+    assert "Verification passed" in message.sent[0][0]
