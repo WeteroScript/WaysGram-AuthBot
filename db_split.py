@@ -35,6 +35,10 @@ SCHEMA = "messenger"
 MESSENGER_TABLES = frozenset(
     {
         "messages",
+        "message_gifts",
+        "message_contacts",
+        "message_locations",
+        "message_reactions",
         "message_hidden_for",
         "message_events",
         "scheduled_messages",
@@ -65,6 +69,8 @@ MESSENGER_TABLES = frozenset(
         "gift_market_listings",
         "gift_auctions",
         "auction_bids",
+        "gift_collectible_auctions",
+        "gift_collectible_auction_bids",
         "economy_transactions",
         "telegram_gift_catalog",
         "telegram_gift_prices",

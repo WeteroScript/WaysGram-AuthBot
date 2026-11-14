@@ -49,6 +49,10 @@ def test_fresh_install_uses_two_files(tmp_path: Path, monkeypatch: pytest.Monkey
     assert not (db_split.MESSENGER_TABLES & main_tables)
     assert db_split.MESSENGER_TABLES <= messenger_tables
     assert not {"users", "numbers", "auth_codes", "accounts", "api_sessions"} & messenger_tables
+    assert {
+        "message_gifts", "message_contacts", "message_locations", "message_reactions",
+        "gift_collectible_auctions", "gift_collectible_auction_bids",
+    } <= messenger_tables
 
 
 def test_queries_without_schema_and_joins_work_across_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -100,6 +104,14 @@ def make_legacy_single_file(path: Path) -> None:
     legacy.execute(
         "INSERT INTO messages(id,sender_telegram_id,recipient_telegram_id,body,created_at) VALUES(7,1,2,'old message',9)"
     )
+    legacy.execute(
+        "INSERT INTO message_contacts(message_id,contact_name,contact_phone,contact_email) "
+        "VALUES(7,'Legacy Contact','+31 6 11111111','legacy@example.com')"
+    )
+    legacy.execute(
+        "INSERT INTO message_locations(message_id,latitude,longitude,label) "
+        "VALUES(7,52.1,5.1,'Legacy Location')"
+    )
     legacy.execute("INSERT INTO gift_catalog(id,name,price_grams,supply,created_at) VALUES(3,'Old Gift',5,2,1)")
     legacy.commit()
     legacy.close()
@@ -122,6 +134,12 @@ def test_legacy_single_file_database_is_migrated(tmp_path: Path, monkeypatch: py
     assert not (db_split.MESSENGER_TABLES & tables(path))
     conn = sqlite3.connect(messenger)
     assert conn.execute("SELECT id,body FROM messages").fetchall() == [(7, "old message")]
+    assert conn.execute(
+        "SELECT contact_name,contact_phone,contact_email FROM message_contacts WHERE message_id=7"
+    ).fetchall() == [("Legacy Contact", "+31 6 11111111", "legacy@example.com")]
+    assert conn.execute(
+        "SELECT latitude,longitude,label FROM message_locations WHERE message_id=7"
+    ).fetchall() == [(52.1, 5.1, "Legacy Location")]
     assert conn.execute("SELECT name,price_grams,supply FROM gift_catalog").fetchall() == [("Old Gift", 5, 2)]
     # AUTOINCREMENT keeps counting after the migrated ids.
     conn.execute("INSERT INTO messages(sender_telegram_id,recipient_telegram_id,body,created_at) VALUES(1,2,'new',10)")
