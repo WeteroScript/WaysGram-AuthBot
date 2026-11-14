@@ -417,6 +417,15 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_media_assets_owner_time
                 ON media_assets(owner_telegram_id,created_at);
+            CREATE TABLE IF NOT EXISTS media_transcriptions (
+                media_id TEXT PRIMARY KEY,
+                transcript TEXT NOT NULL,
+                model TEXT NOT NULL,
+                requested_by_telegram_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_transcriptions_created
+                ON media_transcriptions(created_at);
             CREATE INDEX IF NOT EXISTS idx_api_sessions_user
                 ON api_sessions(telegram_id, expires_at);
             CREATE TABLE IF NOT EXISTS api_login_request_log (
@@ -2017,6 +2026,130 @@ def build_messenger_router(
             "next_before_id": int(rows[-1]["message_id"]) if rows else 0,
         }
 
+    @router.post("/api/media/{media_id}/transcription")
+    async def transcribe_media(
+        media_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if not re.fullmatch(r"[a-f0-9]{32}", media_id):
+            raise HTTPException(status_code=404, detail="Аудиофайл не найден")
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Расшифровка пока не настроена на сервере WaysGram",
+            )
+
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,owner_telegram_id,storage_name,mime_type,size_bytes,original_name
+                   FROM media_assets WHERE id=?""",
+                (media_id,),
+            )
+            media = await cur.fetchone()
+            if media is None:
+                raise HTTPException(status_code=404, detail="Аудиофайл не найден")
+            mime_type = str(media["mime_type"] or "").lower()
+            if not mime_type.startswith("audio/"):
+                raise HTTPException(status_code=415, detail="Расшифровка доступна только для аудиофайлов")
+            allowed = int(media["owner_telegram_id"]) == uid
+            if not allowed:
+                cur = await db.execute(
+                    """SELECT 1 FROM messages
+                       WHERE media_id=? AND
+                         (sender_telegram_id=? OR recipient_telegram_id=?)
+                         AND NOT EXISTS (
+                             SELECT 1 FROM message_hidden_for hidden
+                             WHERE hidden.message_id=messages.id AND hidden.telegram_id=?
+                         )
+                       LIMIT 1""",
+                    (media_id, uid, uid, uid),
+                )
+                allowed = await cur.fetchone() is not None
+            if not allowed:
+                raise HTTPException(status_code=404, detail="Аудиофайл не найден")
+            cur = await db.execute(
+                """SELECT transcript,model,created_at
+                   FROM media_transcriptions WHERE media_id=?""",
+                (media_id,),
+            )
+            cached = await cur.fetchone()
+
+        if cached is not None:
+            return {
+                "media_id": media_id,
+                "text": str(cached["transcript"]),
+                "model": str(cached["model"]),
+                "cached": True,
+                "created_at": int(cached["created_at"]),
+            }
+
+        if int(media["size_bytes"]) > MAX_DOCUMENT_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Аудиофайл превышает лимит расшифровки 25 МБ")
+        file_path = media_storage_dir() / str(media["storage_name"])
+        try:
+            audio_bytes = await asyncio.to_thread(file_path.read_bytes)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Аудиофайл отсутствует в хранилище") from exc
+        if not audio_bytes:
+            raise HTTPException(status_code=422, detail="Аудиофайл пуст")
+
+        filename = str(media["original_name"] or (media_id + ".m4a"))
+        if not Path(filename).suffix:
+            filename += ".m4a"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": "Bearer " + api_key},
+                    data={"model": "gpt-transcribe", "response_format": "json"},
+                    files={"file": (filename, audio_bytes, mime_type)},
+                )
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="Сервис расшифровки не ответил вовремя") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Не удалось связаться с сервисом расшифровки") from exc
+
+        if response.status_code == 429:
+            raise HTTPException(status_code=503, detail="Сервис расшифровки временно ограничил запросы")
+        if response.status_code in (401, 403):
+            LOGGER.error("OpenAI transcription credentials rejected with HTTP %s", response.status_code)
+            raise HTTPException(status_code=503, detail="Сервис расшифровки не настроен")
+        if response.status_code >= 400:
+            LOGGER.warning("OpenAI transcription failed with HTTP %s", response.status_code)
+            raise HTTPException(status_code=502, detail="Сервис не смог расшифровать аудиофайл")
+
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Сервис расшифровки вернул некорректный ответ") from exc
+        transcript = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
+        if not transcript:
+            raise HTTPException(status_code=422, detail="В аудиофайле не удалось распознать речь")
+        if len(transcript) > 50000:
+            transcript = transcript[:50000]
+
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO media_transcriptions
+                   (media_id,transcript,model,requested_by_telegram_id,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (media_id, transcript, "gpt-transcribe", uid, now),
+            )
+            await db.commit()
+        return {
+            "media_id": media_id,
+            "text": transcript,
+            "model": "gpt-transcribe",
+            "cached": False,
+            "created_at": now,
+        }
+
     @router.get("/api/media/storage")
     async def list_personal_media_storage(
         limit: int = Query(default=50, ge=1, le=100),
@@ -2102,6 +2235,7 @@ def build_messenger_router(
                     status_code=409,
                     detail="Файл используется в сообщениях или профиле и не может быть удалён",
                 )
+            await db.execute("DELETE FROM media_transcriptions WHERE media_id=?", (media_id,))
             await db.execute(
                 "DELETE FROM media_assets WHERE id=? AND owner_telegram_id=?",
                 (media_id, uid),
