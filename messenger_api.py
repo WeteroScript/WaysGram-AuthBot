@@ -174,7 +174,12 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
     safe_name = re.sub(r"[\x00-\x1f\x7f]", "", safe_name).strip(" .")[:120]
     if not safe_name:
         safe_name = "document"
-    extension = Path(safe_name).suffix.lower()
+    lower_name = safe_name.lower()
+    compound_extension = next(
+        (suffix for suffix in (".tar.gz", ".tar.bz2", ".tar.xz") if lower_name.endswith(suffix)),
+        None,
+    )
+    extension = compound_extension or Path(safe_name).suffix.lower()
 
     if extension == ".pdf":
         if len(raw) < 16 or not raw.startswith(b"%PDF-") or b"%%EOF" not in raw[-2048:]:
@@ -237,8 +242,38 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
             raise ValueError("Файл не является корректным ZIP-архивом")
         return raw, "application/zip", extension, safe_name
 
+    if extension == ".rar":
+        if not (raw.startswith(b"Rar!\x1a\x07\x00") or raw.startswith(b"Rar!\x1a\x07\x01\x00")):
+            raise ValueError("Файл не является корректным RAR-архивом")
+        return raw, "application/vnd.rar", extension, safe_name
+
+    if extension == ".7z":
+        if len(raw) < 6 or not raw.startswith(b"7z\xbc\xaf\x27\x1c"):
+            raise ValueError("Файл не является корректным 7z-архивом")
+        return raw, "application/x-7z-compressed", extension, safe_name
+
+    if extension == ".tar":
+        if len(raw) < 512 or raw[257:262] != b"ustar":
+            raise ValueError("Файл не является корректным TAR-архивом")
+        return raw, "application/x-tar", extension, safe_name
+
+    if extension in {".gz", ".tgz", ".tar.gz"}:
+        if len(raw) < 18 or raw[:3] != b"\x1f\x8b\x08":
+            raise ValueError("Файл не является корректным GZIP-архивом")
+        return raw, "application/gzip", extension, safe_name
+
+    if extension in {".bz2", ".tbz2", ".tar.bz2"}:
+        if len(raw) < 4 or raw[:3] != b"BZh" or raw[3:4] not in b"123456789":
+            raise ValueError("Файл не является корректным BZIP2-архивом")
+        return raw, "application/x-bzip2", extension, safe_name
+
+    if extension in {".xz", ".txz", ".tar.xz"}:
+        if len(raw) < 6 or not raw.startswith(b"\xfd7zXZ\x00"):
+            raise ValueError("Файл не является корректным XZ-архивом")
+        return raw, "application/x-xz", extension, safe_name
+
     raise ValueError(
-        "Поддерживаются PDF, TXT, CSV, ZIP, MP4, M4V, MOV, WebM, MKV, MP3, M4A, OGG и WAV"
+        "Поддерживаются PDF, TXT, CSV, ZIP, RAR, 7Z, TAR, GZIP, BZIP2, XZ, MP4, M4V, MOV, WebM, MKV, MP3, M4A, OGG и WAV"
     )
 
 
@@ -1717,6 +1752,8 @@ def build_messenger_router(
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
         allowed_types = {
             "application/pdf", "text/plain", "text/csv", "application/zip",
+            "application/vnd.rar", "application/x-7z-compressed", "application/x-tar",
+            "application/gzip", "application/x-bzip2", "application/x-xz",
             "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
             "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav",
             "application/octet-stream",
@@ -1724,7 +1761,7 @@ def build_messenger_router(
         if declared_type not in allowed_types:
             raise HTTPException(
                 status_code=415,
-                detail="Поддерживаются PDF, TXT, CSV, ZIP, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
+                detail="Поддерживаются PDF, TXT, CSV, ZIP, RAR, 7Z, TAR, GZIP, BZIP2, XZ, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
             )
         declared_length = request.headers.get("content-length")
         if declared_length:
