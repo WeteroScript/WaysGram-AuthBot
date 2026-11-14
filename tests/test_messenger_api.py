@@ -2822,6 +2822,89 @@ def test_video_audio_and_zip_uploads_are_validated_and_private(api_env) -> None:
     run(scenario())
 
 
+def test_video_note_upload_is_persisted_and_exposed_in_dm_history(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89401, "video_note_sender")
+    add_account(api_env, 89402, "video_note_recipient")
+    add_session(path, 89401, "video-note-sender-session")
+    add_session(path, 89402, "video-note-recipient-session")
+
+    video_bytes = b"\x00\x00\x00\x18ftypisom" + (b"\x00" * 32)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer video-note-sender-session"}
+            recipient = {"Authorization": "Bearer video-note-recipient-session"}
+
+            uploaded = await client.post(
+                "/api/media/documents",
+                headers={
+                    **sender,
+                    "Content-Type": "video/mp4",
+                    "X-Filename": "round-video.mp4",
+                    "X-Media-Kind": "video_note",
+                },
+                content=video_bytes,
+            )
+            assert uploaded.status_code == 201
+            media = uploaded.json()
+            assert media["mime_type"] == "video/mp4"
+            assert media["media_kind"] == "video_note"
+
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89402,
+                    "body": "Видеосообщение",
+                    "media_id": media["id"],
+                },
+            )
+            assert sent.status_code == 201
+            assert sent.json()["media_kind"] == "video_note"
+
+            history = await client.get("/api/messages?with=89401", headers=recipient)
+            assert history.status_code == 200
+            assert history.json()["messages"][-1]["media_kind"] == "video_note"
+
+            search = await client.get(
+                "/api/messages/search?with=89401&q=Видеосообщение",
+                headers=recipient,
+            )
+            assert search.status_code == 200
+            assert search.json()["messages"][-1]["media_kind"] == "video_note"
+
+            downloaded = await client.get(media["url"], headers=recipient)
+            assert downloaded.status_code == 200
+            assert downloaded.content == video_bytes
+
+            invalid_kind = await client.post(
+                "/api/media/documents",
+                headers={
+                    **sender,
+                    "Content-Type": "video/mp4",
+                    "X-Filename": "ordinary-video.mp4",
+                    "X-Media-Kind": "not_a_real_kind",
+                },
+                content=video_bytes,
+            )
+            assert invalid_kind.status_code == 400
+
+            invalid_format = await client.post(
+                "/api/media/documents",
+                headers={
+                    **sender,
+                    "Content-Type": "audio/mp4",
+                    "X-Filename": "audio.m4a",
+                    "X-Media-Kind": "video_note",
+                },
+                content=b"\x00\x00\x00\x18ftypM4A " + (b"\x00" * 16),
+            )
+            assert invalid_format.status_code == 415
+
+    run(scenario())
+
+
 def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 82301
