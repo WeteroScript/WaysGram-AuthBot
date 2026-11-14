@@ -106,6 +106,8 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert len(mine) == 1 and mine[0]["gift_name"] == "🎁"
             assert mine[0]["telegram_gift_id"] == "g1"
+            assert mine[0]["sticker_available"] is True
+            assert mine[0]["sticker_url"] == "/api/telegram/gifts/g1/sticker"
             assert bought.json()["gift"]["telegram_gift_id"] == "g1"
 
             # A gift for a friend ends up in the friend's inventory, the buyer pays.
