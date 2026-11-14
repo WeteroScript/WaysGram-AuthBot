@@ -1611,6 +1611,63 @@ def test_document_upload_attachment_and_private_download(api_env) -> None:
 
     run(scenario())
 
+def test_uncompressed_image_attachment_preserves_original_bytes(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89301, "uncompressed_sender")
+    add_account(api_env, 89302, "uncompressed_intruder")
+    add_session(path, 89301, "uncompressed-sender-session")
+    add_session(path, 89302, "uncompressed-intruder-session")
+
+    fixtures = []
+    for extension, image_format, mime_type in (
+        (".jpg", "JPEG", "image/jpeg"),
+        (".png", "PNG", "image/png"),
+        (".webp", "WEBP", "image/webp"),
+    ):
+        buffer = BytesIO()
+        Image.new("RGB", (7, 5), (17, 81, 149)).save(buffer, format=image_format)
+        fixtures.append((f"original{extension}", mime_type, buffer.getvalue()))
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer uncompressed-sender-session"}
+            intruder = {"Authorization": "Bearer uncompressed-intruder-session"}
+
+            for filename, mime_type, original_bytes in fixtures:
+                uploaded = await client.post(
+                    "/api/media/documents",
+                    headers={
+                        **sender,
+                        "Content-Type": mime_type,
+                        "X-Filename": filename,
+                    },
+                    content=original_bytes,
+                )
+                assert uploaded.status_code == 201, filename
+                media = uploaded.json()
+                assert media["mime_type"] == mime_type
+                assert media["size_bytes"] == len(original_bytes)
+                downloaded = await client.get(media["url"], headers=sender)
+                assert downloaded.status_code == 200
+                assert downloaded.content == original_bytes
+
+            rejected = await client.post(
+                "/api/media/documents",
+                headers={
+                    **sender,
+                    "Content-Type": "image/jpeg",
+                    "X-Filename": "broken.jpg",
+                },
+                content=b"not an image",
+            )
+            assert rejected.status_code == 415
+
+            denied = await client.get(media["url"], headers=intruder)
+            assert denied.status_code == 404
+
+    run(scenario())
+
+
 def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 83001, "buyer")
