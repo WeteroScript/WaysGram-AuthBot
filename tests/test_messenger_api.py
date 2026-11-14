@@ -706,7 +706,7 @@ def test_direct_message_forward_preserves_origin_and_is_idempotent(api_env) -> N
             assert original.status_code == 201
             message_id = original.json()["id"]
 
-            forward_headers = {**forward_sender, "Idempotency-Key": "forward-once"}
+            forward_headers = {**forward_sender, "Idempotency-Key": "forward-once-key-0001"}
             forwarded = await client.post(
                 f"/api/messages/{message_id}/forward",
                 headers=forward_headers,
@@ -752,7 +752,8 @@ def test_direct_messages_preserve_telegram_html_formatting(api_env) -> None:
     body = (
         "<b>bold</b> <i>italic</i> <u>underlined</u> "
         "<s>struck</s> <tg-spoiler>spoiler</tg-spoiler> <code>monospace</code> "
-        "<blockquote>quoted text</blockquote>"
+        "<blockquote>quoted text</blockquote> "
+        "<pre>code block\\nsecond line</pre>"
     )
 
     async def scenario() -> None:
