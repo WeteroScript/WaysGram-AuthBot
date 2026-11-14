@@ -411,7 +411,8 @@ async def init_messenger_storage(database_path: Path) -> None:
                 mime_type TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
                 created_at INTEGER NOT NULL,
-                original_name TEXT
+                original_name TEXT,
+                media_kind TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_media_assets_owner_time
                 ON media_assets(owner_telegram_id,created_at);
@@ -949,6 +950,11 @@ async def init_messenger_storage(database_path: Path) -> None:
         media_columns = {str(row[1]) for row in await cur.fetchall()}
         if "original_name" not in media_columns:
             await db.execute(f"ALTER TABLE {db_split.SCHEMA}.media_assets ADD COLUMN original_name TEXT")
+        if "media_kind" not in media_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.media_assets "
+                "ADD COLUMN media_kind TEXT NOT NULL DEFAULT ''"
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(scheduled_messages)")
         scheduled_columns = {str(row[1]) for row in await cur.fetchall()}
         if "repeat_interval_seconds" not in scheduled_columns:
@@ -1671,9 +1677,9 @@ def build_messenger_router(
 
     async def media_message_fields(db: Any, media_id: str | None) -> dict[str, str | None]:
         if not media_id:
-            return {"media_type": None, "media_name": None}
+            return {"media_type": None, "media_name": None, "media_kind": None}
         cur = await db.execute(
-            "SELECT mime_type,original_name FROM media_assets WHERE id=?",
+            "SELECT mime_type,original_name,media_kind FROM media_assets WHERE id=?",
             (media_id,),
         )
         media = await cur.fetchone()
@@ -1682,6 +1688,7 @@ def build_messenger_router(
         return {
             "media_type": str(media[0]),
             "media_name": str(media[1] or "document"),
+            "media_kind": str(media[2] or ""),
         }
 
     async def default_media_message_body(db: Any, media_id: str) -> str:
@@ -1776,6 +1783,9 @@ def build_messenger_router(
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
+        media_kind = str(request.headers.get("x-media-kind", "")).strip().lower()
+        if media_kind not in {"", "video_note"}:
+            raise HTTPException(status_code=400, detail="Неизвестный тип видеосообщения")
         allowed_types = {
             "image/jpeg", "image/png", "image/webp",
             "application/pdf", "text/plain", "text/csv", "application/zip",
@@ -1816,6 +1826,11 @@ def build_messenger_router(
             raise HTTPException(status_code=415, detail=str(exc)) from exc
         if declared_type not in {mime_type, "application/octet-stream"}:
             raise HTTPException(status_code=415, detail="Заголовок Content-Type не совпадает с документом")
+        if media_kind == "video_note" and mime_type != "video/mp4":
+            raise HTTPException(
+                status_code=415,
+                detail="Видеосообщения-кружочки должны быть в формате MP4",
+            )
 
         now = int(time.time())
         media_id = secrets.token_hex(16)
@@ -1842,9 +1857,9 @@ def build_messenger_router(
                 await asyncio.to_thread(file_path.write_bytes, normalized)
                 await db.execute(
                     """INSERT INTO media_assets
-                       (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at,original_name)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (media_id, uid, storage_name, mime_type, len(normalized), now, safe_name),
+                       (id,owner_telegram_id,storage_name,mime_type,size_bytes,created_at,original_name,media_kind)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (media_id, uid, storage_name, mime_type, len(normalized), now, safe_name, media_kind),
                 )
                 await db.commit()
         except Exception:
@@ -1854,6 +1869,7 @@ def build_messenger_router(
             "id": media_id,
             "mime_type": mime_type,
             "name": safe_name,
+            "media_kind": media_kind,
             "size_bytes": len(normalized),
             "url": f"/api/media/{media_id}",
         }
@@ -5123,6 +5139,7 @@ def build_messenger_router(
                             WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                    (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
                    (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name,
+                   (SELECT media_kind FROM media_assets WHERE id=messages.media_id) AS media_kind,
                    gift_attachment.serial_number AS gift_serial_number,
                    gift_attachment.gift_name AS gift_name,
                    gift_attachment.telegram_gift_id AS gift_telegram_gift_id,
@@ -5292,7 +5309,8 @@ def build_messenger_router(
                       FROM (SELECT reaction,COUNT(*) AS reaction_count FROM message_reactions
                             WHERE scope='dm' AND chat_id=0 AND message_id=messages.id GROUP BY reaction)) AS reaction_summary,
                           (SELECT mime_type FROM media_assets WHERE id=messages.media_id) AS media_type,
-                          (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name
+                          (SELECT original_name FROM media_assets WHERE id=messages.media_id) AS media_name,
+                          (SELECT media_kind FROM media_assets WHERE id=messages.media_id) AS media_kind
                    FROM messages
                    WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
                           (sender_telegram_id=? AND recipient_telegram_id=?))
