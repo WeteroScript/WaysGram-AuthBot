@@ -1668,6 +1668,105 @@ def test_uncompressed_image_attachment_preserves_original_bytes(api_env) -> None
     run(scenario())
 
 
+def test_voice_message_transcription_requires_key_checks_access_and_caches(api_env, monkeypatch) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89411, "transcription_sender")
+    add_account(api_env, 89412, "transcription_recipient")
+    add_account(api_env, 89413, "transcription_intruder")
+    add_session(path, 89411, "transcription-sender-session")
+    add_session(path, 89412, "transcription-recipient-session")
+    add_session(path, 89413, "transcription-intruder-session")
+
+    audio_bytes = b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 32
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer transcription-sender-session"}
+            recipient = {"Authorization": "Bearer transcription-recipient-session"}
+            intruder = {"Authorization": "Bearer transcription-intruder-session"}
+
+            uploaded = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "audio/mp4", "X-Filename": "voice.m4a", "X-Media-Kind": "voice"},
+                content=audio_bytes,
+            )
+            assert uploaded.status_code == 201
+            media_id = uploaded.json()["id"]
+
+            sent = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={"recipient_id": 89412, "media_id": media_id, "body": "Голосовое сообщение"},
+            )
+            assert sent.status_code == 201
+
+            monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+            no_key = await client.post(
+                f"/api/media/{media_id}/transcription",
+                headers=recipient,
+            )
+            assert no_key.status_code == 503
+
+            monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+            original_post = httpx.AsyncClient.post
+            calls = []
+
+            async def fake_post(self, url, *args, **kwargs):
+                if str(url).startswith("https://api.openai.com/v1/audio/transcriptions"):
+                    calls.append({"url": str(url), "kwargs": kwargs})
+                    return httpx.Response(
+                        200,
+                        json={"text": "Привет, это тестовая расшифровка."},
+                        request=httpx.Request("POST", str(url)),
+                    )
+                return await original_post(self, url, *args, **kwargs)
+
+            monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+            denied = await client.post(
+                f"/api/media/{media_id}/transcription",
+                headers=intruder,
+            )
+            assert denied.status_code == 404
+            assert calls == []
+
+            first = await client.post(
+                f"/api/media/{media_id}/transcription",
+                headers=recipient,
+            )
+            assert first.status_code == 200
+            assert first.json()["text"] == "Привет, это тестовая расшифровка."
+            assert first.json()["model"] == "gpt-transcribe"
+            assert first.json()["cached"] is False
+            assert len(calls) == 1
+            assert calls[0]["kwargs"]["data"]["model"] == "gpt-transcribe"
+            assert calls[0]["kwargs"]["files"]["file"][2] == "audio/mp4"
+            assert calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer test-openai-key"
+
+            second = await client.post(
+                f"/api/media/{media_id}/transcription",
+                headers=recipient,
+            )
+            assert second.status_code == 200
+            assert second.json()["text"] == first.json()["text"]
+            assert second.json()["cached"] is True
+            assert len(calls) == 1
+
+            wrong_type = await client.post(
+                "/api/media/documents",
+                headers={**sender, "Content-Type": "text/plain", "X-Filename": "not-audio.txt"},
+                content=b"not audio",
+            )
+            assert wrong_type.status_code == 201
+            rejected = await client.post(
+                f"/api/media/{wrong_type.json()['id']}/transcription",
+                headers=sender,
+            )
+            assert rejected.status_code == 415
+
+    run(scenario())
+
+
 def test_personal_media_storage_lists_usage_and_deletes_only_unreferenced_files(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89311, "storage_owner")
