@@ -3085,6 +3085,122 @@ def test_direct_messages_support_explicit_location_sharing(api_env) -> None:
     run(scenario())
 
 
+
+
+def test_live_location_start_update_read_and_stop_permissions(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89401, "live_location_sender")
+    add_account(api_env, 89402, "live_location_recipient")
+    add_account(api_env, 89403, "live_location_intruder")
+    add_session(path, 89401, "live-location-sender-session")
+    add_session(path, 89402, "live-location-recipient-session")
+    add_session(path, 89403, "live-location-intruder-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer live-location-sender-session"}
+            recipient = {"Authorization": "Bearer live-location-recipient-session"}
+            intruder = {"Authorization": "Bearer live-location-intruder-session"}
+
+            invalid_duration = await client.post(
+                "/api/messages/live-location",
+                headers=sender,
+                json={
+                    "recipient_id": 89402,
+                    "latitude": 52.37,
+                    "longitude": 4.89,
+                    "duration_seconds": 120,
+                },
+            )
+            assert invalid_duration.status_code == 400
+
+            started = await client.post(
+                "/api/messages/live-location",
+                headers=sender,
+                json={
+                    "recipient_id": 89402,
+                    "latitude": 52.3701,
+                    "longitude": 4.8952,
+                    "accuracy_m": 12.5,
+                    "duration_seconds": 900,
+                },
+            )
+            assert started.status_code == 201
+            live = started.json()
+            assert live["status"] == "active"
+            assert live["created"] is True
+            assert len(live["id"]) == 32
+            assert live["recipient_telegram_id"] == 89402
+            assert live["expires_at"] - live["started_at"] == 900
+
+            duplicate = await client.post(
+                "/api/messages/live-location",
+                headers=sender,
+                json={
+                    "recipient_id": 89402,
+                    "latitude": 52.37,
+                    "longitude": 4.89,
+                    "duration_seconds": 900,
+                },
+            )
+            assert duplicate.status_code == 409
+
+            sender_view = await client.get("/api/messages/live-location?with=89402", headers=sender)
+            recipient_view = await client.get("/api/messages/live-location?with=89401", headers=recipient)
+            intruder_view = await client.get("/api/messages/live-location?with=89401", headers=intruder)
+            assert sender_view.status_code == 200
+            assert recipient_view.status_code == 200
+            assert len(sender_view.json()["locations"]) == 1
+            assert len(recipient_view.json()["locations"]) == 1
+            assert intruder_view.json()["count"] == 0
+
+            updated = await client.post(
+                "/api/messages/live-location",
+                headers=sender,
+                json={
+                    "recipient_id": 89402,
+                    "live_location_id": live["id"],
+                    "latitude": 52.371,
+                    "longitude": 4.896,
+                    "accuracy_m": 8.0,
+                },
+            )
+            assert updated.status_code == 201
+            assert updated.json()["created"] is False
+            assert updated.json()["latitude"] == 52.371
+            assert updated.json()["longitude"] == 4.896
+
+            intruder_stop = await client.delete(
+                f"/api/messages/live-location/{live['id']}",
+                headers=intruder,
+            )
+            assert intruder_stop.status_code == 404
+
+            recipient_stop = await client.delete(
+                f"/api/messages/live-location/{live['id']}",
+                headers=recipient,
+            )
+            assert recipient_stop.status_code == 200
+            assert recipient_stop.json()["status"] == "stopped"
+
+            after_stop = await client.get("/api/messages/live-location?with=89402", headers=sender)
+            assert after_stop.status_code == 200
+            assert after_stop.json()["count"] == 0
+
+            boolean_coordinate = await client.post(
+                "/api/messages/live-location",
+                headers=sender,
+                json={
+                    "recipient_id": 89402,
+                    "latitude": True,
+                    "longitude": 4.89,
+                    "duration_seconds": 900,
+                },
+            )
+            assert boolean_coordinate.status_code == 400
+
+    run(scenario())
+
 def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 82301
