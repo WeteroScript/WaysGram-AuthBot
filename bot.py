@@ -78,6 +78,22 @@ TEXT: dict[str, dict[str, str]] = {
         "welcome": "Проверка пройдена. Главное меню WaysGram:",
         "get_number": "Получить номер",
         "get_code": "Получить код",
+        "my_accounts": "Мои аккаунты",
+        "accounts_empty": "У вас пока нет аккаунтов WaysGram.",
+        "account_title": "Аккаунт WaysGram: {number}",
+        "account_get_code": "Получить код",
+        "account_delete": "Удалить аккаунт",
+        "account_transfer": "Передать аккаунт",
+        "account_back": "Назад",
+        "account_delete_prompt": "Удалить аккаунт {number} и связанные с ним данные? Это действие нельзя отменить.",
+        "account_delete_confirm": "Да, удалить",
+        "account_delete_cancel": "Отмена",
+        "account_deleted": "Аккаунт {number} и связанные записи удалены.",
+        "account_not_found": "Аккаунт не найден или больше вам не принадлежит.",
+        "account_transfer_prompt": "Отправьте Telegram ID или @username пользователя, зарегистрированного в AuthWaysGram_bot.",
+        "account_transfer_success": "Аккаунт {number} передан пользователю {user_id}. Все прежние сессии WaysGram завершены.",
+        "account_transfer_not_found": "Пользователь не найден. Он должен сначала открыть AuthWaysGram_bot.",
+        "account_transfer_self": "Этот аккаунт уже принадлежит вам.",
         "settings": "Настройки",
         "number_exists": "Ваш номер WaysGram: {number}",
         "provider_missing": "Не удалось создать виртуальный номер. Повторите попытку позже.",
@@ -104,6 +120,22 @@ TEXT: dict[str, dict[str, str]] = {
         "welcome": "Verification passed. WaysGram main menu:",
         "get_number": "Get number",
         "get_code": "Get code",
+        "my_accounts": "My accounts",
+        "accounts_empty": "You do not have any WaysGram accounts yet.",
+        "account_title": "WaysGram account: {number}",
+        "account_get_code": "Get code",
+        "account_delete": "Delete account",
+        "account_transfer": "Transfer account",
+        "account_back": "Back",
+        "account_delete_prompt": "Delete account {number} and its related data? This cannot be undone.",
+        "account_delete_confirm": "Yes, delete",
+        "account_delete_cancel": "Cancel",
+        "account_deleted": "Account {number} and its related records were deleted.",
+        "account_not_found": "Account not found or no longer belongs to you.",
+        "account_transfer_prompt": "Send the Telegram ID or @username of a user registered in AuthWaysGram_bot.",
+        "account_transfer_success": "Account {number} was transferred to user {user_id}. All previous WaysGram sessions were revoked.",
+        "account_transfer_not_found": "User not found. They must open AuthWaysGram_bot first.",
+        "account_transfer_self": "This account already belongs to you.",
         "settings": "Settings",
         "number_exists": "Your WaysGram number: {number}",
         "provider_missing": "Could not create a virtual number. Please try again later.",
@@ -162,12 +194,14 @@ class Store:
                     telegram_id INTEGER PRIMARY KEY,
                     chat_id INTEGER NOT NULL,
                     language TEXT,
+                    username TEXT NOT NULL DEFAULT '',
                     verified INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS numbers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     telegram_id INTEGER NOT NULL UNIQUE REFERENCES users(telegram_id),
+                    owner_telegram_id INTEGER NOT NULL DEFAULT 0,
                     number TEXT NOT NULL UNIQUE,
                     provider_ref TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
@@ -204,6 +238,8 @@ class Store:
             )
             cur = await db.execute("PRAGMA table_info(users)")
             columns = {str(row[1]) for row in await cur.fetchall()}
+            if "username" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''")
             if "verified" not in columns:
                 await db.execute(
                     "ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0"
@@ -232,22 +268,29 @@ class Store:
                 await db.execute(
                     "ALTER TABLE numbers ADD COLUMN last_code_requested_at INTEGER NOT NULL DEFAULT 0"
                 )
+            if "owner_telegram_id" not in number_columns:
+                await db.execute(
+                    "ALTER TABLE numbers ADD COLUMN owner_telegram_id INTEGER NOT NULL DEFAULT 0"
+                )
+            await db.execute("UPDATE numbers SET owner_telegram_id=telegram_id WHERE owner_telegram_id=0")
             await db.commit()
 
-    async def upsert_user(self, telegram_id: int, chat_id: int) -> None:
+    async def upsert_user(self, telegram_id: int, chat_id: int, username: str = "") -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                """INSERT INTO users(telegram_id, chat_id, created_at)
-                   VALUES(?, ?, ?) ON CONFLICT(telegram_id)
-                   DO UPDATE SET chat_id=excluded.chat_id""",
-                (telegram_id, chat_id, int(time.time())),
+                """INSERT INTO users(telegram_id, chat_id, username, created_at)
+                   VALUES(?, ?, ?, ?) ON CONFLICT(telegram_id)
+                   DO UPDATE SET chat_id=excluded.chat_id,
+                       username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE users.username END""",
+                (telegram_id, chat_id, username.lstrip("@").lower()[:32], int(time.time())),
             )
             await db.commit()
 
     async def set_language(self, telegram_id: int, language: str) -> None:
+        # Changing the display language must not revoke a completed verification.
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "UPDATE users SET language=?, verified=0 WHERE telegram_id=?",
+                "UPDATE users SET language=? WHERE telegram_id=?",
                 (language, telegram_id),
             )
             await db.commit()
@@ -289,7 +332,7 @@ class Store:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT telegram_id, chat_id, language, verified FROM users WHERE telegram_id=?",
+                "SELECT telegram_id, chat_id, language, username, verified FROM users WHERE telegram_id=?",
                 (telegram_id,),
             )
             row = await cur.fetchone()
@@ -318,9 +361,9 @@ class Store:
                 number = "+1" + f"{secrets.randbelow(10_000_000_000):010d}"
                 cur = await db.execute(
                     """INSERT OR IGNORE INTO numbers
-                       (telegram_id, number, provider_ref, created_at)
-                       VALUES(?, ?, 'internal', ?)""",
-                    (telegram_id, number, int(time.time())),
+                       (telegram_id, owner_telegram_id, number, provider_ref, created_at)
+                       VALUES(?, ?, ?, 'internal', ?)""",
+                    (telegram_id, telegram_id, number, int(time.time())),
                 )
                 if cur.rowcount == 1:
                     await db.commit()
@@ -339,13 +382,120 @@ class Store:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT n.telegram_id, u.chat_id, u.language, u.verified
-                   FROM numbers n JOIN users u ON u.telegram_id=n.telegram_id
+                """SELECT n.telegram_id,
+                          COALESCE(owner.chat_id, account_user.chat_id) AS chat_id,
+                          COALESCE(owner.language, account_user.language) AS language,
+                          CASE WHEN account_user.verified=1
+                                    AND COALESCE(owner.verified, account_user.verified)=1
+                               THEN 1 ELSE 0 END AS verified,
+                          COALESCE(n.owner_telegram_id,n.telegram_id) AS owner_telegram_id
+                   FROM numbers n
+                   JOIN users account_user ON account_user.telegram_id=n.telegram_id
+                   LEFT JOIN users owner
+                     ON owner.telegram_id=COALESCE(n.owner_telegram_id,n.telegram_id)
                    WHERE n.number=?""",
                 (number,),
             )
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def owned_numbers(self, owner_telegram_id: int) -> list[tuple[str, int]]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """SELECT number,telegram_id FROM numbers
+                   WHERE COALESCE(owner_telegram_id,telegram_id)=?
+                   ORDER BY created_at DESC, id DESC""",
+                (owner_telegram_id,),
+            )
+            return [(str(row[0]), int(row[1])) for row in await cur.fetchall()]
+
+    async def find_registered_user(self, value: str) -> int | None:
+        value = value.strip()
+        async with aiosqlite.connect(self.path) as db:
+            if value.isdigit():
+                cur = await db.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (int(value),))
+            else:
+                username = value.lstrip("@").lower()
+                if not re.fullmatch(r"[a-z0-9_]{5,32}", username):
+                    return None
+                cur = await db.execute("SELECT telegram_id FROM users WHERE lower(username)=?", (username,))
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
+
+    async def transfer_number(self, number: str, current_owner: int, new_owner: int) -> int | None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT telegram_id FROM numbers
+                   WHERE number=? AND COALESCE(owner_telegram_id,telegram_id)=?""",
+                (number, current_owner),
+            )
+            row = await cur.fetchone()
+            if not row or new_owner == current_owner:
+                await db.rollback()
+                return None
+            cur = await db.execute("SELECT 1 FROM users WHERE telegram_id=?", (new_owner,))
+            if not await cur.fetchone():
+                await db.rollback()
+                return None
+            account_id = int(row[0])
+            await db.execute("UPDATE numbers SET owner_telegram_id=? WHERE number=?", (new_owner, number))
+            await db.execute("DELETE FROM auth_codes WHERE number=?", (number,))
+            await db.execute("DELETE FROM api_sessions WHERE telegram_id=?", (account_id,))
+            await db.execute("DELETE FROM messenger.push_devices WHERE telegram_id=?", (account_id,))
+            await db.commit()
+            return account_id
+
+    async def delete_number(self, number: str, owner_telegram_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT telegram_id FROM numbers
+                   WHERE number=? AND COALESCE(owner_telegram_id,telegram_id)=?""",
+                (number, owner_telegram_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return False
+            account_id = int(row[0])
+            await db.execute("DELETE FROM auth_codes WHERE number=?", (number,))
+            await db.execute("DELETE FROM otp_webhook_receipts WHERE number=?", (number,))
+            await db.execute("DELETE FROM api_login_request_log WHERE phone=?", (number,))
+            identity_columns = {
+                "telegram_id", "owner_telegram_id", "sender_telegram_id",
+                "recipient_telegram_id", "user_telegram_id", "author_telegram_id",
+                "forwarded_from_telegram_id", "requested_by_telegram_id",
+                "stopped_by_telegram_id", "from_telegram_id", "to_telegram_id",
+                "bidder_telegram_id", "current_bidder_id", "actor_id",
+                "pinned_by", "created_by", "admin_id",
+            }
+            for schema in ("main", "messenger"):
+                cur = await db.execute(
+                    f"SELECT name FROM {schema}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+                for item in await cur.fetchall():
+                    table = str(item[0])
+                    if table in {"accounts", "numbers", "users", "auth_codes",
+                                 "otp_webhook_receipts", "api_login_request_log"}:
+                        continue
+                    cur = await db.execute(f'PRAGMA {schema}.table_info("{table}")')
+                    columns = [str(column[1]) for column in await cur.fetchall()]
+                    refs = [column for column in columns
+                            if column in identity_columns or column.endswith("_telegram_id")]
+                    if refs:
+                        where = " OR ".join(f'"{column}"=?' for column in refs)
+                        await db.execute(
+                            f'DELETE FROM "{schema}"."{table}" WHERE {where}',
+                            tuple(account_id for _ in refs),
+                        )
+            await db.execute("DELETE FROM accounts WHERE telegram_id=?", (account_id,))
+            await db.execute("DELETE FROM numbers WHERE number=?", (number,))
+            await db.execute("DELETE FROM captcha_challenges WHERE telegram_id=?", (account_id,))
+            if account_id != owner_telegram_id:
+                await db.execute("DELETE FROM users WHERE telegram_id=?", (account_id,))
+            await db.commit()
+            return True
 
     async def save_code(self, number: str, code: str, expires_in: int) -> bool:
         now = int(time.time())
@@ -483,6 +633,7 @@ def main_keyboard(lang: str) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=tr(lang, "get_number"))],
             [KeyboardButton(text=tr(lang, "get_code"))],
+            [KeyboardButton(text=tr(lang, "my_accounts"))],
             [KeyboardButton(text=tr(lang, "settings"))],
         ],
         resize_keyboard=True,
@@ -532,7 +683,7 @@ async def ask_captcha(message: Message, telegram_id: int, lang: str) -> None:
 async def start_handler(message: Message) -> None:
     if not message.from_user:
         return
-    await store.upsert_user(message.from_user.id, message.chat.id)
+    await store.upsert_user(message.from_user.id, message.chat.id, message.from_user.username or "")
     user = await store.get_user(message.from_user.id)
     if not user or not user.get("language"):
         await message.answer(tr(None, "choose_language"), reply_markup=language_keyboard())
@@ -552,10 +703,19 @@ async def language_handler(callback: CallbackQuery) -> None:
     if language not in ("ru", "en"):
         await callback.answer()
         return
-    await store.upsert_user(callback.from_user.id, callback.message.chat.id)
+    existing_user = await store.get_user(callback.from_user.id)
+    was_verified = bool(existing_user and existing_user.get("verified"))
+    await store.upsert_user(
+        callback.from_user.id,
+        callback.message.chat.id,
+        callback.from_user.username or "",
+    )
     await store.set_language(callback.from_user.id, language)
     await callback.answer()
-    await ask_captcha(callback.message, callback.from_user.id, language)
+    if was_verified:
+        await callback.message.answer(tr(language, "welcome"), reply_markup=main_keyboard(language))
+    else:
+        await ask_captcha(callback.message, callback.from_user.id, language)
 
 
 @router.callback_query(F.data.startswith("cap:"))
@@ -568,6 +728,10 @@ async def captcha_handler(callback: CallbackQuery) -> None:
         return
     user = await store.get_user(callback.from_user.id)
     lang = str(user.get("language") if user else "en")
+    if user and user.get("verified"):
+        await safe_callback_answer(callback)
+        await callback.message.answer(tr(lang, "welcome"), reply_markup=main_keyboard(lang))
+        return
     status, challenge = await store.take_challenge(parts[1], callback.from_user.id)
     if status == "other":
         await safe_callback_answer(callback, "This check belongs to another user.", True)
@@ -630,10 +794,16 @@ async def get_code_handler(message: Message) -> None:
     if not user or not user.get("verified"):
         await ask_captcha(message, message.from_user.id, lang)
         return
-    number = await store.get_number(message.from_user.id)
-    if not number:
+    owned = await store.owned_numbers(message.from_user.id)
+    if not owned:
         await message.answer(tr(lang, "need_number"))
         return
+    if len(owned) > 1:
+        rows = [[InlineKeyboardButton(text=number, callback_data=f"myacc:code:{number}")]
+                for number, _ in owned]
+        await message.answer(tr(lang, "my_accounts"), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    number = owned[0][0]
     result = await store.latest_code(number)
     if not result:
         await message.answer(tr(lang, "code_missing"))
@@ -641,6 +811,151 @@ async def get_code_handler(message: Message) -> None:
     code, seconds_left = result
     minutes = max(1, (seconds_left + 59) // 60)
     await message.answer(tr(lang, "code_ready", code=code, minutes=minutes))
+
+
+async def send_my_accounts(message: Message, telegram_id: int, lang: str) -> None:
+    owned = await store.owned_numbers(telegram_id)
+    if not owned:
+        await message.answer(
+            tr(lang, "accounts_empty"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=tr(lang, "account_back"), callback_data="nav:menu")]
+            ]),
+        )
+        return
+    keyboard = [[InlineKeyboardButton(text=number, callback_data=f"myacc:open:{number}")]
+                for number, _ in owned]
+    keyboard.append([InlineKeyboardButton(text=tr(lang, "account_back"), callback_data="nav:menu")])
+    await message.answer(tr(lang, "my_accounts"), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.message(F.text.in_(["Мои аккаунты", "My accounts"]))
+async def my_accounts_handler(message: Message) -> None:
+    if not message.from_user:
+        return
+    user = await store.get_user(message.from_user.id)
+    lang = str(user.get("language") if user else "en")
+    if not user or not user.get("verified"):
+        await ask_captcha(message, message.from_user.id, lang)
+        return
+    await send_my_accounts(message, message.from_user.id, lang)
+
+
+ACCOUNT_INPUT: dict[int, str] = {}
+
+
+def account_action_keyboard(number: str, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=tr(lang, "account_get_code"), callback_data=f"myacc:code:{number}"),
+            InlineKeyboardButton(text=tr(lang, "account_delete"), callback_data=f"myacc:delete_ask:{number}"),
+        ],
+        [InlineKeyboardButton(text=tr(lang, "account_transfer"), callback_data=f"myacc:transfer:{number}")],
+        [InlineKeyboardButton(text=tr(lang, "account_back"), callback_data="myacc:list")],
+    ])
+
+
+@router.callback_query(F.data.startswith("myacc:"))
+async def my_accounts_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message or not callback.data:
+        return
+    user_id = callback.from_user.id
+    user = await store.get_user(user_id)
+    lang = str(user.get("language") if user else "en")
+    if not user or not user.get("verified"):
+        await safe_callback_answer(callback)
+        await ask_captcha(callback.message, user_id, lang)
+        return
+    parts = callback.data.split(":", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    number = parts[2] if len(parts) > 2 else ""
+    if action == "cancel_transfer":
+        ACCOUNT_INPUT.pop(user_id, None)
+        await safe_callback_answer(callback)
+        await send_my_accounts(callback.message, user_id, lang)
+        return
+    if action == "list":
+        await safe_callback_answer(callback)
+        await send_my_accounts(callback.message, user_id, lang)
+        return
+    owned = await store.owned_numbers(user_id)
+    if not number or not any(item[0] == number for item in owned):
+        await safe_callback_answer(callback, tr(lang, "account_not_found"), True)
+        return
+    if action == "open":
+        await safe_callback_answer(callback)
+        await callback.message.answer(tr(lang, "account_title", number=number),
+                                      reply_markup=account_action_keyboard(number, lang))
+    elif action == "code":
+        result = await store.latest_code(number)
+        await safe_callback_answer(callback)
+        if not result:
+            await callback.message.answer(tr(lang, "code_missing"),
+                                          reply_markup=account_action_keyboard(number, lang))
+            return
+        code, seconds_left = result
+        minutes = max(1, (seconds_left + 59) // 60)
+        await callback.message.answer(tr(lang, "code_ready", code=code, minutes=minutes),
+                                      reply_markup=account_action_keyboard(number, lang))
+    elif action == "delete_ask":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=tr(lang, "account_delete_confirm"), callback_data=f"myacc:delete:{number}")],
+            [InlineKeyboardButton(text=tr(lang, "account_delete_cancel"), callback_data=f"myacc:open:{number}")],
+        ])
+        await safe_callback_answer(callback)
+        await callback.message.answer(tr(lang, "account_delete_prompt", number=number), reply_markup=keyboard)
+    elif action == "delete":
+        deleted = await store.delete_number(number, user_id)
+        await safe_callback_answer(callback)
+        await callback.message.answer(tr(lang, "account_deleted", number=number) if deleted
+                                      else tr(lang, "account_not_found"))
+        if deleted:
+            await send_my_accounts(callback.message, user_id, lang)
+    elif action == "transfer":
+        ACCOUNT_INPUT[user_id] = number
+        await safe_callback_answer(callback)
+        await callback.message.answer(
+            tr(lang, "account_transfer_prompt"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=tr(lang, "account_delete_cancel"), callback_data="myacc:cancel_transfer")]
+            ]),
+        )
+    else:
+        await safe_callback_answer(callback)
+
+
+@router.message(F.text, lambda message: bool(message.from_user and message.from_user.id in ACCOUNT_INPUT))
+async def account_transfer_input(message: Message) -> None:
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    number = ACCOUNT_INPUT.get(user_id)
+    if not number:
+        return
+    user = await store.get_user(user_id)
+    lang = str(user.get("language") if user else "en")
+    target_id = await store.find_registered_user((message.text or "").strip())
+    if target_id is None:
+        await message.answer(tr(lang, "account_transfer_not_found"))
+        return
+    if target_id == user_id:
+        await message.answer(tr(lang, "account_transfer_self"))
+        return
+    account_id = await store.transfer_number(number, user_id, target_id)
+    if account_id is None:
+        ACCOUNT_INPUT.pop(user_id, None)
+        await message.answer(tr(lang, "account_not_found"))
+        return
+    ACCOUNT_INPUT.pop(user_id, None)
+    await message.answer(tr(lang, "account_transfer_success", number=number, user_id=target_id))
+    if bot is not None:
+        try:
+            await bot.send_message(
+                chat_id=target_id,
+                text=f"Вам передан аккаунт WaysGram {number}. Откройте AuthWaysGram_bot и нажмите «Мои аккаунты».",
+            )
+        except Exception as exc:
+            log.info("Could not notify transferred account owner (%s)", type(exc).__name__)
 
 
 @router.message(F.text.in_(["Настройки", "Settings"]))
@@ -1142,12 +1457,17 @@ async def admin_create_account(number: str, stars: int, grams: int) -> int:
                                (SYNTHETIC_ACCOUNT_BASE, SYNTHETIC_ACCOUNT_BASE))
         account_id = int((await cur.fetchone())[0]) + 1
         await db.execute(
+            """INSERT OR IGNORE INTO users(telegram_id,chat_id,language,verified,created_at)
+               VALUES(?,?, 'ru',1,?)""",
+            (ADMIN_ID, ADMIN_ID, now),
+        )
+        await db.execute(
             "INSERT INTO users(telegram_id,chat_id,language,verified,created_at) VALUES(?,?,?,?,?)",
             (account_id, ADMIN_ID, "ru", 1, now),
         )
         await db.execute(
-            "INSERT INTO numbers(telegram_id,number,provider_ref,created_at) VALUES(?,?,?,?)",
-            (account_id, number, "admin", now),
+            "INSERT INTO numbers(telegram_id,owner_telegram_id,number,provider_ref,created_at) VALUES(?,?,?,?,?)",
+            (account_id, ADMIN_ID, number, "admin", now),
         )
         await db.execute(
             """INSERT INTO accounts(telegram_id,virtual_number,username,display_name,stars,grams,created_at,updated_at)
@@ -1218,6 +1538,8 @@ async def admin_handler(message: Message) -> None:
     if not message.from_user or message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещён.")
         return
+    await store.upsert_user(message.from_user.id, message.chat.id, message.from_user.username or "")
+    await store.set_verified(message.from_user.id, True)
     await message.answer("Панель администратора WaysGram", reply_markup=admin_home_keyboard())
 
 @router.callback_query(F.data.startswith("wgadm:"))
