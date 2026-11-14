@@ -454,6 +454,12 @@ async def init_messenger_storage(database_path: Path) -> None:
                 contact_phone TEXT NOT NULL,
                 contact_email TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS message_locations (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                latitude REAL NOT NULL CHECK(latitude >= -90 AND latitude <= 90),
+                longitude REAL NOT NULL CHECK(longitude >= -180 AND longitude <= 180),
+                label TEXT NOT NULL DEFAULT ''
+            );
             CREATE INDEX IF NOT EXISTS idx_message_gifts_serial
                 ON message_gifts(serial_number);
             CREATE INDEX IF NOT EXISTS idx_api_messages_pair
@@ -5149,6 +5155,9 @@ def build_messenger_router(
                    (SELECT contact_name FROM message_contacts WHERE message_id=messages.id) AS contact_name,
                    (SELECT contact_phone FROM message_contacts WHERE message_id=messages.id) AS contact_phone,
                    (SELECT contact_email FROM message_contacts WHERE message_id=messages.id) AS contact_email,
+                   (SELECT latitude FROM message_locations WHERE message_id=messages.id) AS location_latitude,
+                   (SELECT longitude FROM message_locations WHERE message_id=messages.id) AS location_longitude,
+                   (SELECT label FROM message_locations WHERE message_id=messages.id) AS location_label,
                    gift_attachment.serial_number AS gift_serial_number,
                    gift_attachment.gift_name AS gift_name,
                    gift_attachment.telegram_gift_id AS gift_telegram_gift_id,
@@ -5322,7 +5331,10 @@ def build_messenger_router(
                           (SELECT media_kind FROM media_assets WHERE id=messages.media_id) AS media_kind,
                           (SELECT contact_name FROM message_contacts WHERE message_id=messages.id) AS contact_name,
                           (SELECT contact_phone FROM message_contacts WHERE message_id=messages.id) AS contact_phone,
-                          (SELECT contact_email FROM message_contacts WHERE message_id=messages.id) AS contact_email
+                          (SELECT contact_email FROM message_contacts WHERE message_id=messages.id) AS contact_email,
+                          (SELECT latitude FROM message_locations WHERE message_id=messages.id) AS location_latitude,
+                          (SELECT longitude FROM message_locations WHERE message_id=messages.id) AS location_longitude,
+                          (SELECT label FROM message_locations WHERE message_id=messages.id) AS location_label
                    FROM messages
                    WHERE ((sender_telegram_id=? AND recipient_telegram_id=?) OR
                           (sender_telegram_id=? AND recipient_telegram_id=?))
@@ -5357,6 +5369,26 @@ def build_messenger_router(
         media_id = str(payload.get("media_id") or "").strip() or None
         contact_value = payload.get("contact")
         contact_payload: dict[str, str] | None = None
+        location_value = payload.get("location")
+        location_payload: dict[str, float | str] | None = None
+        if location_value is not None:
+            if not isinstance(location_value, dict):
+                raise HTTPException(status_code=400, detail="Геолокация должна быть объектом")
+            try:
+                latitude = float(location_value.get("latitude"))
+                longitude = float(location_value.get("longitude"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Укажите корректные координаты")
+            if not (-90.0 <= latitude <= 90.0) or not (-180.0 <= longitude <= 180.0):
+                raise HTTPException(status_code=400, detail="Координаты выходят за допустимый диапазон")
+            location_label = str(location_value.get("label") or "").strip()
+            if len(location_label) > 120:
+                raise HTTPException(status_code=400, detail="Название места не должно превышать 120 символов")
+            location_payload = {
+                "latitude": latitude,
+                "longitude": longitude,
+                "label": location_label,
+            }
         if contact_value is not None:
             if not isinstance(contact_value, dict):
                 raise HTTPException(status_code=400, detail="Контакт должен быть объектом")
@@ -5371,16 +5403,20 @@ def build_messenger_router(
                 contact_email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", contact_email)
             ):
                 raise HTTPException(status_code=400, detail="Некорректный адрес электронной почты контакта")
-            if media_id:
-                raise HTTPException(status_code=400, detail="Нельзя отправлять контакт вместе с файлом")
+            if media_id or location_payload:
+                raise HTTPException(status_code=400, detail="Нельзя объединять контакт с файлом или геолокацией")
             contact_payload = {
                 "name": contact_name,
                 "phone": contact_phone,
                 "email": contact_email,
             }
+        if location_payload and media_id:
+            raise HTTPException(status_code=400, detail="Нельзя отправлять геолокацию вместе с файлом")
         body_value = str(payload.get("body") or "")
         if contact_payload and not body_value.strip():
             body_value = "Контакт: " + contact_payload["name"]
+        elif location_payload and not body_value.strip():
+            body_value = location_payload["label"] or "Местоположение"
         body = _message_body(body_value) if body_value.strip() or not media_id else ""
         silent = payload.get("silent", False)
         if not isinstance(silent, bool):
@@ -5452,6 +5488,18 @@ def build_messenger_router(
                         contact_payload["email"],
                     ),
                 )
+            if location_payload:
+                await db.execute(
+                    """INSERT INTO message_locations
+                       (message_id,latitude,longitude,label)
+                       VALUES(?,?,?,?)""",
+                    (
+                        message_id,
+                        location_payload["latitude"],
+                        location_payload["longitude"],
+                        location_payload["label"],
+                    ),
+                )
             await record_event(
                 db, "dm", message_id, "new_message", uid,
                 user_a=uid, user_b=recipient_id,
@@ -5465,6 +5513,7 @@ def build_messenger_router(
                 "media_id": media_id,
                 "reply_to_id": reply_to_id,
                 "contact": contact_payload,
+                "location": location_payload,
                 **media_fields,
                 "created_at": now,
             }
