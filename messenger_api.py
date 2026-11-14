@@ -3424,7 +3424,7 @@ def build_messenger_router(
             title = await telegram_gift_title(db, gift_id)
             if not title:
                 await db.rollback()
-                raise HTTPException(status_code=409, detail="Подарок больше недоступен в Telegram")
+                raise HTTPException(status_code=409, detail="Подарок не найден в текущем или историческом каталоге WaysGram")
             price = int(priced["price_stars"])
             cur = await db.execute("SELECT stars,is_banned FROM accounts WHERE telegram_id=?", (uid,))
             account = await cur.fetchone()
