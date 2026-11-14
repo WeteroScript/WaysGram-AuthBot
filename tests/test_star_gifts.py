@@ -679,6 +679,19 @@ def test_collectible_gift_auction_can_be_cancelled_before_first_bid(env) -> None
             upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
             assert upgraded.status_code == 200
 
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute(
+                    """INSERT INTO telegram_auction_gift_registry
+                       (gift_id,title,auction_slug,auction_start_date,gifts_per_round,
+                        discovered_at,source_payload)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    ("g1", "🎁", "historic-g1", 1700000000, 1000, 1700000001, "{}"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
             created = await client.post(
                 f"/api/gifts/{serial}/auction",
                 headers=headers(101),
