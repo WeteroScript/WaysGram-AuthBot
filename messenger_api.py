@@ -5379,9 +5379,9 @@ def build_messenger_router(
                 "email": contact_email,
             }
         body_value = str(payload.get("body") or "")
+        if contact_payload and not body_value.strip():
+            body_value = "Контакт: " + contact_payload["name"]
         body = _message_body(body_value) if body_value.strip() or not media_id else ""
-        if contact_payload and not body:
-            body = "Контакт: " + contact_payload["name"]
         silent = payload.get("silent", False)
         if not isinstance(silent, bool):
             raise HTTPException(status_code=400, detail="silent должен быть логическим значением")
