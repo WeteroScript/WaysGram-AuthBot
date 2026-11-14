@@ -188,10 +188,18 @@ def test_mtproto_registry_records_only_started_auctions_and_is_append_only(tmp_p
                 "SELECT COUNT(*) FROM telegram_auction_gift_registry"
             ).fetchone() == (0,)
 
-        # The metadata is already cached. The next Telegram response is
-        # StarGiftsNotModified, but the start date has now passed.
-        client.gift.auction_start_date = 1_700_000_300
+        # An unchanged catalogue must not turn a future auction into
+        # historical provenance.
         client.not_modified = True
+        await provider.sync(database)
+        with db_split.sqlite_connect(database) as db:
+            assert db.execute(
+                "SELECT COUNT(*) FROM telegram_auction_gift_registry"
+            ).fetchone() == (0,)
+
+        # A subsequent full sync reports that the auction has already started.
+        client.gift.auction_start_date = 1_700_000_300
+        client.not_modified = False
         await provider.sync(database)
         with db_split.sqlite_connect(database) as db:
             registry = db.execute(
