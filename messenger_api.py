@@ -3521,13 +3521,20 @@ def build_messenger_router(
         cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
         state = await cur.fetchone()
         source = str(state[0]) if state else "telegram_bot_api"
-        table = "telegram_mtproto_gift_catalog" if source == "telegram_mtproto" else "telegram_gift_catalog"
-        cur = await db.execute(
-            f"SELECT title FROM {table} WHERE gift_id=?",
-            (gift_id,),
+        tables = (
+            ("telegram_mtproto_gift_catalog", "telegram_gift_catalog")
+            if source == "telegram_mtproto"
+            else ("telegram_gift_catalog", "telegram_mtproto_gift_catalog")
         )
-        row = await cur.fetchone()
-        return str(row[0]) if row else ""
+        for table in tables:
+            cur = await db.execute(
+                f"SELECT title FROM {table} WHERE gift_id=?",
+                (gift_id,),
+            )
+            row = await cur.fetchone()
+            if row and str(row[0]).strip():
+                return str(row[0])
+        return ""
 
     @router.get("/api/telegram/gifts")
     async def telegram_gift_catalog(
@@ -3578,6 +3585,7 @@ def build_messenger_router(
                 gifts.append({
                     "id": gift_id,
                     "source": "telegram",
+                    "catalog_source": "telegram_mtproto",
                     "title": str(row["title"]),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["stars"]),
@@ -3628,6 +3636,7 @@ def build_messenger_router(
                 gifts.append({
                     "id": gift_id,
                     "source": "telegram",
+                    "catalog_source": "telegram_bot_api",
                     "title": str(row["title"]),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["star_count"]),
@@ -3655,6 +3664,126 @@ def build_messenger_router(
                     },
                     "synced_at": int(row["synced_at"]),
                 })
+
+        # Include records retained in the other catalog source as historical WaysGram items.
+        # Telegram availability is informational only; internal pricing and stock govern WaysGram.
+        known_ids = {str(gift["id"]) for gift in gifts}
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            if source == "telegram_mtproto":
+                cur = await db.execute(
+                    """SELECT gift_id,title,sticker_type,sticker_emoji,sticker_set_name,
+                              sticker_width,sticker_height,sticker_is_animated,sticker_is_video,
+                              sticker_mime_type,star_count,upgrade_star_count,is_premium,has_colors,
+                              total_count,remaining_count,personal_total_count,personal_remaining_count,
+                              unique_gift_variant_count,background_json,publisher_chat_json,
+                              synced_at
+                       FROM telegram_gift_catalog ORDER BY synced_at DESC"""
+                )
+                historical_rows = await cur.fetchall()
+                for row in historical_rows:
+                    gift_id = str(row["gift_id"])
+                    if gift_id in known_ids:
+                        continue
+                    gifts.append({
+                        "id": gift_id,
+                        "source": "telegram",
+                        "catalog_source": "telegram_bot_api",
+                        "title": str(row["title"]),
+                        "emoji": str(row["sticker_emoji"] or ""),
+                        "star_count": int(row["star_count"]),
+                        "currency": "telegram_stars",
+                        "upgrade_star_count": row["upgrade_star_count"],
+                        "is_premium": bool(row["is_premium"]),
+                        "has_colors": bool(row["has_colors"]),
+                        "is_limited": row["total_count"] is not None,
+                        "total_count": row["total_count"],
+                        "remaining_count": row["remaining_count"],
+                        "personal_total_count": row["personal_total_count"],
+                        "personal_remaining_count": row["personal_remaining_count"],
+                        "unique_gift_variant_count": row["unique_gift_variant_count"],
+                        "background": json.loads(row["background_json"]) if row["background_json"] else None,
+                        "publisher_chat": json.loads(row["publisher_chat_json"]) if row["publisher_chat_json"] else None,
+                        "sticker": {
+                            "type": str(row["sticker_type"]),
+                            "set_name": str(row["sticker_set_name"] or ""),
+                            "width": row["sticker_width"],
+                            "height": row["sticker_height"],
+                            "is_animated": bool(row["sticker_is_animated"]),
+                            "is_video": bool(row["sticker_is_video"]),
+                            "mime_type": str(row["sticker_mime_type"] or ""),
+                            "url": f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker",
+                        },
+                        "synced_at": int(row["synced_at"]),
+                    })
+                    known_ids.add(gift_id)
+            else:
+                cur = await db.execute(
+                    """SELECT gift_id,title,sticker_emoji,sticker_set_name,sticker_width,
+                              sticker_height,sticker_is_animated,sticker_is_video,
+                              sticker_mime_type,stars,limited,sold_out,birthday,require_premium,
+                              limited_per_user,peer_color_available,auction,availability_remains,
+                              availability_total,availability_resale,convert_stars,first_sale_date,
+                              last_sale_date,upgrade_stars,resell_min_stars,released_by_json,
+                              per_user_total,per_user_remains,locked_until_date,auction_slug,
+                              gifts_per_round,auction_start_date,upgrade_variants,background_json,
+                              synced_at
+                       FROM telegram_mtproto_gift_catalog ORDER BY synced_at DESC"""
+                )
+                historical_rows = await cur.fetchall()
+                for row in historical_rows:
+                    gift_id = str(row["gift_id"])
+                    if gift_id in known_ids:
+                        continue
+                    gifts.append({
+                        "id": gift_id,
+                        "source": "telegram",
+                        "catalog_source": "telegram_mtproto",
+                        "title": str(row["title"]),
+                        "emoji": str(row["sticker_emoji"] or ""),
+                        "star_count": int(row["stars"]),
+                        "currency": "telegram_stars",
+                        "upgrade_star_count": row["upgrade_stars"],
+                        "is_premium": bool(row["require_premium"]),
+                        "has_colors": bool(row["peer_color_available"]),
+                        "is_limited": bool(row["limited"]),
+                        "sold_out": bool(row["sold_out"]),
+                        "birthday": bool(row["birthday"]),
+                        "require_premium": bool(row["require_premium"]),
+                        "limited_per_user": bool(row["limited_per_user"]),
+                        "auction": bool(row["auction"]),
+                        "availability_resale": row["availability_resale"],
+                        "convert_stars": row["convert_stars"],
+                        "first_sale_date": row["first_sale_date"],
+                        "last_sale_date": row["last_sale_date"],
+                        "resell_min_stars": row["resell_min_stars"],
+                        "per_user_total": row["per_user_total"],
+                        "per_user_remains": row["per_user_remains"],
+                        "locked_until_date": row["locked_until_date"],
+                        "auction_slug": str(row["auction_slug"] or ""),
+                        "gifts_per_round": row["gifts_per_round"],
+                        "auction_start_date": row["auction_start_date"],
+                        "upgrade_variants": row["upgrade_variants"],
+                        "total_count": row["availability_total"],
+                        "remaining_count": row["availability_remains"],
+                        "personal_total_count": row["per_user_total"],
+                        "personal_remaining_count": row["per_user_remains"],
+                        "background": json.loads(row["background_json"]) if row["background_json"] else None,
+                        "sticker": {
+                            "type": "video" if bool(row["sticker_is_video"]) else (
+                                "animated" if bool(row["sticker_is_animated"]) else "regular"
+                            ),
+                            "set_name": str(row["sticker_set_name"] or ""),
+                            "width": row["sticker_width"],
+                            "height": row["sticker_height"],
+                            "is_animated": bool(row["sticker_is_animated"]),
+                            "is_video": bool(row["sticker_is_video"]),
+                            "mime_type": str(row["sticker_mime_type"] or ""),
+                            "url": f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker",
+                        },
+                        "synced_at": int(row["synced_at"]),
+                    })
+                    known_ids.add(gift_id)
 
         prices = await gift_prices()
         for gift in gifts:
@@ -3693,36 +3822,55 @@ def build_messenger_router(
                 "SELECT source FROM telegram_gift_sync_state WHERE id=1"
             )
             state = await cur.fetchone()
-        source = str(state["source"]) if state else "telegram_bot_api"
+            active_source = str(state["source"]) if state else "telegram_bot_api"
 
-        if source == "telegram_mtproto":
+            source_order = (
+                ("telegram_mtproto", "telegram_bot_api")
+                if active_source == "telegram_mtproto"
+                else ("telegram_bot_api", "telegram_mtproto")
+            )
+            catalog_source = ""
+            sticker_row = None
+            for candidate in source_order:
+                if candidate == "telegram_mtproto":
+                    cur = await db.execute(
+                        """SELECT sticker_mime_type,sticker_document_id,sticker_dc_id,sticker_size
+                           FROM telegram_mtproto_gift_catalog WHERE gift_id=?""",
+                        (gift_id,),
+                    )
+                else:
+                    cur = await db.execute(
+                        """SELECT sticker_file_id,sticker_mime_type
+                           FROM telegram_gift_catalog WHERE gift_id=?""",
+                        (gift_id,),
+                    )
+                sticker_row = await cur.fetchone()
+                if sticker_row is not None:
+                    catalog_source = candidate
+                    break
+
+        if sticker_row is None:
+            raise HTTPException(status_code=404, detail="Подарок не найден в текущем или историческом каталоге")
+
+        if catalog_source == "telegram_mtproto":
             provider = mtproto_gift_provider() if mtproto_gift_provider else None
             if provider is None:
-                raise HTTPException(status_code=503, detail="Telegram MTProto is not connected")
+                raise HTTPException(status_code=503, detail="Telegram MTProto media недоступна")
             try:
                 content, media_type = await provider.download_sticker(gift_id)
             except LookupError as exc:
-                raise HTTPException(status_code=404, detail="Подарок Telegram не найден в MTProto-каталоге") from exc
+                raise HTTPException(status_code=404, detail="Стикер старого подарка отсутствует в кэше Telegram") from exc
             except Exception as exc:
                 raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram через MTProto") from exc
         else:
-            async with aiosqlite.connect(db_path()) as db:
-                cur = await db.execute(
-                    """SELECT sticker_file_id,sticker_mime_type
-                       FROM telegram_gift_catalog WHERE gift_id=?""",
-                    (gift_id,),
-                )
-                row = await cur.fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Подарок Telegram не найден")
             bot = bot_provider()
             if bot is None:
                 raise HTTPException(status_code=503, detail="Telegram Bot API недоступен")
             try:
                 content, media_type = await fetch_telegram_sticker(
                     bot,
-                    str(row[0]),
-                    str(row[1] or ""),
+                    str(sticker_row["sticker_file_id"]),
+                    str(sticker_row["sticker_mime_type"] or ""),
                 )
             except Exception as exc:
                 raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram") from exc
