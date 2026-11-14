@@ -3568,9 +3568,28 @@ def build_messenger_router(
     async def settle_due_collectible_auctions(db: Any, now: int) -> int:
         cur = await db.execute(
             """SELECT id,serial_number,seller_telegram_id,current_bid_grams,
-                      highest_bidder_telegram_id
+                      highest_bidder_telegram_id,
+                      EXISTS(
+                          SELECT 1
+                          FROM user_gifts g
+                          JOIN telegram_auction_gift_registry r
+                            ON r.gift_id=g.telegram_gift_id
+                          WHERE g.serial_number=gift_collectible_auctions.serial_number
+                            AND g.owner_telegram_id=gift_collectible_auctions.seller_telegram_id
+                      ) AS auction_eligible
                FROM gift_collectible_auctions
-               WHERE status='active' AND ends_at<=?
+               WHERE status='active'
+                 AND (
+                     ends_at<=?
+                     OR NOT EXISTS(
+                         SELECT 1
+                         FROM user_gifts g
+                         JOIN telegram_auction_gift_registry r
+                           ON r.gift_id=g.telegram_gift_id
+                         WHERE g.serial_number=gift_collectible_auctions.serial_number
+                           AND g.owner_telegram_id=gift_collectible_auctions.seller_telegram_id
+                     )
+                 )
                ORDER BY ends_at,id""",
             (now,),
         )
@@ -3582,6 +3601,33 @@ def build_messenger_router(
             seller_id = int(auction["seller_telegram_id"])
             bidder_value = auction["highest_bidder_telegram_id"]
             bid = int(auction["current_bid_grams"])
+            if not bool(auction["auction_eligible"]):
+                if bidder_value is not None and bid > 0:
+                    bidder_id = int(bidder_value)
+                    cur = await db.execute(
+                        "SELECT grams FROM accounts WHERE telegram_id=?",
+                        (bidder_id,),
+                    )
+                    bidder = await cur.fetchone()
+                    if bidder is not None:
+                        refunded_balance = int(bidder["grams"]) + bid
+                        await db.execute(
+                            "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                            (refunded_balance, now, bidder_id),
+                        )
+                        await db.execute(
+                            """INSERT INTO economy_transactions
+                               (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                               VALUES(?,'grams',?,?,?,NULL,?)""",
+                            (bidder_id, bid, refunded_balance,
+                             f"gift_auction_ineligible_refund:{auction_id}", now),
+                        )
+                await db.execute(
+                    "UPDATE gift_collectible_auctions SET status='cancelled',settled_at=? WHERE id=? AND status='active'",
+                    (now, auction_id),
+                )
+                settled += 1
+                continue
             if bidder_value is None or bid <= 0:
                 await db.execute(
                     "UPDATE gift_collectible_auctions SET status='ended',settled_at=? WHERE id=? AND status='active'",
