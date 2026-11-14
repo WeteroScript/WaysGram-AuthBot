@@ -374,6 +374,77 @@ def test_mentions_and_hashtag_search_support_chat_links(api_env) -> None:
     run(scenario())
 
 
+def test_message_waits_until_recipient_becomes_online(api_env) -> None:
+    _path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89501, "online_sender")
+    add_account(api_env, 89502, "online_recipient")
+    add_session(_path, 89501, "online-sender-session")
+    add_session(_path, 89502, "online-recipient-session")
+
+    async def scenario() -> None:
+        await app.router.startup()
+        try:
+            async with await client_for(app) as client:
+                sender = {"Authorization": "Bearer online-sender-session"}
+                recipient = {"Authorization": "Bearer online-recipient-session"}
+                headers = {**sender, "Idempotency-Key": "wait-online-message-key-01"}
+
+                queued = await client.post(
+                    "/api/messages/when-online",
+                    headers=headers,
+                    json={"recipient_id": 89502, "body": "send when I appear online"},
+                )
+                assert queued.status_code == 201
+                assert queued.json()["status"] == "pending"
+                assert queued.json()["trigger"] == "when_online"
+
+                before_online = await client.get("/api/messages?with=89501", headers=recipient)
+                assert before_online.status_code == 200
+                assert before_online.json()["messages"] == []
+
+                # This authenticated request is the recipient's first online activity.
+                profile = await client.get("/api/me", headers=recipient)
+                assert profile.status_code == 200
+
+                history = None
+                for _ in range(12):
+                    await asyncio.sleep(0.25)
+                    response = await client.get("/api/messages?with=89501", headers=recipient)
+                    assert response.status_code == 200
+                    messages = response.json()["messages"]
+                    if messages:
+                        history = messages
+                        break
+                assert history is not None and len(history) == 1
+                assert history[0]["body"] == "send when I appear online"
+                assert history[0]["sender_id"] == 89501
+
+                repeated = await client.post(
+                    "/api/messages/when-online",
+                    headers=headers,
+                    json={"recipient_id": 89502, "body": "send when I appear online"},
+                )
+                assert repeated.status_code == 201
+                assert repeated.json()["id"] == queued.json()["id"]
+
+                pending = await client.post(
+                    "/api/messages/when-online",
+                    headers={**sender, "Idempotency-Key": "cancel-online-message-key"},
+                    json={"recipient_id": 89502, "body": "cancel this online message"},
+                )
+                assert pending.status_code == 201
+                cancelled = await client.delete(
+                    f"/api/messages/when-online/{pending.json()['id']}",
+                    headers=sender,
+                )
+                assert cancelled.status_code == 200
+                assert cancelled.json()["status"] == "cancelled"
+        finally:
+            await app.router.shutdown()
+
+    run(scenario())
+
+
 def test_recurring_scheduled_messages_keep_local_time_across_dst() -> None:
     zone_name = "Europe/Amsterdam"
     zone = ZoneInfo(zone_name)
