@@ -950,6 +950,28 @@ def test_waysgram_auction_requires_historical_telegram_auction_origin(env) -> No
             assert rejected.status_code == 409
             assert "исторически" in rejected.json()["detail"].lower()
 
+            # A legacy active auction for a non-eligible model is cancelled,
+            # and its locked leading bid is returned automatically.
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute(
+                    "UPDATE accounts SET grams=97 WHERE telegram_id=102"
+                )
+                now = int(time.time())
+                connection.execute(
+                    """INSERT INTO gift_collectible_auctions
+                       (serial_number,seller_telegram_id,starting_price_grams,current_bid_grams,
+                        highest_bidder_telegram_id,status,starts_at,ends_at,created_at)
+                       VALUES(?,?,?,?,?,'active',?,?,?)""",
+                    (serial, 101, 3, 3, 102, now, now + 3600, now),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            hidden = await client.get("/api/gift-auctions", headers=headers(102))
+            assert hidden.status_code == 200 and hidden.json()["count"] == 0
+            assert (await client.get("/api/me", headers=headers(102))).json()["grams"] == 100
+
             # Historical provenance is stored independently from live catalogue availability.
             connection = db_split.sqlite_connect(path)
             try:
