@@ -2766,6 +2766,7 @@ def test_video_audio_and_zip_uploads_are_validated_and_private(api_env) -> None:
     fixtures = (
         ("video/mp4", "clip.mp4", b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00", "video/mp4", "inline"),
         ("audio/mpeg", "voice.mp3", b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb", "audio/mpeg", "inline"),
+        ("audio/mp4", "voice.m4a", b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00", "audio/mp4", "inline"),
         ("application/zip", "bundle.zip", b"PK\x03\x04\x14\x00\x00\x00\x00\x00", "application/zip", "attachment"),
     )
 
