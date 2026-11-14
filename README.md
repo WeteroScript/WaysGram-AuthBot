@@ -266,3 +266,8 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 **Обновление с одним файлом.** При первом запуске новой версии таблицы мессенджера автоматически переносятся во второй файл. Перед этим рядом с основной базой сохраняется копия `waysgram_authbot.sqlite3.pre-split.bak`. Перенос проверяется по числу строк, и исходная таблица удаляется только после успешной проверки. Повторный запуск безопасен.
 
 Резервные копии должны включать оба файла и каталог `waysgram_media`. Оба файла должны лежать на постоянном диске.
+
+### Voice transcription
+
+Voice transcription is optional. Configure `OPENAI_API_KEY` in the AuthBot host environment to enable it. The WaysGram client asks for explicit confirmation before sending an audio attachment to OpenAI. The resulting transcript is cached in the messenger database for that media item; removing an unused media item also removes its cached transcript.
+
