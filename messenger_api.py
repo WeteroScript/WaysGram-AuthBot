@@ -657,6 +657,17 @@ async def init_messenger_storage(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_telegram_mtproto_gifts_available
                 ON telegram_mtproto_gift_catalog(is_available,position);
+            CREATE TABLE IF NOT EXISTS telegram_auction_gift_registry (
+                gift_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                auction_slug TEXT NOT NULL,
+                auction_start_date INTEGER NOT NULL,
+                gifts_per_round INTEGER NOT NULL CHECK(gifts_per_round > 0),
+                discovered_at INTEGER NOT NULL,
+                source_payload TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_telegram_auction_gift_registry_start
+                ON telegram_auction_gift_registry(auction_start_date DESC);
             CREATE TABLE IF NOT EXISTS chat_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT COLLATE NOCASE UNIQUE,
@@ -790,6 +801,21 @@ async def init_messenger_storage(database_path: Path) -> None:
         # A database from an older version keeps everything in one file: move the messenger tables out first,
         # because a table left in the main file would hide the one in the messenger file.
         await db_split.migrate_legacy_with(db, database_path)
+        # Snapshot only models that Telegram explicitly marks as auction-issued.
+        # Keep this registry append-only; live availability and active auction
+        # state are separate from the model's historical distribution method.
+        await db.execute(
+            """INSERT OR IGNORE INTO telegram_auction_gift_registry
+               (gift_id,title,auction_slug,auction_start_date,gifts_per_round,
+                discovered_at,source_payload)
+               SELECT gift_id,title,auction_slug,auction_start_date,gifts_per_round,
+                      synced_at,source_payload
+               FROM telegram_mtproto_gift_catalog
+               WHERE auction=1
+                 AND TRIM(COALESCE(auction_slug,''))<>''
+                 AND auction_start_date IS NOT NULL
+                 AND COALESCE(gifts_per_round,0)>0"""
+        )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(user_gifts)")
         user_gift_columns = {str(row[1]) for row in await cur.fetchall()}
         if "upgrade_level" not in user_gift_columns:
@@ -2431,7 +2457,9 @@ def build_messenger_router(
                                    AND l.status='active') AS is_listed,
                           EXISTS(SELECT 1 FROM gift_collectible_auctions a
                                  WHERE a.serial_number=user_gifts.serial_number
-                                   AND a.status='active') AS is_auctioned
+                                   AND a.status='active') AS is_auctioned,
+                          EXISTS(SELECT 1 FROM telegram_auction_gift_registry r
+                                 WHERE r.gift_id=user_gifts.telegram_gift_id) AS auction_eligible
                    FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
                 (int(user["telegram_id"]),),
             )
@@ -2698,7 +2726,9 @@ def build_messenger_router(
                                    AND l.status='active') AS is_listed,
                           EXISTS(SELECT 1 FROM gift_collectible_auctions a
                                  WHERE a.serial_number=user_gifts.serial_number
-                                   AND a.status='active') AS is_auctioned
+                                   AND a.status='active') AS is_auctioned,
+                          EXISTS(SELECT 1 FROM telegram_auction_gift_registry r
+                                 WHERE r.gift_id=user_gifts.telegram_gift_id) AS auction_eligible
                    FROM user_gifts
                    WHERE owner_telegram_id=?
                    ORDER BY id DESC LIMIT 50""",
@@ -3673,11 +3703,14 @@ def build_messenger_router(
                           (SELECT COUNT(*) FROM gift_collectible_auction_bids b
                            WHERE b.auction_id=a.id) AS bid_count,
                           CASE WHEN a.current_bid_grams=0 THEN a.starting_price_grams
-                               ELSE a.current_bid_grams+1 END AS minimum_bid_grams
+                               ELSE a.current_bid_grams+1 END AS minimum_bid_grams,
+                          1 AS auction_eligible
                    FROM gift_collectible_auctions a
                    JOIN user_gifts g ON g.serial_number=a.serial_number
                    JOIN accounts seller ON seller.telegram_id=a.seller_telegram_id
                    WHERE a.status='active'
+                     AND EXISTS(SELECT 1 FROM telegram_auction_gift_registry r
+                                WHERE r.gift_id=g.telegram_gift_id)
                    ORDER BY a.ends_at ASC,a.id ASC LIMIT 100"""
             )
             rows = await cur.fetchall()
@@ -3723,7 +3756,8 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             await settle_due_collectible_auctions(db, now)
             cur = await db.execute(
-                "SELECT id,gift_name,upgrade_level,attributes_json FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?",
+                """SELECT id,gift_name,telegram_gift_id,upgrade_level,attributes_json
+                   FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?""",
                 (serial, uid),
             )
             gift = await cur.fetchone()
@@ -3740,6 +3774,16 @@ def build_messenger_router(
             ):
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Сначала улучшите подарок до коллекционного")
+            cur = await db.execute(
+                "SELECT 1 FROM telegram_auction_gift_registry WHERE gift_id=?",
+                (str(gift["telegram_gift_id"] or ""),),
+            )
+            if await cur.fetchone() is None:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="Аукцион доступен только для моделей, исторически выпускавшихся через аукцион Telegram",
+                )
             cur = await db.execute(
                 "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
                 (serial,),
@@ -3834,9 +3878,12 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             await settle_due_collectible_auctions(db, now)
             cur = await db.execute(
-                """SELECT id,serial_number,seller_telegram_id,starting_price_grams,
-                          current_bid_grams,highest_bidder_telegram_id,ends_at
-                   FROM gift_collectible_auctions WHERE id=? AND status='active'""",
+                """SELECT a.id,a.serial_number,a.seller_telegram_id,a.starting_price_grams,
+                          a.current_bid_grams,a.highest_bidder_telegram_id,a.ends_at,
+                          g.telegram_gift_id
+                   FROM gift_collectible_auctions a
+                   JOIN user_gifts g ON g.serial_number=a.serial_number
+                   WHERE a.id=? AND a.status='active'""",
                 (auction_id,),
             )
             auction = await cur.fetchone()
@@ -3844,6 +3891,13 @@ def build_messenger_router(
                 # Keep any due-auction settlement performed above.
                 await db.commit()
                 raise HTTPException(status_code=409, detail="Аукцион уже завершён или недоступен")
+            cur = await db.execute(
+                "SELECT 1 FROM telegram_auction_gift_registry WHERE gift_id=?",
+                (str(auction["telegram_gift_id"] or ""),),
+            )
+            if await cur.fetchone() is None:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Аукцион недоступен для этой модели подарка")
             seller_id = int(auction["seller_telegram_id"])
             if uid == seller_id:
                 await db.rollback()
