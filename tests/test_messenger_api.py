@@ -1668,6 +1668,95 @@ def test_uncompressed_image_attachment_preserves_original_bytes(api_env) -> None
     run(scenario())
 
 
+def test_personal_media_storage_lists_usage_and_deletes_only_unreferenced_files(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89311, "storage_owner")
+    add_account(api_env, 89312, "storage_recipient")
+    add_account(api_env, 89313, "storage_intruder")
+    add_session(path, 89311, "storage-owner-session")
+    add_session(path, 89312, "storage-recipient-session")
+    add_session(path, 89313, "storage-intruder-session")
+
+    document_bytes = b"WaysGram cloud storage test document\n"
+    attached_bytes = b"Attached media must remain available\n"
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            owner = {"Authorization": "Bearer storage-owner-session"}
+            recipient = {"Authorization": "Bearer storage-recipient-session"}
+            intruder = {"Authorization": "Bearer storage-intruder-session"}
+
+            orphan_upload = await client.post(
+                "/api/media/documents",
+                headers={**owner, "Content-Type": "text/plain", "X-Filename": "orphan.txt"},
+                content=document_bytes,
+            )
+            attached_upload = await client.post(
+                "/api/media/documents",
+                headers={**owner, "Content-Type": "text/plain", "X-Filename": "attached.txt"},
+                content=attached_bytes,
+            )
+            assert orphan_upload.status_code == 201
+            assert attached_upload.status_code == 201
+            orphan_id = orphan_upload.json()["id"]
+            attached_id = attached_upload.json()["id"]
+
+            sent = await client.post(
+                "/api/messages",
+                headers=owner,
+                json={"recipient_id": 89312, "media_id": attached_id},
+            )
+            assert sent.status_code == 201
+
+            storage = await client.get("/api/media/storage", headers=owner)
+            assert storage.status_code == 200
+            payload = storage.json()
+            assert payload["total_files"] == 2
+            assert payload["used_bytes"] == len(document_bytes) + len(attached_bytes)
+            assert payload["quota_bytes"] >= payload["used_bytes"]
+            records = {item["id"]: item for item in payload["files"]}
+            assert records[orphan_id]["can_delete"] is True
+            assert records[orphan_id]["message_references"] == 0
+            assert records[attached_id]["can_delete"] is False
+            assert records[attached_id]["message_references"] == 1
+
+            outsider = await client.get("/api/media/storage", headers=intruder)
+            assert outsider.status_code == 200
+            assert outsider.json()["total_files"] == 0
+
+            blocked_delete = await client.delete(
+                f"/api/media/storage/{attached_id}",
+                headers=owner,
+            )
+            assert blocked_delete.status_code == 409
+
+            denied_delete = await client.delete(
+                f"/api/media/storage/{orphan_id}",
+                headers=intruder,
+            )
+            assert denied_delete.status_code == 404
+
+            deleted = await client.delete(
+                f"/api/media/storage/{orphan_id}",
+                headers=owner,
+            )
+            assert deleted.status_code == 200
+            assert deleted.json()["freed_bytes"] == len(document_bytes)
+
+            after_delete = await client.get("/api/media/storage", headers=owner)
+            assert after_delete.status_code == 200
+            assert after_delete.json()["total_files"] == 1
+            assert after_delete.json()["used_bytes"] == len(attached_bytes)
+            saved_chat_file = await client.get(attached_upload.json()["url"], headers=recipient)
+            assert saved_chat_file.status_code == 200
+            assert saved_chat_file.content == attached_bytes
+
+            missing = await client.get(orphan_upload.json()["url"], headers=owner)
+            assert missing.status_code == 404
+
+    run(scenario())
+
+
 def test_gift_purchase_is_idempotent_and_transfer_updates_inventory(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 83001, "buyer")
