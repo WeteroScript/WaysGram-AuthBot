@@ -646,6 +646,71 @@ def test_scheduled_direct_messages_send_once_and_can_be_cancelled(api_env) -> No
     run(scenario())
 
 
+def test_direct_message_forward_preserves_origin_and_is_idempotent(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89301, "forward_original")
+    add_account(api_env, 89302, "forward_sender")
+    add_account(api_env, 89303, "forward_recipient")
+    add_account(api_env, 89304, "forward_outsider")
+    for user_id, token in (
+        (89301, "forward-original-session"),
+        (89302, "forward-sender-session"),
+        (89303, "forward-recipient-session"),
+        (89304, "forward-outsider-session"),
+    ):
+        add_session(path, user_id, token)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            original_sender = {"Authorization": "Bearer forward-original-session"}
+            forward_sender = {"Authorization": "Bearer forward-sender-session"}
+            recipient = {"Authorization": "Bearer forward-recipient-session"}
+            outsider = {"Authorization": "Bearer forward-outsider-session"}
+
+            original = await client.post(
+                "/api/messages",
+                headers=original_sender,
+                json={"recipient_id": 89302, "body": "message to forward"},
+            )
+            assert original.status_code == 201
+            message_id = original.json()["id"]
+
+            forward_headers = {**forward_sender, "Idempotency-Key": "forward-once"}
+            forwarded = await client.post(
+                f"/api/messages/{message_id}/forward",
+                headers=forward_headers,
+                json={"recipient_id": 89303},
+            )
+            assert forwarded.status_code == 201
+            payload = forwarded.json()
+            assert payload["body"] == "message to forward"
+            assert payload["forwarded_from_telegram_id"] == 89301
+            assert payload["forwarded_from_message_id"] == message_id
+
+            repeated = await client.post(
+                f"/api/messages/{message_id}/forward",
+                headers=forward_headers,
+                json={"recipient_id": 89303},
+            )
+            assert repeated.status_code == 201
+            assert repeated.json()["id"] == payload["id"]
+
+            denied = await client.post(
+                f"/api/messages/{message_id}/forward",
+                headers=outsider,
+                json={"recipient_id": 89303},
+            )
+            assert denied.status_code == 404
+
+            history = await client.get("/api/messages?with=89302", headers=recipient)
+            assert history.status_code == 200
+            forwarded_message = history.json()["messages"][-1]
+            assert forwarded_message["id"] == payload["id"]
+            assert forwarded_message["forwarded_from_telegram_id"] == 89301
+
+    run(scenario())
+
+
 def test_direct_messages_preserve_telegram_html_formatting(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 89101, "format_sender")
@@ -655,7 +720,8 @@ def test_direct_messages_preserve_telegram_html_formatting(api_env) -> None:
 
     body = (
         "<b>bold</b> <i>italic</i> <u>underlined</u> "
-        "<s>struck</s> <tg-spoiler>spoiler</tg-spoiler> <code>monospace</code>"
+        "<s>struck</s> <tg-spoiler>spoiler</tg-spoiler> <code>monospace</code> "
+        "<blockquote>quoted text</blockquote>"
     )
 
     async def scenario() -> None:
