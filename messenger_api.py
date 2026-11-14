@@ -1826,8 +1826,8 @@ def build_messenger_router(
         uid = int(user["telegram_id"])
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
         media_kind = str(request.headers.get("x-media-kind", "")).strip().lower()
-        if media_kind not in {"", "video_note"}:
-            raise HTTPException(status_code=400, detail="Неизвестный тип видеосообщения")
+        if media_kind not in {"", "video_note", "voice"}:
+            raise HTTPException(status_code=400, detail="Неизвестный тип медиафайла")
         allowed_types = {
             "image/jpeg", "image/png", "image/webp",
             "application/pdf", "text/plain", "text/csv", "application/zip",
@@ -1872,6 +1872,11 @@ def build_messenger_router(
             raise HTTPException(
                 status_code=415,
                 detail="Видеосообщения-кружочки должны быть в формате MP4",
+            )
+        if media_kind == "voice" and not mime_type.startswith("audio/"):
+            raise HTTPException(
+                status_code=415,
+                detail="Голосовые сообщения должны быть аудиофайлами",
             )
 
         now = int(time.time())
