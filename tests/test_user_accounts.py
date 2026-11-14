@@ -82,7 +82,7 @@ def test_transfer_changes_owner_and_revokes_all_existing_sessions(account_store)
     assert run(store.find_registered_user("@recipient")) == RECIPIENT
     assert run(store.transfer_number("+15551234567", ADMIN, RECIPIENT)) == account_id
     assert run(store.owned_numbers(ADMIN)) == []
-    assert run(store.owned_numbers(RECIPIENT)) == [("+15551234567",)]
+    assert run(store.owned_numbers(RECIPIENT)) == [("+15551234567", account_id)]
 
     owner = run(store.resolve_number("+15551234567"))
     assert owner["telegram_id"] == account_id
