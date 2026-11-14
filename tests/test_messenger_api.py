@@ -753,7 +753,7 @@ def test_direct_messages_preserve_telegram_html_formatting(api_env) -> None:
         "<b>bold</b> <i>italic</i> <u>underlined</u> "
         "<s>struck</s> <tg-spoiler>spoiler</tg-spoiler> <code>monospace</code> "
         "<blockquote>quoted text</blockquote> "
-        "<pre>code block\\nsecond line</pre>"
+        "<pre>code block</pre> https://example.com/test"
     )
 
     async def scenario() -> None:
