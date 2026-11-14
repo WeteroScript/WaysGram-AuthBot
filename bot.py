@@ -976,38 +976,71 @@ def normalize_admin_number(value: str) -> str | None:
 
 
 async def telegram_gift_rows() -> list[dict[str, Any]]:
-    """Every gift of the Telegram catalog with the price and stock the administrator has set (0 by default)."""
+    """Return active and historically cached Telegram gift IDs from both catalog sources."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
         state = await cur.fetchone()
-        source = str(state["source"]) if state else ""
-    if not source:
-        # The catalog has not been downloaded yet.
+        active_source = str(state["source"]) if state else ""
+
+    if not active_source:
         try:
             from messenger_api import sync_telegram_gifts
 
             await sync_telegram_gifts(DATABASE_PATH, bot)
         except Exception as exc:
             log.warning("Telegram gift catalog sync failed (%s)", type(exc).__name__)
-            return []
         async with aiosqlite.connect(DATABASE_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
             state = await cur.fetchone()
-            source = str(state["source"]) if state else ""
-    table = "telegram_mtproto_gift_catalog" if source == "telegram_mtproto" else "telegram_gift_catalog"
+            active_source = str(state["source"]) if state else ""
+
+    ordered_sources = (
+        [active_source, "telegram_mtproto" if active_source == "telegram_bot_api" else "telegram_bot_api"]
+        if active_source else ["telegram_mtproto", "telegram_bot_api"]
+    )
+    catalogs = {
+        "telegram_mtproto": "telegram_mtproto_gift_catalog",
+        "telegram_bot_api": "telegram_gift_catalog",
+    }
+    by_id: dict[str, dict[str, Any]] = {}
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            f"""SELECT g.gift_id AS id,g.title AS title,
-                       COALESCE(p.price_stars,0) AS price_stars,COALESCE(p.supply,0) AS supply,COALESCE(p.sold,0) AS sold
-                FROM {table} g LEFT JOIN telegram_gift_prices p ON p.gift_id=g.gift_id
-                WHERE 1=1
-                ORDER BY (COALESCE(p.price_stars,0)>0 AND COALESCE(p.supply,0)>COALESCE(p.sold,0)) DESC, g.gift_id"""
-        )
-        return [dict(row) for row in await cur.fetchall()]
+        for catalog_source in ordered_sources:
+            table = catalogs.get(catalog_source)
+            if table is None:
+                continue
+            cur = await db.execute(
+                f"""SELECT g.gift_id AS id,g.title AS title,
+                           COALESCE(p.price_stars,0) AS price_stars,
+                           COALESCE(p.supply,0) AS supply,
+                           COALESCE(p.sold,0) AS sold,
+                           g.is_available AS telegram_available
+                    FROM {table} g
+                    LEFT JOIN telegram_gift_prices p ON p.gift_id=g.gift_id"""
+            )
+            for row in await cur.fetchall():
+                gift_id = str(row["id"])
+                if gift_id in by_id:
+                    continue
+                item = dict(row)
+                item["catalog_source"] = catalog_source
+                item["telegram_available"] = bool(item.get("telegram_available"))
+                by_id[gift_id] = item
 
+    rows = list(by_id.values())
+    rows.sort(
+        key=lambda row: (
+            not (
+                int(row["price_stars"]) > 0
+                and int(row["supply"]) - int(row["sold"]) > 0
+            ),
+            str(row["title"]).casefold(),
+            str(row["id"]),
+        )
+    )
+    return rows
 
 def telegram_gift_label(row: dict[str, Any]) -> str:
     remaining = max(int(row["supply"]) - int(row["sold"]), 0)
@@ -1045,10 +1078,12 @@ async def admin_telegram_gift_card(gift_id: str) -> tuple[str, InlineKeyboardMar
     if not row:
         return None
     remaining = max(int(row["supply"]) - int(row["sold"]), 0)
+    telegram_status = "доступен в текущем каталоге Telegram" if row.get("telegram_available") else "сохранён в истории (в Telegram больше не продаётся)"
     body = (
-        f"Подарок {row['title']}\n\nID: {row['id']}\nЦена: {row['price_stars']} Stars\n"
-        f"Всего в продаже: {row['supply']}\nПродано: {row['sold']}\nОсталось: {remaining}\n"
-        f"Статус: {'в магазине' if int(row['price_stars']) > 0 and remaining > 0 else 'скрыт'}"
+        f"Подарок {row['title']}\n\nID: {row['id']}\nИсточник данных: {row.get('catalog_source', 'telegram')}\n"
+        f"Статус Telegram: {telegram_status}\nЦена WaysGram: {row['price_stars']} Stars\n"
+        f"Всего в продаже WaysGram: {row['supply']}\nПродано: {row['sold']}\nОсталось: {remaining}\n"
+        f"Статус WaysGram: {'в магазине' if int(row['price_stars']) > 0 and remaining > 0 else 'скрыт'}"
     )
     return body, admin_keyboard([
         [("Цена (Stars)", f"wgadm:tgprice:{gift_id}"), ("Остаток (шт.)", f"wgadm:tgsupply:{gift_id}")],
@@ -1533,7 +1568,7 @@ async def admin_callback(callback: CallbackQuery) -> None:
         await callback.message.answer(body, reply_markup=keyboard)
     elif action == "tgadd":
         ADMIN_INPUT[ADMIN_ID] = ("tgadd_id", None)
-        await callback.message.answer("Отправьте Telegram Gift ID из синхронизированного каталога. Название вводить не нужно.")
+        await callback.message.answer("Отправьте Telegram Gift ID. Проверю текущий и сохранённый исторический каталог; доступность покупки в Telegram не важна.")
     elif action == "tggift" and len(parts) == 3:
         card = await admin_telegram_gift_card(parts[2])
         if card:
@@ -1854,8 +1889,9 @@ async def admin_text_input(message: Message) -> None:
         row = next((item for item in await telegram_gift_rows() if str(item["id"]) == value), None)
         if row is None:
             await message.answer(
-                "Gift ID нет в синхронизированном каталоге и сохранённой истории. "
-                "WaysGram не может восстановить название и изображение только по неизвестному ID."
+                "Этот Gift ID не найден ни в текущем, ни в сохранённом историческом каталоге. "
+                "Telegram не предоставляет получение старого публичного подарка только по ID. "
+                "Для такого ID понадобятся название и файл стикера."
             )
             return
         async with aiosqlite.connect(DATABASE_PATH) as db:
