@@ -1029,6 +1029,22 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
                 item["telegram_available"] = bool(item.get("telegram_available"))
                 by_id[gift_id] = item
 
+        cur = await db.execute(
+            """SELECT p.gift_id AS id,'Telegram Gift ' || p.gift_id AS title,
+                      p.price_stars,p.supply,p.sold,0 AS telegram_available
+               FROM telegram_gift_prices p
+               WHERE NOT EXISTS (SELECT 1 FROM telegram_gift_catalog c WHERE c.gift_id=p.gift_id)
+                 AND NOT EXISTS (SELECT 1 FROM telegram_mtproto_gift_catalog m WHERE m.gift_id=p.gift_id)"""
+        )
+        for row in await cur.fetchall():
+            gift_id = str(row["id"])
+            if gift_id in by_id:
+                continue
+            item = dict(row)
+            item["catalog_source"] = "waysgram_manual"
+            item["telegram_available"] = False
+            by_id[gift_id] = item
+
     rows = list(by_id.values())
     rows.sort(
         key=lambda row: (
@@ -1078,7 +1094,10 @@ async def admin_telegram_gift_card(gift_id: str) -> tuple[str, InlineKeyboardMar
     if not row:
         return None
     remaining = max(int(row["supply"]) - int(row["sold"]), 0)
-    telegram_status = "доступен в текущем каталоге Telegram" if row.get("telegram_available") else "сохранён в истории (в Telegram больше не продаётся)"
+    if row.get("catalog_source") == "waysgram_manual":
+        telegram_status = "метаданные Telegram не найдены; запись создана в WaysGram только по ID"
+    else:
+        telegram_status = "доступен в текущем каталоге Telegram" if row.get("telegram_available") else "сохранён в истории (в Telegram больше не продаётся)"
     body = (
         f"Подарок {row['title']}\n\nID: {row['id']}\nИсточник данных: {row.get('catalog_source', 'telegram')}\n"
         f"Статус Telegram: {telegram_status}\nЦена WaysGram: {row['price_stars']} Stars\n"
@@ -1887,13 +1906,6 @@ async def admin_text_input(message: Message) -> None:
             await message.answer("Некорректный Telegram Gift ID. Отправьте ID без пробелов.")
             return
         row = next((item for item in await telegram_gift_rows() if str(item["id"]) == value), None)
-        if row is None:
-            await message.answer(
-                "Этот Gift ID не найден ни в текущем, ни в сохранённом историческом каталоге. "
-                "Telegram не предоставляет получение старого публичного подарка только по ID. "
-                "Для такого ID понадобятся название и файл стикера."
-            )
-            return
         async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute(
                 """INSERT OR IGNORE INTO telegram_gift_prices
@@ -1904,7 +1916,7 @@ async def admin_text_input(message: Message) -> None:
         ADMIN_INPUT.pop(ADMIN_ID, None)
         card = await admin_telegram_gift_card(value)
         if card:
-            await message.answer("Telegram Gift ID добавлен в управление.\n\n" + card[0], reply_markup=card[1])
+            await message.answer("Telegram Gift ID добавлен в управление WaysGram.\n\n" + card[0], reply_markup=card[1])
         else:
             await message.answer("Подарок не найден. Обновите каталог.")
     elif kind in ("tgprice", "tgsupply"):
