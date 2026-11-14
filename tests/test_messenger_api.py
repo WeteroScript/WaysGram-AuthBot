@@ -3060,6 +3060,16 @@ def test_direct_messages_support_explicit_location_sharing(api_env) -> None:
             )
             assert invalid_nan.status_code == 400
 
+            invalid_boolean = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89602,
+                    "location": {"latitude": True, "longitude": 0},
+                },
+            )
+            assert invalid_boolean.status_code == 400
+
             mixed = await client.post(
                 "/api/messages",
                 headers=sender,
