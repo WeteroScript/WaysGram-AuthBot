@@ -5007,3 +5007,60 @@ def test_retired_mtproto_gift_is_available_from_historical_catalog(api_env) -> N
     retired = next(row for row in admin_rows if row["id"] == "retired_987654")
     assert retired["catalog_source"] == "telegram_mtproto"
     assert retired["telegram_available"] is False
+
+
+def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_waysgram(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88102, "manual_gift_user")
+    add_session(path, 88102, "manual-gift-session")
+    now = int(time.time())
+    with db_split.sqlite_connect(path) as db:
+        db.execute("UPDATE accounts SET stars=100 WHERE telegram_id=88102")
+        db.execute(
+            """INSERT INTO telegram_gift_sync_state(id,last_synced_at,gift_count,source)
+               VALUES(1,?,0,'telegram_bot_api')""",
+            (now,),
+        )
+        db.execute(
+            """INSERT INTO telegram_gift_prices
+               (gift_id,price_stars,supply,sold,updated_at)
+               VALUES('gift_not_cached',25,2,0,?)""",
+            (now,),
+        )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = {"Authorization": "Bearer manual-gift-session"}
+            catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
+            assert catalog.status_code == 200
+            gift = next(item for item in catalog.json()["gifts"] if item["id"] == "gift_not_cached")
+            assert gift["catalog_source"] == "waysgram_manual"
+            assert gift["title"] == "Telegram Gift gift_not_cached"
+            assert gift["for_sale"] is True
+            assert gift["sticker"]["url"].endswith("/gift_not_cached/sticker")
+
+            purchase = await client.post(
+                "/api/telegram/gifts/gift_not_cached/purchase",
+                headers={**auth, "Idempotency-Key": "manual-gift-purchase-0001"},
+                json={},
+            )
+            assert purchase.status_code == 201
+            assert purchase.json()["gift"]["gift_name"] == "Telegram Gift gift_not_cached"
+
+            inventory = await client.get("/api/me/gifts", headers=auth)
+            assert inventory.status_code == 200
+            assert inventory.json()["gifts"][0]["telegram_gift_id"] == "gift_not_cached"
+            assert inventory.json()["gifts"][0]["gift_name"] == "Telegram Gift gift_not_cached"
+
+            sticker = await client.get(
+                "/api/telegram/gifts/gift_not_cached/sticker",
+                headers=auth,
+            )
+            assert sticker.status_code == 404
+
+    run(scenario())
+
+    manual_rows = run(bot_module.telegram_gift_rows())
+    manual = next(row for row in manual_rows if row["id"] == "gift_not_cached")
+    assert manual["catalog_source"] == "waysgram_manual"
+    assert manual["telegram_available"] is False
