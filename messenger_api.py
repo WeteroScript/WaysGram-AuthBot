@@ -181,6 +181,32 @@ def _normalize_uploaded_document(raw: bytes, filename: str) -> tuple[bytes, str,
     )
     extension = compound_extension or Path(safe_name).suffix.lower()
 
+    if extension in {".jpg", ".jpeg", ".png", ".webp"}:
+        try:
+            with Image.open(BytesIO(raw)) as source_image:
+                image_format = str(source_image.format or "").upper()
+                expected_formats = {
+                    ".jpg": ("JPEG", "image/jpeg"),
+                    ".jpeg": ("JPEG", "image/jpeg"),
+                    ".png": ("PNG", "image/png"),
+                    ".webp": ("WEBP", "image/webp"),
+                }
+                expected = expected_formats[extension]
+                width, height = source_image.size
+                if image_format != expected[0]:
+                    raise ValueError("Расширение файла не соответствует формату изображения")
+                if (
+                    width <= 0 or height <= 0 or width > 8192 or height > 8192
+                    or width * height > MAX_IMAGE_PIXELS
+                ):
+                    raise ValueError("Размер изображения не поддерживается")
+                if getattr(source_image, "is_animated", False) or getattr(source_image, "n_frames", 1) != 1:
+                    raise ValueError("Анимированные изображения пока не поддерживаются")
+                source_image.verify()
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError("Файл не является корректным JPEG, PNG или WebP") from exc
+        return raw, expected[1], extension, safe_name
+
     if extension == ".pdf":
         if len(raw) < 16 or not raw.startswith(b"%PDF-") or b"%%EOF" not in raw[-2048:]:
             raise ValueError("Файл не является корректным PDF")
@@ -1751,6 +1777,7 @@ def build_messenger_router(
         uid = int(user["telegram_id"])
         declared_type = str(request.headers.get("content-type", "")).split(";", 1)[0].strip().lower()
         allowed_types = {
+            "image/jpeg", "image/png", "image/webp",
             "application/pdf", "text/plain", "text/csv", "application/zip",
             "application/vnd.rar", "application/x-7z-compressed", "application/x-tar",
             "application/gzip", "application/x-bzip2", "application/x-xz",
@@ -1761,7 +1788,7 @@ def build_messenger_router(
         if declared_type not in allowed_types:
             raise HTTPException(
                 status_code=415,
-                detail="Поддерживаются PDF, TXT, CSV, ZIP, RAR, 7Z, TAR, GZIP, BZIP2, XZ, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
+                detail="Поддерживаются JPEG, PNG, WebP, PDF, TXT, CSV, ZIP, RAR, 7Z, TAR, GZIP, BZIP2, XZ, MP4, WebM, MOV, MKV, MP3, M4A, OGG и WAV",
             )
         declared_length = request.headers.get("content-length")
         if declared_length:
