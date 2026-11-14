@@ -460,6 +460,26 @@ async def init_messenger_storage(database_path: Path) -> None:
                 longitude REAL NOT NULL CHECK(longitude >= -180 AND longitude <= 180),
                 label TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS live_locations (
+                id TEXT PRIMARY KEY,
+                sender_telegram_id INTEGER NOT NULL,
+                recipient_telegram_id INTEGER NOT NULL,
+                latitude REAL NOT NULL CHECK(latitude >= -90 AND latitude <= 90),
+                longitude REAL NOT NULL CHECK(longitude >= -180 AND longitude <= 180),
+                accuracy_m REAL,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                stopped_at INTEGER,
+                stopped_by_telegram_id INTEGER,
+                CHECK(sender_telegram_id<>recipient_telegram_id),
+                CHECK(expires_at>started_at),
+                CHECK(accuracy_m IS NULL OR (accuracy_m>=0 AND accuracy_m<=10000))
+            );
+            CREATE INDEX IF NOT EXISTS idx_live_locations_sender_expiry
+                ON live_locations(sender_telegram_id,expires_at,stopped_at);
+            CREATE INDEX IF NOT EXISTS idx_live_locations_recipient_expiry
+                ON live_locations(recipient_telegram_id,expires_at,stopped_at);
             CREATE INDEX IF NOT EXISTS idx_message_gifts_serial
                 ON message_gifts(serial_number);
             CREATE INDEX IF NOT EXISTS idx_api_messages_pair
@@ -5532,6 +5552,203 @@ def build_messenger_router(
             )
         return result
 
+
+    @router.post("/api/messages/live-location", status_code=201)
+    async def upsert_live_location(
+        payload: dict[str, Any],
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        try:
+            recipient_id = int(payload.get("recipient_id", 0))
+        except (TypeError, ValueError):
+            recipient_id = 0
+        if recipient_id <= 0 or recipient_id == uid:
+            raise HTTPException(status_code=400, detail="Укажите корректного получателя геолокации")
+
+        raw_latitude = payload.get("latitude")
+        raw_longitude = payload.get("longitude")
+        raw_accuracy = payload.get("accuracy_m")
+        if isinstance(raw_latitude, bool) or isinstance(raw_longitude, bool):
+            raise HTTPException(status_code=400, detail="Координаты должны быть числовыми значениями")
+        try:
+            latitude = float(raw_latitude)
+            longitude = float(raw_longitude)
+            accuracy = None if raw_accuracy is None else float(raw_accuracy)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Укажите корректные координаты")
+        if not math.isfinite(latitude) or not math.isfinite(longitude):
+            raise HTTPException(status_code=400, detail="Координаты должны быть конечными числами")
+        if not (-90.0 <= latitude <= 90.0) or not (-180.0 <= longitude <= 180.0):
+            raise HTTPException(status_code=400, detail="Координаты выходят за допустимый диапазон")
+        if accuracy is not None and (
+            not math.isfinite(accuracy) or accuracy < 0 or accuracy > 10000
+        ):
+            raise HTTPException(status_code=400, detail="Некорректная точность геолокации")
+
+        live_id = str(payload.get("live_location_id") or "").strip()
+        now = int(time.time())
+        created = False
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT is_banned FROM accounts WHERE telegram_id=?",
+                (recipient_id,),
+            )
+            recipient = await cur.fetchone()
+            if recipient is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Получатель не найден")
+            if recipient["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Получатель заблокирован")
+            cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                   LIMIT 1""",
+                (uid, recipient_id, recipient_id, uid),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Нельзя делиться геолокацией: пользователь находится в чёрном списке")
+
+            if live_id:
+                if not re.fullmatch(r"[a-f0-9]{32}", live_id):
+                    await db.rollback()
+                    raise HTTPException(status_code=400, detail="Некорректный ID трансляции геолокации")
+                cur = await db.execute(
+                    """UPDATE live_locations
+                       SET latitude=?,longitude=?,accuracy_m=?,updated_at=?
+                       WHERE id=? AND sender_telegram_id=? AND recipient_telegram_id=?
+                         AND stopped_at IS NULL AND expires_at>?""",
+                    (latitude, longitude, accuracy, now, live_id, uid, recipient_id, now),
+                )
+                if cur.rowcount != 1:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Трансляция геолокации завершена или не найдена")
+                cur = await db.execute(
+                    """SELECT id,sender_telegram_id,recipient_telegram_id,latitude,longitude,
+                              accuracy_m,started_at,updated_at,expires_at
+                       FROM live_locations WHERE id=?""",
+                    (live_id,),
+                )
+                row = await cur.fetchone()
+            else:
+                try:
+                    duration = int(payload.get("duration_seconds", 0))
+                except (TypeError, ValueError):
+                    duration = 0
+                if duration not in (900, 3600, 28800):
+                    await db.rollback()
+                    raise HTTPException(status_code=400, detail="Длительность трансляции должна быть 15 минут, 1 час или 8 часов")
+                cur = await db.execute(
+                    """UPDATE live_locations SET stopped_at=?,stopped_by_telegram_id=?
+                       WHERE sender_telegram_id=? AND recipient_telegram_id=?
+                         AND stopped_at IS NULL AND expires_at<=?""",
+                    (now, uid, uid, recipient_id, now),
+                )
+                cur = await db.execute(
+                    """SELECT id FROM live_locations
+                       WHERE sender_telegram_id=? AND recipient_telegram_id=?
+                         AND stopped_at IS NULL AND expires_at>? LIMIT 1""",
+                    (uid, recipient_id, now),
+                )
+                if await cur.fetchone():
+                    await db.rollback()
+                    raise HTTPException(status_code=409, detail="Для этого собеседника уже идёт трансляция геолокации")
+                live_id = secrets.token_hex(16)
+                await db.execute(
+                    """INSERT INTO live_locations(
+                           id,sender_telegram_id,recipient_telegram_id,latitude,longitude,
+                           accuracy_m,started_at,updated_at,expires_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        live_id, uid, recipient_id, latitude, longitude,
+                        accuracy, now, now, now + duration,
+                    ),
+                )
+                cur = await db.execute(
+                    """SELECT id,sender_telegram_id,recipient_telegram_id,latitude,longitude,
+                              accuracy_m,started_at,updated_at,expires_at
+                       FROM live_locations WHERE id=?""",
+                    (live_id,),
+                )
+                row = await cur.fetchone()
+                created = True
+            await db.commit()
+
+        result = dict(row)
+        result["status"] = "active"
+        result["created"] = created
+        if created:
+            await deliver_push_notifications(
+                [recipient_id],
+                str(user.get("display_name") or user.get("username") or "WaysGram"),
+                "Пользователь начал делиться геолокацией в реальном времени",
+                {"scope": "dm", "chat_id": str(uid), "event": "live_location_started"},
+            )
+        return result
+
+    @router.get("/api/messages/live-location")
+    async def get_live_locations(
+        with_user: int = Query(..., alias="with", gt=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if with_user == uid:
+            raise HTTPException(status_code=400, detail="Нельзя открыть трансляцию с самим собой")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT id,sender_telegram_id,recipient_telegram_id,latitude,longitude,
+                          accuracy_m,started_at,updated_at,expires_at
+                   FROM live_locations
+                   WHERE ((sender_telegram_id=? AND recipient_telegram_id=?)
+                       OR (sender_telegram_id=? AND recipient_telegram_id=?))
+                     AND stopped_at IS NULL AND expires_at>?
+                   ORDER BY started_at DESC LIMIT 2""",
+                (uid, with_user, with_user, uid, now),
+            )
+            rows = [dict(row) for row in await cur.fetchall()]
+            cur = await db.execute(
+                """SELECT 1 FROM blocked_users
+                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                   LIMIT 1""",
+                (uid, with_user, with_user, uid),
+            )
+            blocked = await cur.fetchone() is not None
+        if blocked:
+            return {"locations": [], "count": 0}
+        return {"locations": rows, "count": len(rows)}
+
+    @router.delete("/api/messages/live-location/{live_location_id}")
+    async def stop_live_location(
+        live_location_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if not re.fullmatch(r"[a-f0-9]{32}", live_location_id):
+            raise HTTPException(status_code=400, detail="Некорректный ID трансляции геолокации")
+        now = int(time.time())
+        async with aiosqlite.connect(db_path()) as db:
+            cur = await db.execute(
+                """UPDATE live_locations
+                   SET stopped_at=?,stopped_by_telegram_id=?
+                   WHERE id=? AND (sender_telegram_id=? OR recipient_telegram_id=?)
+                     AND stopped_at IS NULL AND expires_at>?""",
+                (now, uid, live_location_id, uid, uid, now),
+            )
+            await db.commit()
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Активная трансляция геолокации не найдена")
+        return {"status": "stopped", "id": live_location_id, "stopped_at": now}
 
     @router.post("/api/messages/album", status_code=201)
     async def send_message_album(
