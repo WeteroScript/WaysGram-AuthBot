@@ -2017,6 +2017,108 @@ def build_messenger_router(
             "next_before_id": int(rows[-1]["message_id"]) if rows else 0,
         }
 
+    @router.get("/api/media/storage")
+    async def list_personal_media_storage(
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0, le=10000),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT COUNT(*),COALESCE(SUM(size_bytes),0)
+                   FROM media_assets WHERE owner_telegram_id=?""",
+                (uid,),
+            )
+            total_files, used_bytes = await cur.fetchone()
+            cur = await db.execute(
+                """SELECT a.id,a.mime_type,a.original_name,a.size_bytes,a.created_at,
+                          (SELECT COUNT(*) FROM messages m WHERE m.media_id=a.id)
+                        + (SELECT COUNT(*) FROM group_messages gm WHERE gm.media_id=a.id)
+                        + (SELECT COUNT(*) FROM channel_messages cm WHERE cm.media_id=a.id)
+                          AS message_references,
+                          (SELECT COUNT(*) FROM accounts ac WHERE ac.avatar_media_id=a.id)
+                          AS avatar_references
+                   FROM media_assets a
+                   WHERE a.owner_telegram_id=?
+                   ORDER BY a.created_at DESC,a.id DESC
+                   LIMIT ? OFFSET ?""",
+                (uid, limit, offset),
+            )
+            files = [dict(row) for row in await cur.fetchall()]
+        for item in files:
+            item["can_delete"] = (
+                int(item["message_references"] or 0) == 0
+                and int(item["avatar_references"] or 0) == 0
+            )
+            item["url"] = f"/api/media/{item['id']}"
+        next_offset = offset + len(files)
+        return {
+            "used_bytes": int(used_bytes or 0),
+            "quota_bytes": MAX_USER_MEDIA_BYTES,
+            "total_files": int(total_files or 0),
+            "files": files,
+            "count": len(files),
+            "has_more": next_offset < int(total_files or 0),
+            "next_offset": next_offset,
+        }
+
+    @router.delete("/api/media/storage/{media_id}")
+    async def delete_unused_personal_media(
+        media_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        if not re.fullmatch(r"[a-f0-9]{32}", media_id):
+            raise HTTPException(status_code=404, detail="Файл не найден")
+
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """SELECT storage_name,size_bytes
+                   FROM media_assets WHERE id=? AND owner_telegram_id=?""",
+                (media_id, uid),
+            )
+            media = await cur.fetchone()
+            if media is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Файл не найден")
+            cur = await db.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM messages WHERE media_id=?)
+                   + (SELECT COUNT(*) FROM group_messages WHERE media_id=?)
+                   + (SELECT COUNT(*) FROM channel_messages WHERE media_id=?)
+                   + (SELECT COUNT(*) FROM accounts WHERE avatar_media_id=?)""",
+                (media_id, media_id, media_id, media_id),
+            )
+            references = int((await cur.fetchone())[0] or 0)
+            if references > 0:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="Файл используется в сообщениях или профиле и не может быть удалён",
+                )
+            await db.execute(
+                "DELETE FROM media_assets WHERE id=? AND owner_telegram_id=?",
+                (media_id, uid),
+            )
+            await db.commit()
+
+        file_path = media_storage_dir() / str(media["storage_name"])
+        try:
+            await asyncio.to_thread(file_path.unlink, missing_ok=True)
+        except OSError:
+            LOGGER.warning("Could not remove deleted WaysGram media file %s", media_id)
+        return {
+            "status": "deleted",
+            "id": media_id,
+            "freed_bytes": int(media["size_bytes"]),
+        }
+
     @router.get("/api/media/{media_id}")
     async def download_media(
         media_id: str,
