@@ -38,6 +38,7 @@ MESSENGER_TABLES = frozenset(
         "message_gifts",
         "message_contacts",
         "message_locations",
+        "live_locations",
         "message_reactions",
         "message_hidden_for",
         "message_events",
