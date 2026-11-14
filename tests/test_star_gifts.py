@@ -517,6 +517,174 @@ def test_gift_market_listing_can_be_cancelled(env) -> None:
     run(scenario())
 
 
+
+def test_collectible_gift_auction_refunds_outbidder_and_settles_ownership(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+
+            # An unupgraded gift is not eligible for collectible auctions.
+            rejected = await client.post(
+                f"/api/gifts/{serial}/auction",
+                headers=headers(101),
+                json={"starting_price_grams": 5, "duration_seconds": 3600},
+            )
+            assert rejected.status_code == 409
+
+            upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert upgraded.status_code == 200
+            traits = upgraded.json()["attributes"]["collectible_traits"]
+
+            created = await client.post(
+                f"/api/gifts/{serial}/auction",
+                headers=headers(101),
+                json={"starting_price_grams": 5, "duration_seconds": 3600},
+            )
+            assert created.status_code == 201
+            auction_id = created.json()["auction_id"]
+            assert created.json()["currency"] == "grams"
+            assert created.json()["minimum_bid_grams"] == 5
+
+            # Fixed-price listing, direct transfer and chat transfer are locked during an auction.
+            assert (await client.post(
+                f"/api/gifts/{serial}/list",
+                headers=headers(101),
+                json={"price_grams": 8},
+            )).status_code == 409
+            assert (await client.post(
+                "/api/gifts/transfer",
+                headers=headers(101),
+                json={"serial_number": serial, "recipient_id": 102},
+            )).status_code == 409
+            assert (await client.post(
+                "/api/messages/gift",
+                headers=headers(101),
+                json={"recipient_id": 102, "serial_number": serial},
+            )).status_code == 409
+            assert (await client.post(
+                f"/api/gift-auctions/{auction_id}/bid",
+                headers=headers(101),
+                json={"amount_grams": 5},
+            )).status_code == 403
+
+            auctions = (await client.get("/api/gift-auctions", headers=headers(102))).json()["auctions"]
+            assert len(auctions) == 1
+            assert auctions[0]["auction_id"] == auction_id
+            assert auctions[0]["attributes"]["collectible_traits"] == traits
+
+            too_low = await client.post(
+                f"/api/gift-auctions/{auction_id}/bid",
+                headers=headers(102),
+                json={"amount_grams": 4},
+            )
+            assert too_low.status_code == 409
+
+            first_bid = await client.post(
+                f"/api/gift-auctions/{auction_id}/bid",
+                headers=headers(102),
+                json={"amount_grams": 5},
+            )
+            assert first_bid.status_code == 201
+            assert first_bid.json()["grams_balance"] == 10
+            outbid = await client.post(
+                f"/api/gift-auctions/{auction_id}/bid",
+                headers=headers(ADMIN),
+                json={"amount_grams": 7},
+            )
+            assert outbid.status_code == 201
+            assert outbid.json()["grams_balance"] == 8
+            assert (await client.get("/api/me", headers=headers(102))).json()["grams"] == 15
+            assert (await client.get("/api/me", headers=headers(ADMIN))).json()["grams"] == 8
+
+            cannot_cancel = await client.delete(
+                f"/api/gifts/{serial}/auction",
+                headers=headers(101),
+            )
+            assert cannot_cancel.status_code == 409
+
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute(
+                    "UPDATE gift_collectible_auctions SET ends_at=? WHERE id=?",
+                    (int(time.time()) - 1, auction_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            settled = await client.get("/api/gift-auctions", headers=headers(102))
+            assert settled.status_code == 200
+            assert settled.json()["count"] == 0
+            assert settled.json()["settled_count"] == 1
+
+            seller_inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            winner_inventory = (await client.get("/api/me/gifts", headers=headers(ADMIN))).json()["gifts"]
+            assert seller_inventory == []
+            assert len(winner_inventory) == 1
+            assert winner_inventory[0]["serial_number"] == serial
+            assert winner_inventory[0]["attributes"]["collectible_traits"] == traits
+            assert (await client.get("/api/me", headers=headers(101))).json()["grams"] == 22
+
+            connection = db_split.sqlite_connect(path)
+            try:
+                status = connection.execute(
+                    "SELECT status FROM gift_collectible_auctions WHERE id=?",
+                    (auction_id,),
+                ).fetchone()
+                assert status == ("sold",)
+                transaction = connection.execute(
+                    """SELECT event_type,from_telegram_id,to_telegram_id
+                       FROM gift_transactions WHERE serial_number=? AND event_type='auction_sale'""",
+                    (serial,),
+                ).fetchone()
+                assert transaction == ("auction_sale", 101, ADMIN)
+            finally:
+                connection.close()
+
+    run(scenario())
+
+
+def test_collectible_gift_auction_can_be_cancelled_before_first_bid(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
+            serial = bought.json()["gift"]["serial_number"]
+            upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert upgraded.status_code == 200
+
+            created = await client.post(
+                f"/api/gifts/{serial}/auction",
+                headers=headers(101),
+                json={"starting_price_grams": 6},
+            )
+            assert created.status_code == 201
+            denied = await client.delete(f"/api/gifts/{serial}/auction", headers=headers(102))
+            assert denied.status_code == 404
+
+            cancelled = await client.delete(f"/api/gifts/{serial}/auction", headers=headers(101))
+            assert cancelled.status_code == 200
+            relisted = await client.post(
+                f"/api/gifts/{serial}/list",
+                headers=headers(101),
+                json={"price_grams": 9},
+            )
+            assert relisted.status_code == 201
+
+    run(scenario())
+
+
 def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> None:
     path, app = env
 
