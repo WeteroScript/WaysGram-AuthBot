@@ -2905,6 +2905,86 @@ def test_video_note_upload_is_persisted_and_exposed_in_dm_history(api_env) -> No
     run(scenario())
 
 
+def test_direct_messages_support_structured_contact_cards(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 89501, "contact_sender")
+    add_account(api_env, 89502, "contact_recipient")
+    add_session(path, 89501, "contact-sender-session")
+    add_session(path, 89502, "contact-recipient-session")
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            sender = {"Authorization": "Bearer contact-sender-session"}
+            recipient = {"Authorization": "Bearer contact-recipient-session"}
+            payload = {
+                "recipient_id": 89502,
+                "contact": {
+                    "name": "Sample Contact",
+                    "phone": "+31 6 12345678",
+                    "email": "sample@example.com",
+                },
+            }
+            sent = await client.post("/api/messages", headers=sender, json=payload)
+            assert sent.status_code == 201
+            assert sent.json()["body"] == "Контакт: Sample Contact"
+            assert sent.json()["contact"] == {
+                "name": "Sample Contact",
+                "phone": "+31 6 12345678",
+                "email": "sample@example.com",
+            }
+
+            history = await client.get("/api/messages?with=89501", headers=recipient)
+            assert history.status_code == 200
+            message = history.json()["messages"][-1]
+            assert message["contact_name"] == "Sample Contact"
+            assert message["contact_phone"] == "+31 6 12345678"
+            assert message["contact_email"] == "sample@example.com"
+
+            search = await client.get(
+                "/api/messages/search?with=89501&q=Sample%20Contact",
+                headers=recipient,
+            )
+            assert search.status_code == 200
+            assert search.json()["messages"][-1]["contact_phone"] == "+31 6 12345678"
+
+            bad_phone = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89502,
+                    "contact": {"name": "Bad Contact", "phone": "not a phone"},
+                },
+            )
+            assert bad_phone.status_code == 400
+
+            bad_email = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89502,
+                    "contact": {
+                        "name": "Bad Contact",
+                        "phone": "+31 6 12345678",
+                        "email": "invalid-email",
+                    },
+                },
+            )
+            assert bad_email.status_code == 400
+
+            mixed = await client.post(
+                "/api/messages",
+                headers=sender,
+                json={
+                    "recipient_id": 89502,
+                    "media_id": "f" * 32,
+                    "contact": {"name": "Bad Contact", "phone": "+31 6 12345678"},
+                },
+            )
+            assert mixed.status_code == 400
+
+    run(scenario())
+
+
 def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 82301
