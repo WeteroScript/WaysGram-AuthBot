@@ -2843,6 +2843,14 @@ def build_messenger_router(
                           EXISTS(SELECT 1 FROM gift_collectible_auctions a
                                  WHERE a.serial_number=user_gifts.serial_number
                                    AND a.status='active') AS is_auctioned,
+                          (
+                              EXISTS(SELECT 1 FROM telegram_gift_catalog c
+                                     WHERE c.gift_id=user_gifts.telegram_gift_id
+                                       AND COALESCE(c.sticker_file_id,'')<>'')
+                              OR EXISTS(SELECT 1 FROM telegram_mtproto_gift_catalog m
+                                        WHERE m.gift_id=user_gifts.telegram_gift_id
+                                          AND COALESCE(m.sticker_document_id,'')<>'')
+                          ) AS sticker_available,
                           EXISTS(SELECT 1 FROM telegram_auction_gift_registry r
                                  WHERE r.gift_id=user_gifts.telegram_gift_id) AS auction_eligible
                    FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
@@ -2852,10 +2860,20 @@ def build_messenger_router(
         gifts = []
         for row in rows:
             item = dict(row)
+            raw_attributes = item.pop("attributes_json", "{}")
             try:
-                item["attributes"] = json.loads(item.pop("attributes_json") or "{}")
+                attributes = json.loads(raw_attributes or "{}")
             except (TypeError, ValueError):
-                item["attributes"] = {}
+                attributes = {}
+            item["attributes"] = attributes if isinstance(attributes, dict) else {}
+            gift_id = str(item.get("telegram_gift_id") or "")
+            sticker_available = bool(item.get("sticker_available"))
+            item["sticker_available"] = sticker_available
+            item["sticker_url"] = (
+                f"/api/telegram/gifts/{gift_id}/sticker"
+                if sticker_available and gift_id
+                else ""
+            )
             gifts.append(item)
         return {"gifts": gifts}
 
