@@ -814,7 +814,9 @@ async def init_messenger_storage(database_path: Path) -> None:
                WHERE auction=1
                  AND TRIM(COALESCE(auction_slug,''))<>''
                  AND auction_start_date IS NOT NULL
-                 AND COALESCE(gifts_per_round,0)>0"""
+                 AND auction_start_date<=?
+                 AND COALESCE(gifts_per_round,0)>0""",
+            (int(time.time()),)
         )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(user_gifts)")
         user_gift_columns = {str(row[1]) for row in await cur.fetchall()}
