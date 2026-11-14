@@ -442,7 +442,7 @@ class Store:
             await db.execute("UPDATE numbers SET owner_telegram_id=? WHERE number=?", (new_owner, number))
             await db.execute("DELETE FROM auth_codes WHERE number=?", (number,))
             await db.execute("DELETE FROM api_sessions WHERE telegram_id=?", (account_id,))
-            await db.execute("DELETE FROM messenger.push_devices WHERE telegram_id=?", (account_id,))
+            await db.execute("DELETE FROM push_devices WHERE telegram_id=?", (account_id,))
             await db.commit()
             return account_id
 
