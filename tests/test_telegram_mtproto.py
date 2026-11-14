@@ -179,7 +179,7 @@ def test_mtproto_registry_records_only_started_auctions_and_is_append_only(tmp_p
         await init_messenger_storage(database)
 
         client = FakeMTProtoClient()
-        client.gift.auction_start_date = 4_000_000_000
+        client.gift.auction_start_date = 2_000_000_000
         provider = TelegramMTProtoGiftCatalog(client)
 
         await provider.sync(database)
