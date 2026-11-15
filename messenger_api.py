@@ -3297,6 +3297,19 @@ def build_messenger_router(
                 telegram_gift = metadata_by_id[gift_id]
                 gift["telegram_gift"] = telegram_gift
                 gift["gift_emoji"] = telegram_gift["emoji"] if telegram_gift else ""
+                try:
+                    attributes_level = int(gift["attributes"].get("upgrade_level") or 0)
+                except (TypeError, ValueError):
+                    attributes_level = 0
+                try:
+                    stored_level = int(gift.get("upgrade_level") or 0)
+                except (TypeError, ValueError):
+                    stored_level = 0
+                gift["can_upgrade"] = bool(
+                    telegram_gift
+                    and telegram_gift["can_upgrade"]
+                    and max(attributes_level, stored_level) == 0
+                )
         profile["gifts"] = gifts
         profile["common_groups"] = common_groups
         profile["common_contacts"] = common_contacts
