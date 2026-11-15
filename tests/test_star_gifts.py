@@ -157,7 +157,7 @@ def test_public_account_never_returns_literal_null_as_phone(env) -> None:
     connection = db_split.sqlite_connect(path)
     try:
         connection.execute(
-            "UPDATE accounts SET virtual_number='null' WHERE telegram_id=101"
+            "UPDATE accounts SET virtual_number='+null' WHERE telegram_id=101"
         )
         connection.commit()
     finally:
