@@ -21,6 +21,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    FSInputFile,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -37,6 +38,7 @@ from telegram_mtproto import TelegramMTProtoGiftCatalog
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8888957702"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "data/waysgram_authbot.sqlite3"))
+LOG_FILE_PATH = Path(os.getenv("LOG_FILE_PATH", str(DATABASE_PATH.parent / "logs" / "authbot.log")))
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "").strip()
 TELESRV_OTP_WEBHOOK_SECRET = os.getenv("TELESRV_OTP_WEBHOOK_SECRET", "").strip()
 OTP_FERNET_KEY = os.getenv("OTP_FERNET_KEY", "").strip()
@@ -73,9 +75,7 @@ def configure_logging() -> None:
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
     handlers: list[logging.Handler] = [logging.StreamHandler()]
-    log_path = Path(
-        os.getenv("LOG_FILE_PATH", str(DATABASE_PATH.parent / "logs" / "authbot.log"))
-    )
+    log_path = LOG_FILE_PATH
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
@@ -1257,6 +1257,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [("📡 Каналы", "wgadm:channels")],
         [("👥 Группы", "wgadm:groups"), ("🤖 Боты", "wgadm:bots")],
         [("🔐 Журнал действий", "wgadm:logs")],
+        [("📄 Получить логи", "wgadm:getlogs")],
     ])
 
 async def admin_account_card(telegram_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
@@ -1622,6 +1623,26 @@ async def admin_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     if action == "home":
         await callback.message.answer("Панель администратора WaysGram", reply_markup=admin_home_keyboard())
+    elif action == "getlogs":
+        if not LOG_FILE_PATH.is_file():
+            await callback.message.answer(
+                "Файл логов пока не создан или недоступен. Проверьте запуск AuthBot и права на запись в каталог логов."
+            )
+            return
+        try:
+            if LOG_FILE_PATH.stat().st_size == 0:
+                await callback.message.answer("Файл логов пока пуст.")
+                return
+            await callback.message.answer_document(
+                FSInputFile(str(LOG_FILE_PATH), filename="authbot.log"),
+                caption="Текущий журнал AuthBot с хостинга.",
+            )
+        except OSError as exc:
+            log.exception("Admin log export failed (%s)", type(exc).__name__)
+            await callback.message.answer("Не удалось прочитать файл логов. Проверьте путь и права доступа.")
+        except Exception as exc:
+            log.exception("Admin log delivery failed (%s)", type(exc).__name__)
+            await callback.message.answer("Не удалось отправить логи в Telegram. Проверьте журнал ошибок.")
     elif action == "stats":
         now = int(time.time())
         async with aiosqlite.connect(DATABASE_PATH) as db:
