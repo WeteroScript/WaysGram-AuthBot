@@ -5102,7 +5102,7 @@ def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_ways
             assert catalog.status_code == 200
             gift = next(item for item in catalog.json()["gifts"] if item["id"] == "5807641025165919973")
             assert gift["catalog_source"] == "waysgram_manual"
-            assert gift["title"] == "Telegram Gift 5807641025165919973"
+            assert gift["title"] == "Подарок Telegram"
             assert gift["for_sale"] is True
             assert gift["sticker"]["url"].endswith("/5807641025165919973/sticker")
 
@@ -5112,12 +5112,12 @@ def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_ways
                 json={},
             )
             assert purchase.status_code == 201
-            assert purchase.json()["gift"]["gift_name"] == "Telegram Gift 5807641025165919973"
+            assert purchase.json()["gift"]["gift_name"] == "Подарок Telegram"
 
             inventory = await client.get("/api/me/gifts", headers=auth)
             assert inventory.status_code == 200
             assert inventory.json()["gifts"][0]["telegram_gift_id"] == "5807641025165919973"
-            assert inventory.json()["gifts"][0]["gift_name"] == "Telegram Gift 5807641025165919973"
+            assert inventory.json()["gifts"][0]["gift_name"] == "Подарок Telegram"
 
             sticker = await client.get(
                 "/api/telegram/gifts/5807641025165919973/sticker",
