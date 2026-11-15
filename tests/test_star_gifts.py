@@ -113,6 +113,14 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert mine[0]["telegram_gift"]["emoji"] == "🎁"
             assert mine[0]["telegram_gift"]["upgrade_star_count"] == 10
             assert mine[0]["can_upgrade"] is True
+
+            public_profile = await client.get("/api/users/101", headers=headers(102))
+            assert public_profile.status_code == 200
+            public_gift = public_profile.json()["gifts"][0]
+            assert public_gift["telegram_gift"]["emoji"] == "🎁"
+            assert public_gift["gift_emoji"] == "🎁"
+            assert public_gift["telegram_gift"]["upgrade_star_count"] == 10
+
             assert bought.json()["gift"]["telegram_gift_id"] == "g1"
 
             # A gift for a friend ends up in the friend's inventory, the buyer pays.
