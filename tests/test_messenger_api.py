@@ -3465,7 +3465,7 @@ def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
             conversations = await client.get("/api/conversations", headers=headers)
             assert conversations.status_code == 200
             saved = next(item for item in conversations.json()["conversations"] if item["id"] == user_id)
-            assert saved["last_message"] == "Note to myself"
+            assert saved["last_message"] == "Голосовое сообщение"
             assert saved["unread_count"] == 0
 
     run(scenario())
