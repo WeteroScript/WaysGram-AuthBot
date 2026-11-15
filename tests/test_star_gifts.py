@@ -168,6 +168,9 @@ def test_public_account_never_returns_literal_null_as_phone(env) -> None:
         connection.execute(
             "UPDATE accounts SET virtual_number='+null' WHERE telegram_id=101"
         )
+        expected_number = connection.execute(
+            "SELECT number FROM numbers WHERE telegram_id=101"
+        ).fetchone()[0]
         connection.commit()
     finally:
         connection.close()
@@ -176,7 +179,8 @@ def test_public_account_never_returns_literal_null_as_phone(env) -> None:
         async with await client_for(app) as client:
             profile = await client.get("/api/me", headers=headers(101))
             assert profile.status_code == 200
-            assert profile.json()["phone"] == ""
+            assert profile.json()["phone"] == expected_number
+            assert profile.json()["phone"] != "+null"
 
     run(scenario())
 
@@ -881,7 +885,7 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["gift_name"] == "🎁"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
-            assert receipt["gift_attributes"] == {"event_type": "purchase"}
+            assert receipt["gift_attributes"] == {"event_type": "purchase", "price_stars": 35}
             assert receipt["gift_emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["upgrade_star_count"] == 10
