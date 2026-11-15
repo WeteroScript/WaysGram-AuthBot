@@ -3415,12 +3415,6 @@ def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
     user_id = 82301
     add_account(api_env, user_id, "saved_user")
     add_session(path, user_id, "saved-messages-session")
-    with db_split.sqlite_connect(path) as db:
-        db.execute(
-            "INSERT INTO blocked_users(owner_telegram_id,blocked_telegram_id,created_at) VALUES(?,?,?)",
-            (user_id, user_id, int(time.time())),
-        )
-        db.commit()
 
     async def scenario() -> None:
         async with await client_for(app) as client:
