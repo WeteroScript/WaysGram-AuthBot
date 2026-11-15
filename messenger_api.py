@@ -1147,7 +1147,7 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
     }
     if include_phone:
         phone = str(row["virtual_number"] or "").strip()
-        result["phone"] = phone if re.fullmatch(r"\\+[1-9]\\d{7,14}", phone) else ""
+        result["phone"] = phone if re.fullmatch(r"\+[1-9]\d{7,14}", phone) else ""
     result["stars"] = int(row["stars"])
     result["grams"] = int(row["grams"])
     result["is_premium"] = True  # every WaysGram account has Premium, permanently
