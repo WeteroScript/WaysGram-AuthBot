@@ -108,6 +108,19 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert mine[0]["telegram_gift_id"] == "g1"
             assert mine[0]["sticker_available"] is True
             assert mine[0]["sticker_url"] == "/api/telegram/gifts/g1/sticker"
+            assert mine[0]["gift_emoji"] == "🎁"
+            assert mine[0]["telegram_gift"]["catalog_source"] == "telegram_gift_catalog"
+            assert mine[0]["telegram_gift"]["emoji"] == "🎁"
+            assert mine[0]["telegram_gift"]["upgrade_star_count"] == 10
+            assert mine[0]["can_upgrade"] is True
+
+            public_profile = await client.get("/api/users/101", headers=headers(102))
+            assert public_profile.status_code == 200
+            public_gift = public_profile.json()["gifts"][0]
+            assert public_gift["telegram_gift"]["emoji"] == "🎁"
+            assert public_gift["gift_emoji"] == "🎁"
+            assert public_gift["telegram_gift"]["upgrade_star_count"] == 10
+
             assert bought.json()["gift"]["telegram_gift_id"] == "g1"
 
             # A gift for a friend ends up in the friend's inventory, the buyer pays.
@@ -143,6 +156,26 @@ def test_gift_purchase_rules(env) -> None:
             assert (await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={"recipient_id": "x"})).status_code == 400
             # Nothing was charged by the failed attempts.
             assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 5000
+
+    run(scenario())
+
+
+def test_public_account_never_returns_literal_null_as_phone(env) -> None:
+    path, app = env
+    connection = db_split.sqlite_connect(path)
+    try:
+        connection.execute(
+            "UPDATE accounts SET virtual_number='+null' WHERE telegram_id=101"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            profile = await client.get("/api/me", headers=headers(101))
+            assert profile.status_code == 200
+            assert profile.json()["phone"] == ""
 
     run(scenario())
 
@@ -848,6 +881,9 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
             assert receipt["gift_attributes"] == {"event_type": "purchase"}
+            assert receipt["gift_emoji"] == "🎁"
+            assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
+            assert receipt["gift_telegram_metadata"]["upgrade_star_count"] == 10
 
     run(scenario())
 
@@ -931,6 +967,9 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
                 assert item["gift_serial_number"] == serial
                 assert item["gift_name"] == "🎁"
                 assert item["gift_upgrade_level"] == 1
+                assert item["gift_emoji"] == "🎁"
+                assert item["gift_telegram_metadata"]["emoji"] == "🎁"
+                assert item["gift_telegram_metadata"]["upgrade_star_count"] == 10
                 assert item["gift_attributes"]["upgrade_source"] == "waysgram_internal"
                 assert item["gift_attributes"]["collectible_traits"] == traits
 

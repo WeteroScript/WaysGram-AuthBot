@@ -1146,11 +1146,118 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
         "bio": _bio_of(row),
     }
     if include_phone:
-        result["phone"] = row["virtual_number"]
+        phone = str(row["virtual_number"] or "").strip()
+        phone_value = phone.lstrip("+").casefold()
+        result["phone"] = "" if phone_value in {"", "null", "none", "undefined"} else phone
     result["stars"] = int(row["stars"])
     result["grams"] = int(row["grams"])
     result["is_premium"] = True  # every WaysGram account has Premium, permanently
     return result
+
+
+async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | None:
+    """Return the authoritative Telegram catalogue snapshot for one gift ID."""
+    gift_id = str(gift_id or "").strip()
+    if not gift_id:
+        return None
+
+    cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
+    sync_state = await cur.fetchone()
+    active_source = str(sync_state["source"] or "") if sync_state else ""
+    sources = (
+        ("telegram_mtproto", "telegram_gift_catalog")
+        if active_source == "telegram_mtproto"
+        else ("telegram_gift_catalog", "telegram_mtproto")
+    )
+
+    row = None
+    source = ""
+    for candidate in sources:
+        if candidate == "telegram_mtproto":
+            cur = await db.execute(
+                """SELECT gift_id,title,sticker_emoji,sticker_set_name,sticker_width,
+                          sticker_height,sticker_is_animated,sticker_is_video,sticker_mime_type,
+                          sticker_document_id,stars,upgrade_stars,upgrade_variants,
+                          require_premium,peer_color_available,limited,sold_out,
+                          availability_total,availability_remains,background_json
+                   FROM telegram_mtproto_gift_catalog WHERE gift_id=?""",
+                (gift_id,),
+            )
+        else:
+            cur = await db.execute(
+                """SELECT gift_id,title,sticker_emoji,sticker_set_name,sticker_width,
+                          sticker_height,sticker_is_animated,sticker_is_video,sticker_mime_type,
+                          sticker_file_id,star_count,upgrade_star_count,unique_gift_variant_count,
+                          is_premium,has_colors,total_count,remaining_count,background_json
+                   FROM telegram_gift_catalog WHERE gift_id=?""",
+                (gift_id,),
+            )
+        row = await cur.fetchone()
+        if row is not None:
+            source = candidate
+            break
+    if row is None:
+        return None
+
+    if source == "telegram_mtproto":
+        star_count = int(row["stars"] or 0)
+        upgrade_star_count = _optional_int(row["upgrade_stars"])
+        upgrade_variants = _optional_int(row["upgrade_variants"])
+        is_premium = bool(row["require_premium"])
+        has_colors = bool(row["peer_color_available"])
+        is_limited = bool(row["limited"])
+        sold_out = bool(row["sold_out"])
+        total_count = _optional_int(row["availability_total"])
+        remaining_count = _optional_int(row["availability_remains"])
+        sticker_available = bool(row["sticker_document_id"])
+    else:
+        star_count = int(row["star_count"] or 0)
+        upgrade_star_count = _optional_int(row["upgrade_star_count"])
+        upgrade_variants = _optional_int(row["unique_gift_variant_count"])
+        is_premium = bool(row["is_premium"])
+        has_colors = bool(row["has_colors"])
+        is_limited = row["total_count"] is not None
+        sold_out = is_limited and int(row["remaining_count"] or 0) <= 0
+        total_count = _optional_int(row["total_count"])
+        remaining_count = _optional_int(row["remaining_count"])
+        sticker_available = bool(row["sticker_file_id"])
+
+    raw_background = row["background_json"]
+    try:
+        background = json.loads(raw_background) if raw_background else None
+    except (TypeError, ValueError):
+        background = None
+    animated = bool(row["sticker_is_animated"])
+    video = bool(row["sticker_is_video"])
+    return {
+        "id": gift_id,
+        "source": "telegram",
+        "catalog_source": source,
+        "title": str(row["title"] or ""),
+        "emoji": str(row["sticker_emoji"] or ""),
+        "star_count": star_count,
+        "upgrade_star_count": upgrade_star_count,
+        "upgrade_variants": upgrade_variants,
+        "can_upgrade": bool(upgrade_star_count and upgrade_star_count > 0),
+        "is_premium": is_premium,
+        "has_colors": has_colors,
+        "is_limited": is_limited,
+        "sold_out": sold_out,
+        "total_count": total_count,
+        "remaining_count": remaining_count,
+        "background": background,
+        "sticker_available": sticker_available,
+        "sticker": {
+            "type": "video" if video else ("animated" if animated else "regular"),
+            "set_name": str(row["sticker_set_name"] or ""),
+            "width": _optional_int(row["sticker_width"]),
+            "height": _optional_int(row["sticker_height"]),
+            "is_animated": animated,
+            "is_video": video,
+            "mime_type": str(row["sticker_mime_type"] or ""),
+            "url": f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker" if sticker_available else "",
+        },
+    }
 
 
 def _optional_int(value: Any) -> int | None:
@@ -2858,23 +2965,34 @@ def build_messenger_router(
             )
             rows = await cur.fetchall()
         gifts = []
-        for row in rows:
-            item = dict(row)
-            raw_attributes = item.pop("attributes_json", "{}")
-            try:
-                attributes = json.loads(raw_attributes or "{}")
-            except (TypeError, ValueError):
-                attributes = {}
-            item["attributes"] = attributes if isinstance(attributes, dict) else {}
-            gift_id = str(item.get("telegram_gift_id") or "")
-            sticker_available = bool(item.get("sticker_available"))
-            item["sticker_available"] = sticker_available
-            item["sticker_url"] = (
-                f"/api/telegram/gifts/{gift_id}/sticker"
-                if sticker_available and gift_id
-                else ""
-            )
-            gifts.append(item)
+        metadata_by_id: dict[str, dict[str, Any] | None] = {}
+        async with aiosqlite.connect(db_path()) as gift_db:
+            gift_db.row_factory = aiosqlite.Row
+            for row in rows:
+                item = dict(row)
+                raw_attributes = item.pop("attributes_json", "{}")
+                try:
+                    attributes = json.loads(raw_attributes or "{}")
+                except (TypeError, ValueError):
+                    attributes = {}
+                item["attributes"] = attributes if isinstance(attributes, dict) else {}
+                gift_id = str(item.get("telegram_gift_id") or "")
+                if gift_id not in metadata_by_id:
+                    metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
+                telegram_gift = metadata_by_id[gift_id]
+                item["telegram_gift"] = telegram_gift
+                item["gift_emoji"] = telegram_gift["emoji"] if telegram_gift else ""
+                item["can_upgrade"] = bool(
+                    telegram_gift and telegram_gift["can_upgrade"]
+                    and int(item.get("upgrade_level") or 0) == 0
+                )
+                item["sticker_available"] = bool(item.get("sticker_available"))
+                item["sticker_url"] = (
+                    telegram_gift["sticker"]["url"]
+                    if telegram_gift and telegram_gift["sticker_available"]
+                    else ""
+                )
+                gifts.append(item)
         return {"gifts": gifts}
 
     @router.get("/api/me/gifts/transactions")
@@ -3165,11 +3283,20 @@ def build_messenger_router(
             )
             common_contacts = [dict(item) for item in await cur.fetchall()]
         profile = dict(row)
-        for gift in gifts:
-            try:
-                gift["attributes"] = json.loads(gift.pop("attributes_json") or "{}")
-            except (TypeError, ValueError):
-                gift["attributes"] = {}
+        metadata_by_id: dict[str, dict[str, Any] | None] = {}
+        async with aiosqlite.connect(db_path()) as gift_db:
+            gift_db.row_factory = aiosqlite.Row
+            for gift in gifts:
+                try:
+                    gift["attributes"] = json.loads(gift.pop("attributes_json") or "{}")
+                except (TypeError, ValueError):
+                    gift["attributes"] = {}
+                gift_id = str(gift.get("telegram_gift_id") or "")
+                if gift_id not in metadata_by_id:
+                    metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
+                telegram_gift = metadata_by_id[gift_id]
+                gift["telegram_gift"] = telegram_gift
+                gift["gift_emoji"] = telegram_gift["emoji"] if telegram_gift else ""
         profile["gifts"] = gifts
         profile["common_groups"] = common_groups
         profile["common_contacts"] = common_contacts
@@ -5703,13 +5830,26 @@ def build_messenger_router(
         items = [dict(row) for row in rows]
         if not after_id:
             items.reverse()
-        for item in items:
-            raw_attributes = item.pop("gift_attributes_json", None)
-            try:
-                attributes = json.loads(raw_attributes or "{}") if raw_attributes else {}
-            except (TypeError, ValueError):
-                attributes = {}
-            item["gift_attributes"] = attributes if isinstance(attributes, dict) else {}
+        metadata_by_id: dict[str, dict[str, Any] | None] = {}
+        async with aiosqlite.connect(db_path()) as gift_db:
+            gift_db.row_factory = aiosqlite.Row
+            for item in items:
+                raw_attributes = item.pop("gift_attributes_json", None)
+                try:
+                    attributes = json.loads(raw_attributes or "{}") if raw_attributes else {}
+                except (TypeError, ValueError):
+                    attributes = {}
+                item["gift_attributes"] = attributes if isinstance(attributes, dict) else {}
+                gift_id = str(item.get("gift_telegram_gift_id") or "")
+                if gift_id:
+                    if gift_id not in metadata_by_id:
+                        metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
+                    telegram_gift = metadata_by_id[gift_id]
+                    item["gift_telegram_metadata"] = telegram_gift
+                    item["gift_emoji"] = telegram_gift["emoji"] if telegram_gift else ""
+                else:
+                    item["gift_telegram_metadata"] = None
+                    item["gift_emoji"] = ""
         await attach_my_reactions(items, "dm", 0, uid)
         async with aiosqlite.connect(db_path()) as db:
             cur = await db.execute(

@@ -94,6 +94,10 @@ def configure_logging() -> None:
         )
 
     logging.basicConfig(level=level, handlers=handlers, force=True)
+    # httpx logs request URLs at INFO; Telegram Bot API URLs contain the bot token.
+    # Keep those URLs out of both console and persistent logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     for handler in handlers:
         handler.setFormatter(formatter)
 
