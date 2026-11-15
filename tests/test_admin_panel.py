@@ -236,6 +236,8 @@ def test_admin_adds_telegram_gift_by_id(panel, monkeypatch: pytest.MonkeyPatch) 
     assert "добавлен в управление WaysGram" in added_unknown.sent[0][0]
     assert "ID: unknown-id" in added_unknown.sent[0][0]
     assert "метаданные Telegram не найдены" in added_unknown.sent[0][0]
+    assert "Подарок Telegram" in added_unknown.sent[0][0]
+    assert "Telegram Gift unknown-id" not in added_unknown.sent[0][0]
     assert query(path, "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id='unknown-id'") == [(0, 0)]
 
     press("wgadm:tgadd")
@@ -244,3 +246,108 @@ def test_admin_adds_telegram_gift_by_id(panel, monkeypatch: pytest.MonkeyPatch) 
     assert "ID: g2" in added.sent[0][0]
     assert query(path, "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id='g2'") == [(0, 0)]
     assert mtproto_catalog.sync_calls == 2
+
+
+
+def test_admin_database_account_controls(panel) -> None:
+    path, store = panel
+    user_id = 770701
+    run(store.upsert_user(user_id, user_id))
+    run(store.set_verified(user_id, True))
+    number = run(store.allocate_number(user_id))
+    run(bot_module.ensure_account(user_id, number, "db_user", "Database User"))
+    run(bot_module.ensure_system_account())
+
+    conn = db_split.sqlite_connect(path)
+    try:
+        conn.execute(
+            """INSERT INTO user_gifts(serial_number,gift_name,owner_telegram_id,acquired_at)
+               VALUES('WG-DBTEST','Тестовый подарок',?,?)""",
+            (user_id, int(time.time())),
+        )
+        conn.execute(
+            "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES('dbtest','DB test',?,?)",
+            (user_id, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert "Управление БД" in str(press("wgadm:home").sent[0][1])
+    press("wgadm:db")
+    users = press("wgadm:dbaccounts")
+    assert "Пользователи" in users.sent[0][0]
+    assert "@db_user (1)" in str(users.sent[0][1])
+    owner = press(f"wgadm:dbowner:{user_id}")
+    assert number in str(owner.sent[0][1])
+    card = press(f"wgadm:dbaccount:{user_id}")
+    assert "Stars" in card.sent[0][0] and "Gram" in card.sent[0][0]
+
+    press(f"wgadm:dbdo:gifts:{user_id}")
+    assert query(path, "SELECT COUNT(*) FROM user_gifts WHERE owner_telegram_id=?", (user_id,))[0][0] == 0
+
+    press(f"wgadm:dbdo:stars:{user_id}")
+    press(f"wgadm:dbdo:grams:{user_id}")
+    assert query(path, "SELECT stars,grams FROM accounts WHERE telegram_id=?", (user_id,)) == [(0, 0)]
+    assert query(path, "SELECT COUNT(*) FROM economy_transactions WHERE telegram_id=? AND amount<0", (user_id,))[0][0] == 2
+
+    press(f"wgadm:dbdo:channels:{user_id}")
+    assert query(path, "SELECT COUNT(*) FROM channels WHERE owner_telegram_id=?", (user_id,))[0][0] == 0
+
+    press(f"wgadm:dbdo:account:{user_id}")
+    assert query(path, "SELECT COUNT(*) FROM accounts WHERE telegram_id=?", (user_id,))[0][0] == 0
+    assert query(path, "SELECT COUNT(*) FROM numbers WHERE telegram_id=?", (user_id,))[0][0] == 0
+
+
+def test_admin_bulk_gift_import_and_hide_preserve_inventory(panel, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, store = panel
+    class FakeCatalog:
+        async def sync(self, database_path):
+            return {"gift_count": 2, "source": "telegram_mtproto"}
+
+    monkeypatch.setattr(bot_module, "mtproto_gift_catalog", FakeCatalog())
+    conn = db_split.sqlite_connect(path)
+    try:
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO telegram_gift_sync_state(id,last_synced_at,gift_count,source) VALUES(1,?,?,?)",
+            (now, 2, "telegram_mtproto"),
+        )
+        conn.execute(
+            """INSERT INTO telegram_mtproto_gift_catalog
+               (gift_id,title,stars,limited,sold_out,availability_remains,
+                is_available,source_payload,position,synced_at)
+               VALUES('limited','Limited gift',25,1,0,4,1,'{}',0,?)""",
+            (now,),
+        )
+        conn.execute(
+            """INSERT INTO telegram_mtproto_gift_catalog
+               (gift_id,title,stars,limited,sold_out,availability_remains,
+                is_available,source_payload,position,synced_at)
+               VALUES('unlimited','Unlimited gift',50,0,0,NULL,1,'{}',1,?)""",
+            (now,),
+        )
+        conn.execute(
+            """INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at)
+               VALUES('limited',25,7,3,?)""",
+            (now,),
+        )
+        conn.execute(
+            """INSERT INTO user_gifts(serial_number,gift_name,telegram_gift_id,owner_telegram_id,acquired_at)
+               VALUES('WG-KEEP','Keep me','limited',123,?)""",
+            (now,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    added = press("wgadm:dbgiftaddall")
+    assert "Добавлено/обновлено подарков: 2" in added.sent[0][0]
+    assert query(path, "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id='limited'") == [(25, 7, 3)]
+    assert query(path, "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id='unlimited'") == [
+        (50, bot_module.UNLIMITED_GIFT_SUPPLY, 0)
+    ]
+
+    press("wgadm:dbgifthideall")
+    assert query(path, "SELECT COUNT(*) FROM telegram_gift_prices WHERE price_stars=0 AND supply=0")[0][0] == 2
+    assert query(path, "SELECT COUNT(*) FROM user_gifts WHERE serial_number='WG-KEEP'")[0][0] == 1

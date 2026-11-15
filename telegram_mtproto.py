@@ -89,7 +89,7 @@ def _gift_payload(gift: Any, position: int, synced_at: int) -> dict[str, Any]:
     sticker = _sticker_metadata(document)
     gift_id = _int_value(gift, "id")
     emoji = sticker["emoji"]
-    title = str(_value(gift, "title", "") or emoji or f"Telegram gift {gift_id}")
+    title = str(_value(gift, "title", "") or emoji or "Подарок Telegram")
     return {
         "gift_id": str(gift_id),
         "title": title[:160],

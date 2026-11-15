@@ -1251,6 +1251,7 @@ def admin_keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 def admin_home_keyboard() -> InlineKeyboardMarkup:
     return admin_keyboard([
+        [("🗄 Управление БД", "wgadm:db")],
         [("📊 Статистика", "wgadm:stats")],
         [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Подарки", "wgadm:gifts")],
         [("🎁 Подарки Telegram (цены и остатки)", "wgadm:tggifts")],
@@ -1288,6 +1289,154 @@ async def admin_account_card(telegram_id: int) -> tuple[str, InlineKeyboardMarku
         [(ban_label, f"wgadm:ban:{telegram_id}")],
         [("⬅️ В меню", "wgadm:home")],
     ])
+
+async def admin_db_accounts_page() -> tuple[str, InlineKeyboardMarkup]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT COALESCE(n.owner_telegram_id,n.telegram_id) AS owner_id,
+                      COALESCE(NULLIF(a.username,''),NULLIF(u.username,''),'') AS username,
+                      COALESCE(NULLIF(a.display_name,''),'') AS display_name,
+                      COUNT(*) AS account_count
+               FROM numbers n
+               LEFT JOIN accounts a ON a.telegram_id=COALESCE(n.owner_telegram_id,n.telegram_id)
+               LEFT JOIN users u ON u.telegram_id=COALESCE(n.owner_telegram_id,n.telegram_id)
+               GROUP BY COALESCE(n.owner_telegram_id,n.telegram_id)
+               ORDER BY account_count DESC, owner_id ASC"""
+        )
+        rows = await cur.fetchall()
+    keyboard = []
+    for row in rows:
+        owner_id = int(row["owner_id"])
+        username = str(row["username"] or "").strip()
+        display_name = str(row["display_name"] or "").strip()
+        label = f"@{username}" if username else (display_name or f"TG {owner_id}")
+        keyboard.append([(f"{label} ({int(row['account_count'])})"[:64], f"wgadm:dbowner:{owner_id}")])
+    body = (f"Пользователи · {len(rows)}\nВыберите пользователя, чтобы увидеть его аккаунты:"
+            if rows else "Пользователей с аккаунтами пока нет.")
+    keyboard.append([("⬅️ В управление БД", "wgadm:db")])
+    return body, admin_keyboard(keyboard)
+
+
+async def admin_db_owner_accounts(owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT n.telegram_id AS account_id,n.number,
+                      a.username,a.display_name,a.stars,a.grams
+               FROM numbers n
+               LEFT JOIN accounts a ON a.telegram_id=n.telegram_id
+               WHERE COALESCE(n.owner_telegram_id,n.telegram_id)=?
+               ORDER BY n.created_at DESC,n.telegram_id DESC""",
+            (owner_id,),
+        )
+        rows = await cur.fetchall()
+        cur = await db.execute(
+            "SELECT username,display_name FROM accounts WHERE telegram_id=?",
+            (owner_id,),
+        )
+        owner = await cur.fetchone()
+    if not rows:
+        return "У пользователя больше нет аккаунтов.", admin_keyboard([
+            [("⬅️ К аккаунтам", "wgadm:dbaccounts")],
+        ])
+    username = str(owner["username"] or "").strip() if owner else ""
+    display_name = str(owner["display_name"] or "").strip() if owner else ""
+    owner_label = f"@{username}" if username else (display_name or f"TG {owner_id}")
+    keyboard = []
+    for row in rows:
+        keyboard.append([(
+            f"{row['number']} · TG {row['account_id']}"[:64],
+            f"wgadm:dbaccount:{int(row['account_id'])}",
+        )])
+    keyboard.append([("⬅️ К пользователям", "wgadm:dbaccounts")])
+    return f"Аккаунты {owner_label} · {len(rows)} шт.", admin_keyboard(keyboard)
+
+
+async def admin_db_account_panel(account_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    card = await admin_account_card(account_id)
+    if not card:
+        return None
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(owner_telegram_id,telegram_id) FROM numbers WHERE telegram_id=?",
+            (account_id,),
+        )
+        row = await cur.fetchone()
+    owner_id = int(row[0]) if row else account_id
+    keyboard = admin_keyboard([
+        [("🗑 Удалить подарки", f"wgadm:dbask:gifts:{account_id}"),
+         ("Обнулить Stars", f"wgadm:dbask:stars:{account_id}")],
+        [("🗑 Удалить канал", f"wgadm:dbask:channels:{account_id}"),
+         ("Обнулить Gram", f"wgadm:dbask:grams:{account_id}")],
+        [("Удалить аккаунт полностью", f"wgadm:dbask:account:{account_id}")],
+        [("⬅️ К аккаунтам пользователя", f"wgadm:dbowner:{owner_id}")],
+    ])
+    return card[0] + "\n\nУправление данными аккаунта:", keyboard
+
+
+async def admin_add_all_telegram_gifts() -> tuple[int, int]:
+    # Refresh the full Telegram source catalogue before copying its original
+    # Stars price and available stock into the independent WaysGram shop.
+    if mtproto_gift_catalog is not None:
+        await mtproto_gift_catalog.sync(DATABASE_PATH)
+    elif bot is not None:
+        await sync_telegram_gifts(DATABASE_PATH, bot)
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
+        state = await cur.fetchone()
+        source = str(state["source"]) if state else "telegram_bot_api"
+        if source == "telegram_mtproto":
+            cur = await db.execute(
+                """SELECT gift_id,stars,limited,sold_out,
+                          availability_remains AS remaining_stock
+                   FROM telegram_mtproto_gift_catalog
+                   WHERE is_available=1 ORDER BY position,gift_id"""
+            )
+        else:
+            cur = await db.execute(
+                """SELECT gift_id,star_count AS stars,
+                          CASE WHEN total_count IS NULL THEN 0 ELSE 1 END AS limited,
+                          CASE WHEN total_count IS NOT NULL AND COALESCE(remaining_count,0)<=0 THEN 1 ELSE 0 END AS sold_out,
+                          remaining_count AS remaining_stock
+                   FROM telegram_gift_catalog
+                   WHERE is_available=1 ORDER BY position,gift_id"""
+            )
+        rows = await cur.fetchall()
+        if not rows:
+            return 0, 0
+        now = int(time.time())
+        unlimited_count = 0
+        for row in rows:
+            gift_id = str(row["gift_id"])
+            price = max(0, int(row["stars"] or 0))
+            cur = await db.execute(
+                "SELECT sold FROM telegram_gift_prices WHERE gift_id=?",
+                (gift_id,),
+            )
+            old = await cur.fetchone()
+            sold = max(0, int(old[0])) if old else 0
+            if not bool(row["limited"]):
+                supply = UNLIMITED_GIFT_SUPPLY
+                unlimited_count += 1
+            elif bool(row["sold_out"]):
+                supply = sold
+            else:
+                supply = max(0, int(row["remaining_stock"] or 0)) + sold
+            await db.execute(
+                """INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(gift_id) DO UPDATE SET
+                       price_stars=excluded.price_stars,
+                       supply=excluded.supply,
+                       updated_at=excluded.updated_at""",
+                (gift_id, price, supply, sold, now),
+            )
+        await db.commit()
+    return len(rows), unlimited_count
+
 
 async def admin_gift_card(gift_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -1346,6 +1495,7 @@ async def admin_channel_card(channel_id: int) -> tuple[str, InlineKeyboardMarkup
 
 SYNTHETIC_ACCOUNT_BASE = 9_000_000_000_000  # ids of accounts created by the administrator; far above real Telegram ids
 TG_GIFTS_PAGE_SIZE = 10
+UNLIMITED_GIFT_SUPPLY = 2_000_000_000
 USERNAME_RE = re.compile(r"[a-z][a-z0-9_]{1,31}")
 
 
@@ -1402,7 +1552,11 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
             if table is None:
                 continue
             cur = await db.execute(
-                f"""SELECT g.gift_id AS id,g.title AS title,
+                f"""SELECT g.gift_id AS id,
+                           CASE WHEN lower(trim(COALESCE(g.title,''))) LIKE 'telegram gift%'
+                                     OR trim(COALESCE(g.title,''))=''
+                                THEN COALESCE(NULLIF(g.sticker_emoji,''),'Подарок Telegram')
+                                ELSE g.title END AS title,
                            COALESCE(p.price_stars,0) AS price_stars,
                            COALESCE(p.supply,0) AS supply,
                            COALESCE(p.sold,0) AS sold,
@@ -1420,7 +1574,7 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
                 by_id[gift_id] = item
 
         cur = await db.execute(
-            """SELECT p.gift_id AS id,'Telegram Gift ' || p.gift_id AS title,
+            """SELECT p.gift_id AS id,'Подарок Telegram' AS title,
                       p.price_stars,p.supply,p.sold,0 AS telegram_available
                FROM telegram_gift_prices p
                WHERE NOT EXISTS (SELECT 1 FROM telegram_gift_catalog c WHERE c.gift_id=p.gift_id)
@@ -1627,6 +1781,231 @@ async def admin_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     if action == "home":
         await callback.message.answer("Панель администратора WaysGram", reply_markup=admin_home_keyboard())
+
+    elif action == "db":
+        await callback.message.answer(
+            "Управление базой данных WaysGram",
+            reply_markup=admin_keyboard([
+                [("👥 Аккаунты", "wgadm:dbaccounts")],
+                [("🎁 Подарки", "wgadm:dbgifts")],
+                [("⬅️ В меню", "wgadm:home")],
+            ]),
+        )
+    elif action == "dbaccounts":
+        body, keyboard = await admin_db_accounts_page()
+        await callback.message.answer(body, reply_markup=keyboard)
+    elif action == "dbowner" and len(parts) == 3:
+        try:
+            owner_id = int(parts[2])
+        except ValueError:
+            return
+        body, keyboard = await admin_db_owner_accounts(owner_id)
+        await callback.message.answer(body, reply_markup=keyboard)
+    elif action == "dbaccount" and len(parts) == 3:
+        try:
+            account_id = int(parts[2])
+        except ValueError:
+            return
+        card = await admin_db_account_panel(account_id)
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+        else:
+            await callback.message.answer("Аккаунт не найден.")
+    elif action == "dbask" and len(parts) == 4:
+        operation, account_id = parts[2], int(parts[3])
+        names = {
+            "gifts": "удалить подарки из инвентаря",
+            "stars": "обнулить баланс Stars",
+            "grams": "обнулить баланс Gram",
+            "channels": "удалить каналы аккаунта",
+            "account": "полностью удалить аккаунт и связанные данные",
+        }
+        if operation not in names:
+            return
+        if account_id == SYSTEM_ACCOUNT_ID:
+            await callback.message.answer("Системный аккаунт WaysGram защищён от удаления.")
+            return
+        await callback.message.answer(
+            f"Подтвердите действие: {names[operation]}?\n\nАккаунт TG {account_id}.",
+            reply_markup=admin_keyboard([
+                [("Подтвердить", f"wgadm:dbdo:{operation}:{account_id}")],
+                [("Отмена", f"wgadm:dbaccount:{account_id}")],
+            ]),
+        )
+    elif action == "dbdo" and len(parts) == 4:
+        operation, account_id = parts[2], int(parts[3])
+        if operation not in {"gifts", "stars", "grams", "channels", "account"}:
+            return
+        if account_id == SYSTEM_ACCOUNT_ID:
+            await callback.message.answer("Системный аккаунт WaysGram защищён от изменения.")
+            return
+        now = int(time.time())
+        result_text = ""
+        if operation == "account":
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                cur = await db.execute(
+                    "SELECT number,COALESCE(owner_telegram_id,telegram_id) FROM numbers WHERE telegram_id=?",
+                    (account_id,),
+                )
+                row = await cur.fetchone()
+            if not row:
+                await callback.message.answer("Номер аккаунта не найден. Удаление не выполнено.")
+                return
+            deleted = await store.delete_number(str(row[0]), int(row[1]))
+            if not deleted:
+                await callback.message.answer("Аккаунт уже удалён или не найден.")
+                return
+            await admin_log("db_delete_account", str(account_id), f"number={row[0]}; owner={row[1]}")
+            body, keyboard = await admin_db_owner_accounts(int(row[1]))
+            await callback.message.answer(f"Аккаунт TG {account_id} и связанные данные удалены.")
+            await callback.message.answer(body, reply_markup=keyboard)
+            return
+
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute("SELECT 1 FROM accounts WHERE telegram_id=?", (account_id,))
+            if not await cur.fetchone():
+                await db.rollback()
+                await callback.message.answer("Аккаунт не найден.")
+                return
+            if operation == "gifts":
+                cur = await db.execute(
+                    "SELECT serial_number FROM user_gifts WHERE owner_telegram_id=?",
+                    (account_id,),
+                )
+                serials = [str(row[0]) for row in await cur.fetchall()]
+                for serial in serials:
+                    cur = await db.execute(
+                        """SELECT id,highest_bidder_telegram_id,current_bid_grams
+                           FROM gift_collectible_auctions
+                           WHERE serial_number=? AND status='active'""",
+                        (serial,),
+                    )
+                    auctions = await cur.fetchall()
+                    for auction in auctions:
+                        bidder_id = auction["highest_bidder_telegram_id"]
+                        refund = int(auction["current_bid_grams"] or 0)
+                        if bidder_id is not None and refund > 0:
+                            cur = await db.execute(
+                                "SELECT grams FROM accounts WHERE telegram_id=?",
+                                (int(bidder_id),),
+                            )
+                            bidder = await cur.fetchone()
+                            if bidder:
+                                new_balance = int(bidder[0]) + refund
+                                await db.execute(
+                                    "UPDATE accounts SET grams=?,updated_at=? WHERE telegram_id=?",
+                                    (new_balance, now, int(bidder_id)),
+                                )
+                                await db.execute(
+                                    """INSERT INTO economy_transactions
+                                       (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                                       VALUES(?,'grams',?,?,?, ?,?)""",
+                                    (int(bidder_id), refund, new_balance,
+                                     f"admin_inventory_cleanup:{serial}", ADMIN_ID, now),
+                                )
+                    await db.execute(
+                        "UPDATE gift_collectible_auctions SET status='cancelled',settled_at=? WHERE serial_number=? AND status='active'",
+                        (now, serial),
+                    )
+                    await db.execute(
+                        "UPDATE gift_market_listings SET status='cancelled' WHERE serial_number=? AND status='active'",
+                        (serial,),
+                    )
+                await db.execute("DELETE FROM user_gifts WHERE owner_telegram_id=?", (account_id,))
+                result_text = f"Удалено подарков из инвентаря: {len(serials)}. История сообщений и операций сохранена."
+            elif operation in {"stars", "grams"}:
+                cur = await db.execute(f"SELECT {operation} FROM accounts WHERE telegram_id=?", (account_id,))
+                old_balance = int((await cur.fetchone())[0])
+                await db.execute(
+                    f"UPDATE accounts SET {operation}=0,updated_at=? WHERE telegram_id=?",
+                    (now, account_id),
+                )
+                if old_balance:
+                    await db.execute(
+                        """INSERT INTO economy_transactions
+                           (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (account_id, operation, -old_balance, 0,
+                         f"admin_clear_{operation}", ADMIN_ID, now),
+                    )
+                result_text = f"Баланс {operation.upper()} обнулён. Списано: {old_balance}."
+            elif operation == "channels":
+                cur = await db.execute("SELECT id FROM channels WHERE owner_telegram_id=?", (account_id,))
+                channel_ids = [int(row[0]) for row in await cur.fetchall()]
+                for channel_id in channel_ids:
+                    await db.execute("DELETE FROM channel_messages WHERE channel_id=?", (channel_id,))
+                    await db.execute("DELETE FROM channel_admins WHERE channel_id=?", (channel_id,))
+                    await db.execute("DELETE FROM channel_members WHERE channel_id=?", (channel_id,))
+                    await db.execute("DELETE FROM message_reactions WHERE scope='channel' AND chat_id=?", (channel_id,))
+                    await db.execute("DELETE FROM pinned_messages WHERE scope='channel' AND chat_id=?", (channel_id,))
+                    await db.execute("DELETE FROM cloud_drafts WHERE scope='channel' AND peer_id=?", (channel_id,))
+                    await db.execute("DELETE FROM channels WHERE id=?", (channel_id,))
+                result_text = f"Удалено каналов аккаунта: {len(channel_ids)}."
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, f"db_{operation}", str(account_id), result_text, now),
+            )
+            await db.commit()
+        await callback.message.answer(result_text)
+        card = await admin_db_account_panel(account_id)
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+        else:
+            await callback.message.answer("Аккаунт больше не найден.", reply_markup=admin_keyboard([
+                [("К аккаунтам", "wgadm:dbaccounts")],
+            ]))
+    elif action == "dbgifts":
+        await callback.message.answer(
+            "Управление подарками в магазине WaysGram.\n"
+            "Добавление копирует исходную цену Stars и доступный остаток из активного каталога Telegram.\n"
+            "Скрытие влияет только на магазин; инвентари пользователей и история сохраняются.",
+            reply_markup=admin_keyboard([
+                [("➕ Добавить все подарки", "wgadm:dbgiftaddall")],
+                [("Скрыть все подарки в магазине", "wgadm:dbgifthideask")],
+                [("Открыть каталог", "wgadm:tggifts")],
+                [("⬅️ В управление БД", "wgadm:db")],
+            ]),
+        )
+    elif action == "dbgiftaddall":
+        try:
+            count, unlimited_count = await admin_add_all_telegram_gifts()
+        except Exception as exc:
+            log.exception("Admin bulk gift import failed (%s)", type(exc).__name__)
+            await callback.message.answer("Не удалось обновить каталог Telegram. Проверьте подключение и журнал.")
+            return
+        if count == 0:
+            await callback.message.answer("В активном каталоге Telegram нет подарков для добавления.")
+            return
+        await admin_log("db_gifts_add_all", "telegram_catalog", f"count={count}; unlimited={unlimited_count}")
+        await callback.message.answer(
+            f"Добавлено/обновлено подарков: {count}.\n"
+            f"Без ограничения остатка: {unlimited_count}.\n"
+            "Цены и остатки взяты из текущего каталога Telegram.",
+            reply_markup=admin_keyboard([[("К управлению подарками", "wgadm:dbgifts")]]),
+        )
+    elif action == "dbgifthideask":
+        await callback.message.answer(
+            "Скрыть все подарки из магазина WaysGram? Пользовательские инвентари, серийные номера и история покупок останутся без изменений.",
+            reply_markup=admin_keyboard([
+                [("Подтвердить скрытие всех", "wgadm:dbgifthideall")],
+                [("Отмена", "wgadm:dbgifts")],
+            ]),
+        )
+    elif action == "dbgifthideall":
+        now = int(time.time())
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "UPDATE telegram_gift_prices SET price_stars=0,supply=0,updated_at=?",
+                (now,),
+            )
+            await db.commit()
+        await admin_log("db_gifts_hide_all", "telegram_catalog", "store listings disabled; inventories untouched")
+        await callback.message.answer(
+            "Все подарки скрыты из магазина. Подарки в инвентарях пользователей не удалены.",
+            reply_markup=admin_keyboard([[("К управлению подарками", "wgadm:dbgifts")]]),
+        )
     elif action == "getlogs":
         if not LOG_FILE_PATH.is_file():
             await callback.message.answer(

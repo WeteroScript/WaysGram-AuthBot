@@ -105,6 +105,18 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert bought.json()["stars"] == 5000 - 40
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert len(mine) == 1 and mine[0]["gift_name"] == "🎁"
+            conn = db_split.sqlite_connect(path)
+            try:
+                self_receipt = conn.execute(
+                    """SELECT m.sender_telegram_id,m.recipient_telegram_id,m.body,mg.attributes_json
+                       FROM messages m JOIN message_gifts mg ON mg.message_id=m.id
+                       WHERE mg.serial_number=?""",
+                    (bought.json()["gift"]["serial_number"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert self_receipt[:3] == (101, 101, "Вы приобрели коллекционный подарок «🎁»")
+            assert json.loads(self_receipt[3])["event_type"] == "purchase"
             assert mine[0]["telegram_gift_id"] == "g1"
             assert mine[0]["sticker_available"] is True
             assert mine[0]["sticker_url"] == "/api/telegram/gifts/g1/sticker"
@@ -129,6 +141,26 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert sent.status_code == 201
             assert sent.json()["stars"] == 5000 - 80
             assert len((await client.get("/api/me/gifts", headers=headers(102))).json()["gifts"]) == 1
+            conn = db_split.sqlite_connect(path)
+            try:
+                receipts = conn.execute(
+                    """SELECT m.sender_telegram_id,m.recipient_telegram_id,m.body,mg.serial_number,
+                              mg.attributes_json
+                       FROM messages m JOIN message_gifts mg ON mg.message_id=m.id
+                       WHERE mg.serial_number=?""",
+                    (sent.json()["gift"]["serial_number"],),
+                ).fetchall()
+                event = conn.execute(
+                    """SELECT scope,user_a,user_b,message_id FROM message_events
+                       WHERE message_id=(SELECT message_id FROM message_gifts WHERE serial_number=?)""",
+                    (sent.json()["gift"]["serial_number"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert len(receipts) == 1
+            assert receipts[0][:3] == (101, 102, "Вы отправили подарок «🎁»")
+            assert json.loads(receipts[0][4])["event_type"] == "purchase"
+            assert event is not None and event[:3] == ("dm", 101, 102)
 
             # The stock was 2, so the next purchase fails and costs nothing.
             sold_out = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
