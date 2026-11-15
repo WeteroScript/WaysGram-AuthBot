@@ -967,6 +967,9 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
                 assert item["gift_serial_number"] == serial
                 assert item["gift_name"] == "🎁"
                 assert item["gift_upgrade_level"] == 1
+                assert item["gift_emoji"] == "🎁"
+                assert item["gift_telegram_metadata"]["emoji"] == "🎁"
+                assert item["gift_telegram_metadata"]["upgrade_star_count"] == 10
                 assert item["gift_attributes"]["upgrade_source"] == "waysgram_internal"
                 assert item["gift_attributes"]["collectible_traits"] == traits
 
