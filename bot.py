@@ -61,7 +61,7 @@ WELCOME_DM_TEXT = (
     "Добро пожаловать в WaysGram! ✨"
 )
 
-PHONE_RE = re.compile(r"^\+1\d{10}$")
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 OTP_RE = re.compile(r"^\d{6}$")
 EMOJI = ["🐱", "🐶", "🦊", "🐼", "🐸", "🐵", "🐧", "🐰", "🦁", "🐨", "🐯", "🐹"]
 
@@ -1345,8 +1345,14 @@ USERNAME_RE = re.compile(r"[a-z][a-z0-9_]{1,31}")
 
 
 def normalize_admin_number(value: str) -> str | None:
-    """+1 and ten digits; ten digits alone or eleven starting with 1 are accepted too."""
-    digits = re.sub(r"\D", "", value)
+    """Normalize an international E.164 number; retain legacy US input shortcuts."""
+    raw = value.strip()
+    if not re.fullmatch(r"[+0-9().\s-]+", raw):
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if raw.startswith("+"):
+        normalized = "+" + digits
+        return normalized if PHONE_RE.fullmatch(normalized) else None
     if len(digits) == 10:
         return "+1" + digits
     if len(digits) == 11 and digits.startswith("1"):
@@ -1643,7 +1649,7 @@ async def admin_callback(callback: CallbackQuery) -> None:
             reply_markup=admin_keyboard([[("⬅️ В меню", "wgadm:home")]]))
     elif action == "accounts":
         ADMIN_INPUT[ADMIN_ID] = ("search", None)
-        await callback.message.answer("Отправьте Telegram ID или виртуальный номер +1… для поиска аккаунта.")
+        await callback.message.answer("Отправьте Telegram ID или международный виртуальный номер (+код страны).")
     elif action == "gifts":
         page = 0
         if len(parts) >= 3:
@@ -1994,7 +2000,7 @@ async def admin_callback(callback: CallbackQuery) -> None:
     elif action == "newacct":
         ADMIN_INPUT[ADMIN_ID] = ("newacct_number", None)
         await callback.message.answer(
-            "Создание аккаунта. Введите номер: +1 и 10 цифр (можно только 10 цифр).\n"
+            "Создание аккаунта. Введите международный номер в формате +код страны и номер (например, +44 7700 900123).\n"
             "Коды входа для этого номера будут приходить вам в этот чат."
         )
     elif action == "newuname":
@@ -2326,7 +2332,7 @@ async def admin_text_input(message: Message) -> None:
     elif kind == "newacct_number":
         number = normalize_admin_number(value)
         if not number:
-            await message.answer("Нужен номер вида +1 и 10 цифр. Попробуйте ещё раз.")
+            await message.answer("Введите номер в международном формате: +код страны и 7–14 остальных цифр. Можно использовать пробелы, скобки и дефисы.")
             return
         async with aiosqlite.connect(DATABASE_PATH) as db:
             cur = await db.execute("SELECT 1 FROM numbers WHERE number=?", (number,))
@@ -2579,15 +2585,15 @@ async def admin_text_input(message: Message) -> None:
             reply_markup=admin_keyboard([[("Открыть каталог", "wgadm:gifts")]]))
 
 class NumberResolveRequest(BaseModel):
-    number: str = Field(min_length=12, max_length=12)
+    number: str = Field(min_length=9, max_length=16, pattern=r"^\+[1-9]\d{7,14}$")
 
 
 class AuthCodeRequest(BaseModel):
-    number: str = Field(min_length=12, max_length=12)
+    number: str = Field(min_length=9, max_length=16, pattern=r"^\+[1-9]\d{7,14}$")
 
 
 class CodeVerifyRequest(BaseModel):
-    number: str = Field(min_length=12, max_length=12)
+    number: str = Field(min_length=9, max_length=16, pattern=r"^\+[1-9]\d{7,14}$")
     code: str = Field(pattern=r"^\d{6}$")
 
 
@@ -2775,7 +2781,7 @@ async def resolve_number(
 ) -> dict[str, Any]:
     verify_internal_token(x_internal_token)
     if not PHONE_RE.fullmatch(payload.number):
-        raise HTTPException(status_code=422, detail="Invalid +1 number format")
+        raise HTTPException(status_code=422, detail="Invalid international E.164 number format")
     owner = await store.resolve_number(payload.number)
     if not owner:
         raise HTTPException(status_code=404, detail="Number is not assigned")
