@@ -120,6 +120,7 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert public_gift["telegram_gift"]["emoji"] == "🎁"
             assert public_gift["gift_emoji"] == "🎁"
             assert public_gift["telegram_gift"]["upgrade_star_count"] == 10
+            assert public_gift["can_upgrade"] is True
 
             assert bought.json()["gift"]["telegram_gift_id"] == "g1"
 
@@ -979,6 +980,7 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
             assert public_gift["upgrade_level"] == 1
             assert public_gift["attributes"]["upgrade_source"] == "waysgram_internal"
             assert public_gift["attributes"]["collectible_traits"] == traits
+            assert public_gift["can_upgrade"] is False
             assert public_gift["is_listed"] == 0
 
     run(scenario())
