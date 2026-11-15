@@ -164,6 +164,25 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
 
 
 
+def test_public_account_hides_malformed_virtual_phone_placeholders() -> None:
+    account = {
+        "telegram_id": 81008,
+        "username": "placeholder",
+        "display_name": "Placeholder",
+        "avatar_media_id": "",
+        "bio": "",
+        "virtual_number": "+null",
+        "stars": 0,
+        "grams": 0,
+    }
+    result = messenger_api._public_account(account, include_phone=True)
+    assert result["phone"] == ""
+
+    account["virtual_number"] = "+427712345678"
+    result = messenger_api._public_account(account, include_phone=True)
+    assert result["phone"] == "+427712345678"
+
+
 def test_me_recovers_assigned_number_when_account_value_is_unknown(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     user_id = 81009
