@@ -163,6 +163,27 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
     run(scenario())
 
 
+
+def test_me_recovers_assigned_number_when_account_value_is_unknown(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    user_id = 81009
+    number = add_account(api_env, user_id, "number_recovery")
+    add_session(path, user_id, "number-recovery-session")
+    with db_split.sqlite_connect(path) as db:
+        db.execute("UPDATE accounts SET virtual_number='Unknown' WHERE telegram_id=?", (user_id,))
+        db.commit()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.get(
+                "/api/me",
+                headers={"Authorization": "Bearer number-recovery-session"},
+            )
+            assert response.status_code == 200
+            assert response.json()["phone"] == number
+
+    run(scenario())
+
 def test_new_account_gets_system_welcome_and_balance_notifications(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     run(bot_module.ensure_system_account())
@@ -3407,17 +3428,44 @@ def test_saved_messages_support_self_chat_without_unread_count(api_env) -> None:
             assert sent.json()["sender_id"] == user_id
             assert sent.json()["recipient_id"] == user_id
 
+            voice_upload = await client.post(
+                "/api/media/documents",
+                headers={
+                    **headers,
+                    "Content-Type": "audio/mp4",
+                    "X-Filename": "saved-voice.m4a",
+                    "X-Media-Kind": "voice",
+                },
+                content=b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 32,
+            )
+            assert voice_upload.status_code == 201
+            voice_sent = await client.post(
+                "/api/messages",
+                headers=headers,
+                json={
+                    "recipient_id": user_id,
+                    "media_id": voice_upload.json()["id"],
+                    "body": "Голосовое сообщение",
+                },
+            )
+            assert voice_sent.status_code == 201
+            assert voice_sent.json()["media_kind"] == "voice"
+
             history = await client.get(
                 f"/api/messages?with={user_id}",
                 headers=headers,
             )
             assert history.status_code == 200
-            assert [item["body"] for item in history.json()["messages"]] == ["Note to myself"]
+            assert [item["body"] for item in history.json()["messages"]] == [
+                "Note to myself",
+                "Голосовое сообщение",
+            ]
+            assert history.json()["messages"][-1]["media_kind"] == "voice"
 
             conversations = await client.get("/api/conversations", headers=headers)
             assert conversations.status_code == 200
             saved = next(item for item in conversations.json()["conversations"] if item["id"] == user_id)
-            assert saved["last_message"] == "Note to myself"
+            assert saved["last_message"] == "Голосовое сообщение"
             assert saved["unread_count"] == 0
 
     run(scenario())
@@ -5024,7 +5072,7 @@ def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_ways
         db.execute(
             """INSERT INTO telegram_gift_prices
                (gift_id,price_stars,supply,sold,updated_at)
-               VALUES('gift_not_cached',25,2,0,?)""",
+               VALUES('5807641025165919973',25,2,0,?)""",
             (now,),
         )
 
@@ -5033,27 +5081,27 @@ def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_ways
             auth = {"Authorization": "Bearer manual-gift-session"}
             catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
             assert catalog.status_code == 200
-            gift = next(item for item in catalog.json()["gifts"] if item["id"] == "gift_not_cached")
+            gift = next(item for item in catalog.json()["gifts"] if item["id"] == "5807641025165919973")
             assert gift["catalog_source"] == "waysgram_manual"
-            assert gift["title"] == "Telegram Gift gift_not_cached"
+            assert gift["title"] == "Telegram Gift 5807641025165919973"
             assert gift["for_sale"] is True
-            assert gift["sticker"]["url"].endswith("/gift_not_cached/sticker")
+            assert gift["sticker"]["url"].endswith("/5807641025165919973/sticker")
 
             purchase = await client.post(
-                "/api/telegram/gifts/gift_not_cached/purchase",
+                "/api/telegram/gifts/5807641025165919973/purchase",
                 headers={**auth, "Idempotency-Key": "manual-gift-purchase-0001"},
                 json={},
             )
             assert purchase.status_code == 201
-            assert purchase.json()["gift"]["gift_name"] == "Telegram Gift gift_not_cached"
+            assert purchase.json()["gift"]["gift_name"] == "Telegram Gift 5807641025165919973"
 
             inventory = await client.get("/api/me/gifts", headers=auth)
             assert inventory.status_code == 200
-            assert inventory.json()["gifts"][0]["telegram_gift_id"] == "gift_not_cached"
-            assert inventory.json()["gifts"][0]["gift_name"] == "Telegram Gift gift_not_cached"
+            assert inventory.json()["gifts"][0]["telegram_gift_id"] == "5807641025165919973"
+            assert inventory.json()["gifts"][0]["gift_name"] == "Telegram Gift 5807641025165919973"
 
             sticker = await client.get(
-                "/api/telegram/gifts/gift_not_cached/sticker",
+                "/api/telegram/gifts/5807641025165919973/sticker",
                 headers=auth,
             )
             assert sticker.status_code == 404
@@ -5061,6 +5109,6 @@ def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_ways
     run(scenario())
 
     manual_rows = run(bot_module.telegram_gift_rows())
-    manual = next(row for row in manual_rows if row["id"] == "gift_not_cached")
+    manual = next(row for row in manual_rows if row["id"] == "5807641025165919973")
     assert manual["catalog_source"] == "waysgram_manual"
     assert manual["telegram_available"] is False
