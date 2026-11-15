@@ -1148,7 +1148,7 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
     if include_phone:
         phone = str(row["virtual_number"] or "").strip()
         phone_value = phone.lstrip("+").casefold()
-        result["phone"] = "" if phone_value in {"", "null", "none", "undefined"} else phone
+        result["phone"] = "" if phone_value in {"", "null", "none", "undefined", "unknown"} else phone
     result["stars"] = int(row["stars"])
     result["grams"] = int(row["grams"])
     result["is_premium"] = True  # every WaysGram account has Premium, permanently
@@ -2827,6 +2827,16 @@ def build_messenger_router(
     async def get_me(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         user = await current_user(authorization)
         result = _public_account(user, include_phone=True)
+        if not result["phone"]:
+            async with aiosqlite.connect(db_path()) as db:
+                cur = await db.execute(
+                    "SELECT number FROM numbers WHERE telegram_id=?",
+                    (int(user["telegram_id"]),),
+                )
+                number_row = await cur.fetchone()
+            number = str(number_row[0] or "").strip() if number_row else ""
+            if re.fullmatch(r"\+[1-9]\d{7,14}", number):
+                result["phone"] = number
         result["is_admin"] = is_admin_user(user)
         return result
 
@@ -3642,7 +3652,7 @@ def build_messenger_router(
                    (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
                    VALUES(?,?,?,?,0,?)""",
                 (saved_message_id, serial, title, gift_id,
-                 json.dumps({"event_type": "purchase"}, separators=(",", ":"))),
+                 json.dumps({"event_type": "purchase", "price_stars": price}, separators=(",", ":"))),
             )
             await record_event(
                 db, "dm", saved_message_id, "new_message", uid,
@@ -6103,16 +6113,17 @@ def build_messenger_router(
             if recipient[0]:
                 await db.rollback()
                 raise HTTPException(status_code=403, detail="Получатель заблокирован")
-            cur = await db.execute(
-                """SELECT 1 FROM blocked_users
-                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
-                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
-                   LIMIT 1""",
-                (uid, recipient_id, recipient_id, uid),
-            )
-            if await cur.fetchone():
-                await db.rollback()
-                raise HTTPException(status_code=403, detail="Нельзя отправить сообщение: пользователь находится в чёрном списке")
+            if recipient_id != uid:
+                cur = await db.execute(
+                    """SELECT 1 FROM blocked_users
+                       WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                          OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                       LIMIT 1""",
+                    (uid, recipient_id, recipient_id, uid),
+                )
+                if await cur.fetchone():
+                    await db.rollback()
+                    raise HTTPException(status_code=403, detail="Нельзя отправить сообщение: пользователь находится в чёрном списке")
             reply_to_id = parse_reply_id(payload)
             if reply_to_id:
                 await require_reply_target(
@@ -6178,7 +6189,7 @@ def build_messenger_router(
             }
             await idempotency_store(db, uid, "/api/messages", descriptor, result, now)
             await db.commit()
-        if not silent:
+        if not silent and recipient_id != uid:
             await deliver_push_notifications(
                 [recipient_id],
                 str(user.get("display_name") or user.get("username") or "Новое сообщение"),
@@ -6443,19 +6454,20 @@ def build_messenger_router(
             if recipient["is_banned"]:
                 await db.rollback()
                 raise HTTPException(status_code=403, detail="Получатель заблокирован")
-            blocked_cur = await db.execute(
-                """SELECT 1 FROM blocked_users
-                   WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
-                      OR (owner_telegram_id=? AND blocked_telegram_id=?)
-                   LIMIT 1""",
-                (uid, recipient_id, recipient_id, uid),
-            )
-            if await blocked_cur.fetchone():
-                await db.rollback()
-                raise HTTPException(
-                    status_code=403,
-                    detail="Нельзя отправить альбом: пользователь находится в чёрном списке",
+            if recipient_id != uid:
+                blocked_cur = await db.execute(
+                    """SELECT 1 FROM blocked_users
+                       WHERE (owner_telegram_id=? AND blocked_telegram_id=?)
+                          OR (owner_telegram_id=? AND blocked_telegram_id=?)
+                       LIMIT 1""",
+                    (uid, recipient_id, recipient_id, uid),
                 )
+                if await blocked_cur.fetchone():
+                    await db.rollback()
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Нельзя отправить альбом: пользователь находится в чёрном списке",
+                    )
 
             reply_to_id = parse_reply_id(payload)
             if reply_to_id:
@@ -6534,7 +6546,7 @@ def build_messenger_router(
             await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
 
-        if not silent:
+        if not silent and recipient_id != uid:
             await deliver_push_notifications(
                 [recipient_id],
                 str(user.get("display_name") or user.get("username") or "Новое сообщение"),
