@@ -2322,6 +2322,26 @@ async def admin_text_input(message: Message) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", value):
             await message.answer("Некорректный Telegram Gift ID. Отправьте ID без пробелов.")
             return
+
+        # The Bot API catalogue is bot-sendable only and may not include gifts
+        # present in Telegram's full MTProto StarGift catalogue.
+        # Refresh MTProto before creating a manual WaysGram-only placeholder.
+        if mtproto_gift_catalog is not None:
+            try:
+                sync_result = await mtproto_gift_catalog.sync(DATABASE_PATH)
+                log.info(
+                    "Refreshed Telegram MTProto gift catalogue before admin lookup "
+                    "(gift_id=%s, gift_count=%s)",
+                    value,
+                    sync_result.get("gift_count", 0),
+                )
+            except Exception as exc:
+                log.warning(
+                    "MTProto gift refresh failed before admin lookup (gift_id=%s, error=%s)",
+                    value,
+                    type(exc).__name__,
+                )
+
         row = next((item for item in await telegram_gift_rows() if str(item["id"]) == value), None)
         async with aiosqlite.connect(DATABASE_PATH) as db:
             await db.execute(
