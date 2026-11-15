@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import random
 import re
@@ -64,10 +65,40 @@ PHONE_RE = re.compile(r"^\+1\d{10}$")
 OTP_RE = re.compile(r"^\d{6}$")
 EMOJI = ["🐱", "🐶", "🦊", "🐼", "🐸", "🐵", "🐧", "🐰", "🦁", "🐨", "🐯", "🐹"]
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+def configure_logging() -> None:
+    """Configure console and bounded persistent logs without recording secrets."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_path = Path(
+        os.getenv("LOG_FILE_PATH", str(DATABASE_PATH.parent / "logs" / "authbot.log"))
+    )
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
+    except OSError as exc:
+        print(
+            f"WARNING: persistent AuthBot logging unavailable ({type(exc).__name__}); "
+            "continuing with console logs",
+            flush=True,
+        )
+
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+
+configure_logging()
 log = logging.getLogger("waysgram-authbot")
 
 TEXT: dict[str, dict[str, str]] = {
@@ -625,6 +656,39 @@ mtproto_client: Any | None = None
 mtproto_gift_catalog: TelegramMTProtoGiftCatalog | None = None
 router = Router()
 app = FastAPI(title="WaysGram AuthBot internal API", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Log every API request; never log query values, headers, or request bodies."""
+    started_at = time.perf_counter()
+    method = request.method
+    path = request.url.path
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        log.exception(
+            "HTTP request crashed method=%s path=%s duration_ms=%.2f",
+            method,
+            path,
+            duration_ms,
+        )
+        raise
+
+    duration_ms = (time.perf_counter() - started_at) * 1000
+    status = response.status_code
+    log_method = log.error if status >= 500 else log.warning if status >= 400 else log.info
+    log_method(
+        "HTTP request completed method=%s path=%s status=%s duration_ms=%.2f",
+        method,
+        path,
+        status,
+        duration_ms,
+    )
+    return response
+
+
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 
 
