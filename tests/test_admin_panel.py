@@ -207,8 +207,19 @@ def test_admin_balance_credit_sends_system_message(panel) -> None:
 
 
 
-def test_admin_adds_telegram_gift_by_id(panel) -> None:
+def test_admin_adds_telegram_gift_by_id(panel, monkeypatch: pytest.MonkeyPatch) -> None:
     path, store = panel
+
+    class FakeMTProtoCatalog:
+        def __init__(self):
+            self.sync_calls = 0
+
+        async def sync(self, database_path):
+            self.sync_calls += 1
+            return {"gift_count": 2, "source": "telegram_mtproto"}
+
+    mtproto_catalog = FakeMTProtoCatalog()
+    monkeypatch.setattr(bot_module, "mtproto_gift_catalog", mtproto_catalog)
     gifts = [
         {"id": "g1", "sticker": {"file_id": "f1", "file_unique_id": "u1", "type": "regular",
                                  "width": 512, "height": 512, "is_animated": False, "is_video": False,
@@ -232,3 +243,4 @@ def test_admin_adds_telegram_gift_by_id(panel) -> None:
     assert "добавлен в управление" in added.sent[0][0]
     assert "ID: g2" in added.sent[0][0]
     assert query(path, "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id='g2'") == [(0, 0)]
+    assert mtproto_catalog.sync_calls == 2
