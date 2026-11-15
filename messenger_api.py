@@ -1310,7 +1310,7 @@ async def store_telegram_gifts(
         if not sticker_file_id:
             continue
         emoji = str(sticker.get("emoji") or "")
-        title = str(gift.get("title") or emoji or f"Telegram gift {gift_id}")
+        title = str(gift.get("title") or emoji or "Подарок Telegram")
         normalized.append((
             gift_id,
             title[:160],
@@ -3637,25 +3637,31 @@ def build_messenger_router(
                    VALUES('purchase',?,?,NULL,?,?)""",
                 (serial, title, uid, now),
             )
-            # Telegram-style purchase receipt in the buyer's Saved Messages.
-            # It is committed atomically with the balance debit and inventory item.
+            # Keep the gift receipt inside WaysGram history and route it to
+            # the actual recipient's DM. Self-purchases go to Saved Messages.
+            is_self_purchase = owner == uid
+            receipt_body = (
+                f"Вы приобрели коллекционный подарок «{title}»"
+                if is_self_purchase
+                else f"Вы отправили подарок «{title}»"
+            )
             cur = await db.execute(
                 """INSERT INTO messages
                    (sender_telegram_id,recipient_telegram_id,body,created_at)
                    VALUES(?,?,?,?)""",
-                (uid, uid, f"Вы приобрели коллекционный подарок «{title}»", now),
+                (uid, owner, receipt_body, now),
             )
-            saved_message_id = int(cur.lastrowid)
+            receipt_message_id = int(cur.lastrowid)
             await db.execute(
                 """INSERT INTO message_gifts
                    (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
                    VALUES(?,?,?,?,0,?)""",
-                (saved_message_id, serial, title, gift_id,
+                (receipt_message_id, serial, title, gift_id,
                  json.dumps({"event_type": "purchase", "price_stars": price}, separators=(",", ":"))),
             )
             await record_event(
-                db, "dm", saved_message_id, "new_message", uid,
-                user_a=uid, user_b=uid,
+                db, "dm", receipt_message_id, "new_message", uid,
+                user_a=min(uid, owner), user_b=max(uid, owner),
             )
             if owner != uid:
                 await db.execute(
@@ -3706,7 +3712,7 @@ def build_messenger_router(
             (gift_id,),
         )
         if await cur.fetchone():
-            return f"Telegram Gift {gift_id}"
+            return "Подарок Telegram"
         return ""
 
     @router.get("/api/telegram/gifts")
@@ -3976,7 +3982,7 @@ def build_messenger_router(
                 "id": gift_id,
                 "source": "telegram",
                 "catalog_source": "waysgram_manual",
-                "title": f"Telegram Gift {gift_id}",
+                "title": "Подарок Telegram",
                 "emoji": "",
                 "star_count": 0,
                 "currency": "telegram_stars",
@@ -4012,8 +4018,12 @@ def build_messenger_router(
             gift["price_stars"] = priced["price_stars"]
             gift["supply"] = priced["supply"]
             gift["sold"] = priced["sold"]
-            gift["remaining"] = max(priced["supply"] - priced["sold"], 0)
-            gift["for_sale"] = priced["price_stars"] > 0 and gift["remaining"] > 0
+            unlimited_supply = int(priced["supply"]) >= 2_000_000_000
+            gift["unlimited_supply"] = unlimited_supply
+            gift["remaining"] = None if unlimited_supply else max(priced["supply"] - priced["sold"], 0)
+            gift["for_sale"] = priced["price_stars"] > 0 and (
+                unlimited_supply or gift["remaining"] > 0
+            )
         if not show_all:
             # Nothing is for sale until the administrator sets a price and a stock for the gift.
             # The app asks for everything (all=1) to be able to draw the gifts a user already owns.
