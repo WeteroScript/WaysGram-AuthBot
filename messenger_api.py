@@ -39,7 +39,7 @@ MAX_DOCUMENT_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
-PHONE_RE = re.compile(r"^\+1[0-9]{10}$")
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
 LOGGER = logging.getLogger(__name__)
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
@@ -2584,7 +2584,7 @@ def build_messenger_router(
     async def request_login_code(payload: dict[str, Any], request: Request) -> dict[str, str]:
         phone = str(payload.get("phone", payload.get("number", ""))).strip()
         if not PHONE_RE.fullmatch(phone):
-            raise HTTPException(status_code=400, detail="Номер должен иметь формат +1 и 10 цифр")
+            raise HTTPException(status_code=400, detail="Номер должен быть в международном формате E.164: +код страны и номер")
         owner = await auth_store.resolve_number(phone)
         if not owner:
             raise HTTPException(status_code=404, detail="Номер не закреплён за аккаунтом")
