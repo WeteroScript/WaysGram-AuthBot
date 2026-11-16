@@ -88,6 +88,29 @@ class FakeMTProtoClient:
         return b"telegram-mtproto-sticker"
 
 
+def test_mtproto_gift_name_uses_human_readable_sticker_pack_name(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "waysgram.sqlite3"
+        async with aiosqlite.connect(database) as db:
+            await db.execute("CREATE TABLE user_gifts (id INTEGER PRIMARY KEY, serial_number TEXT)")
+            await db.execute("CREATE TABLE gift_transactions (serial_number TEXT)")
+            await db.commit()
+        await init_messenger_storage(database)
+        client = FakeMTProtoClient()
+        client.gift.title = "Telegram Gift 123"
+        client.gift.sticker.attributes[0].stickerset.short_name = "PlushPepe"
+        provider = TelegramMTProtoGiftCatalog(client)
+
+        await provider.sync(database)
+        with db_split.sqlite_connect(database) as db:
+            row = db.execute(
+                "SELECT title,sticker_set_name FROM telegram_mtproto_gift_catalog WHERE gift_id='123456789'"
+            ).fetchone()
+        assert row == ("Plush Pepe", "PlushPepe")
+
+    asyncio.run(scenario())
+
+
 def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Path) -> None:
     async def scenario() -> None:
         database = tmp_path / "waysgram.sqlite3"
