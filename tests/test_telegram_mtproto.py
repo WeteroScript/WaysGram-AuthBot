@@ -91,6 +91,46 @@ class FakeMTProtoClient:
         return b"telegram-mtproto-sticker"
 
 
+def test_mtproto_preview_returns_raw_animation_when_still_thumbnails_fail() -> None:
+    class Thumb:
+        w = 256
+        h = 256
+
+    class AnimatedClient:
+        def __init__(self):
+            self.calls = []
+
+        async def download_media(self, document, file=bytes, thumb=None):
+            self.calls.append(thumb)
+            if thumb is not None:
+                return b"not an image"
+            return b"raw-tgs-animation"
+
+    async def scenario() -> None:
+        client = AnimatedClient()
+        document = SimpleNamespace(
+            id=9002,
+            dc_id=2,
+            size=32,
+            mime_type="application/x-tgsticker",
+            attributes=[
+                DocumentAttributeSticker("🎁", "PlushPepe"),
+                DocumentAttributeAnimated(),
+            ],
+            thumbs=[Thumb()],
+        )
+        gift = SimpleNamespace(id=123456790, sticker=document)
+        provider = TelegramMTProtoGiftCatalog(client)
+        provider._gifts["123456790"] = gift
+
+        content, mime_type = await provider.download_sticker_preview("123456790")
+        assert content == b"raw-tgs-animation"
+        assert mime_type == "application/x-tgsticker"
+        assert client.calls == [document.thumbs[0], None]
+
+    asyncio.run(scenario())
+
+
 def test_mtproto_preview_falls_back_to_a_smaller_valid_thumbnail() -> None:
     class Thumb:
         def __init__(self, width: int, height: int):
