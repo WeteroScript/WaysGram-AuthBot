@@ -1191,6 +1191,33 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
     return result
 
 
+def _gift_display_title(title: Any, sticker_set_name: Any) -> str:
+    value = str(title or "").strip()
+    generic = (
+        not value
+        or value.casefold().startswith("telegram gift")
+        or value.casefold() in {"gift", "star gift", "telegram"}
+        or not any(character.isalnum() for character in value)
+    )
+    if not generic:
+        return value[:160]
+
+    slug = str(sticker_set_name or "").strip()
+    compact = re.sub(r"[^a-z0-9]", "", slug.casefold())
+    if compact.startswith("plushpepe"):
+        return "Plush Pepe"
+    if not slug or compact.startswith("telegramgift"):
+        return "Подарок Telegram"
+
+    readable = re.sub(r"([a-z0-9])([A-Z])", r"\\1 \\2", slug)
+    readable = re.sub(r"([A-Z])([A-Z][a-z])", r"\\1 \\2", readable)
+    readable = re.sub(r"[_-]+", " ", readable)
+    readable = re.sub(r"\\s+", " ", readable).strip()
+    if readable and any(character.isalnum() for character in readable):
+        return readable[:160]
+    return "Подарок Telegram"
+
+
 async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | None:
     """Return merged Telegram catalogue metadata for one gift ID."""
     gift_id = str(gift_id or "").strip()
@@ -1282,7 +1309,7 @@ async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | Non
     video = bool(row["sticker_is_video"]) or bool(
         fallback_row is not None and fallback_row["sticker_is_video"]
     )
-    title = str(fallback_value("title") or "")
+    title = _gift_display_title(fallback_value("title"), fallback_value("sticker_set_name"))
     emoji = str(fallback_value("sticker_emoji") or "")
     sticker_available = primary_sticker_available or fallback_sticker_available
     return {
@@ -3907,6 +3934,12 @@ def build_messenger_router(
                               gifts_per_round,auction_start_date,upgrade_variants,background_json,
                               sticker_document_id,sticker_dc_id,sticker_size,position,synced_at
                        FROM telegram_mtproto_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_mtproto_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
                        ORDER BY is_available DESC, position ASC"""
                 )
                 rows = await cur.fetchall()
@@ -3919,6 +3952,12 @@ def build_messenger_router(
                               unique_gift_variant_count,background_json,publisher_chat_json,
                               position,synced_at
                        FROM telegram_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
                        ORDER BY is_available DESC, position ASC"""
                 )
                 rows = await cur.fetchall()
@@ -3934,7 +3973,7 @@ def build_messenger_router(
                     "id": gift_id,
                     "source": "telegram",
                     "catalog_source": "telegram_mtproto",
-                    "title": str(row["title"]),
+                    "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["stars"]),
                     "currency": "telegram_stars",
@@ -3985,7 +4024,7 @@ def build_messenger_router(
                     "id": gift_id,
                     "source": "telegram",
                     "catalog_source": "telegram_bot_api",
-                    "title": str(row["title"]),
+                    "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["star_count"]),
                     "currency": "telegram_stars",
@@ -4026,7 +4065,14 @@ def build_messenger_router(
                               total_count,remaining_count,personal_total_count,personal_remaining_count,
                               unique_gift_variant_count,background_json,publisher_chat_json,
                               synced_at
-                       FROM telegram_gift_catalog ORDER BY synced_at DESC"""
+                       FROM telegram_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
+                       ORDER BY synced_at DESC"""
                 )
                 historical_rows = await cur.fetchall()
                 for row in historical_rows:
@@ -4037,7 +4083,7 @@ def build_messenger_router(
                         "id": gift_id,
                         "source": "telegram",
                         "catalog_source": "telegram_bot_api",
-                        "title": str(row["title"]),
+                        "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                         "emoji": str(row["sticker_emoji"] or ""),
                         "star_count": int(row["star_count"]),
                         "currency": "telegram_stars",
@@ -4076,7 +4122,14 @@ def build_messenger_router(
                               per_user_total,per_user_remains,locked_until_date,auction_slug,
                               gifts_per_round,auction_start_date,upgrade_variants,background_json,
                               synced_at
-                       FROM telegram_mtproto_gift_catalog ORDER BY synced_at DESC"""
+                       FROM telegram_mtproto_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_mtproto_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
+                       ORDER BY synced_at DESC"""
                 )
                 historical_rows = await cur.fetchall()
                 for row in historical_rows:
@@ -4087,7 +4140,7 @@ def build_messenger_router(
                         "id": gift_id,
                         "source": "telegram",
                         "catalog_source": "telegram_mtproto",
-                        "title": str(row["title"]),
+                        "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                         "emoji": str(row["sticker_emoji"] or ""),
                         "star_count": int(row["stars"]),
                         "currency": "telegram_stars",
@@ -4265,16 +4318,31 @@ def build_messenger_router(
                         or sticker_mime == "application/x-tgsticker"
                         or sticker_mime.startswith("video/")
                     )
-                    preview_file_id = (
-                        str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
-                        if is_motion else ""
-                    ) or str(sticker_row["sticker_file_id"] or "").strip()
-                    content, media_type = await fetch_telegram_sticker(
-                        bot,
-                        preview_file_id,
-                        str(sticker_row["sticker_mime_type"] or ""),
-                    )
-                content, media_type = _normalize_gift_preview(content)
+                    preview_file_ids = []
+                    thumbnail_id = str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
+                    main_file_id = str(sticker_row["sticker_file_id"] or "").strip()
+                    if is_motion and thumbnail_id:
+                        preview_file_ids.append(thumbnail_id)
+                    if main_file_id and main_file_id not in preview_file_ids:
+                        preview_file_ids.append(main_file_id)
+                    if not preview_file_ids:
+                        continue
+                    normalized_preview = None
+                    for preview_file_id in preview_file_ids:
+                        try:
+                            candidate_bytes, candidate_mime = await fetch_telegram_sticker(
+                                bot,
+                                preview_file_id,
+                                str(sticker_row["sticker_mime_type"] or ""),
+                            )
+                            normalized_preview = _normalize_gift_preview(candidate_bytes)
+                            break
+                        except Exception:
+                            continue
+                    if normalized_preview is None:
+                        continue
+                    content, media_type = normalized_preview
+                content, media_type = _normalize_gift_preview(content) if catalog_source == "telegram_mtproto" else (content, media_type)
                 return Response(
                     content=content,
                     media_type=media_type,
@@ -5477,7 +5545,7 @@ def build_messenger_router(
             raise HTTPException(status_code=404, detail="Приглашение не найдено или отозвано")
         return {
             "channel_id": int(row["id"]),
-            "title": str(row["title"]),
+            "title": _gift_display_title(row["title"], row["sticker_set_name"]),
             "is_public": False,
             "owner_username": str(row["owner_username"] or ""),
         }
