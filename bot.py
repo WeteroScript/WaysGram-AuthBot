@@ -1288,7 +1288,7 @@ async def admin_labels_page() -> tuple[str, InlineKeyboardMarkup]:
         )])
     keyboard.append([("⬅️ В меню", "wgadm:home")])
     body = (
-        f"Метки WaysGram · шаблонов: {len(rows)}\\n"
+        f"Метки WaysGram · шаблонов: {len(rows)}\n"
         "Создайте метку один раз — она сохранится как шаблон для повторной выдачи."
     )
     return body, admin_keyboard(keyboard)
@@ -1308,8 +1308,8 @@ async def admin_label_card(label_id: int) -> tuple[str, InlineKeyboardMarkup] | 
     if row is None:
         return None
     body = (
-        f"Метка #{int(row['id'])}\\n\\n"
-        f"Текст: {row['label_text']}\\nЦвет: {row['color']}\\n"
+        f"Метка #{int(row['id'])}\n\n"
+        f"Текст: {row['label_text']}\nЦвет: {row['color']}\n"
         f"Назначений: {int(row['assigned_count'])}"
     )
     return body, admin_keyboard([
