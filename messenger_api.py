@@ -1768,6 +1768,22 @@ def build_messenger_router(
             await db.commit()
         return user
 
+    async def entity_labels(target_type: str, target_id: int) -> list[dict[str, str]]:
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT l.label_text AS text,l.color
+                   FROM waysgram_label_assignments a
+                   JOIN waysgram_labels l ON l.id=a.label_id
+                   WHERE a.target_type=? AND a.target_id=?
+                   ORDER BY a.assigned_at,a.id""",
+                (target_type, target_id),
+            )
+            return [
+                {"text": str(row["text"]), "color": str(row["color"])}
+                for row in await cur.fetchall()
+            ]
+
     def public_session_id(token_hash: str) -> str:
         return hashlib.sha256(
             ("waysgram-session-id:" + token_hash).encode("utf-8")
@@ -3402,6 +3418,7 @@ def build_messenger_router(
             )
             common_contacts = [dict(item) for item in await cur.fetchall()]
         profile = dict(row)
+        profile["labels"] = await entity_labels("account", user_id)
         metadata_by_id: dict[str, dict[str, Any] | None] = {}
         async with aiosqlite.connect(db_path()) as gift_db:
             gift_db.row_factory = aiosqlite.Row
@@ -3852,7 +3869,9 @@ def build_messenger_router(
         all: int = 0,
     ) -> dict[str, Any]:
         user = await current_user(authorization)
-        show_all = bool(all)
+        # The app storefront must never expose unlisted catalog entries, including
+        # to an administrator's personal WaysGram session. Admin editing lives in AuthBot.
+        show_all = False
         state = await ensure_telegram_gifts_fresh()
         source = str(state.get("source") or "telegram_bot_api")
         async with aiosqlite.connect(db_path()) as db:
@@ -5486,7 +5505,9 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         await require_channel_access(channel_id, int(user["telegram_id"]))
-        return await channel_row(channel_id)
+        channel = await channel_row(channel_id)
+        channel["labels"] = await entity_labels("channel", channel_id)
+        return channel
 
     @router.patch("/api/channels/{channel_id}")
     async def update_channel(
