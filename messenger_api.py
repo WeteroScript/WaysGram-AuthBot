@@ -5573,7 +5573,7 @@ def build_messenger_router(
             raise HTTPException(status_code=404, detail="Приглашение не найдено или отозвано")
         return {
             "channel_id": int(row["id"]),
-            "title": _gift_display_title(row["title"], row["sticker_set_name"]),
+            "title": str(row["title"]),
             "is_public": False,
             "owner_username": str(row["owner_username"] or ""),
         }
