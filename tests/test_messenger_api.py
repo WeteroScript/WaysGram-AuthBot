@@ -2782,15 +2782,11 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             # The storefront is sale-filtered, but the Android catalog must be able
             # to display every Telegram gift even before a WaysGram price is assigned.
             assert payload["count"] == 0
+            # The legacy all=1 switch is ignored; private admin inventory remains in AuthBot only.
             full_catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
             assert full_catalog.status_code == 200
-            assert full_catalog.json()["count"] == 1
-            assert full_catalog.json()["gifts"][0]["id"] == "gift_123"
-            assert full_catalog.json()["gifts"][0]["for_sale"] is False
-            with db_split.sqlite_connect(path) as db:
-                db.execute(
-                    "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('gift_123',40,3,0,1)"
-                )
+            assert full_catalog.json()["count"] == 0
+
             catalog = await client.get("/api/telegram/gifts", headers=auth)
             payload = catalog.json()
             assert payload["count"] == 1
