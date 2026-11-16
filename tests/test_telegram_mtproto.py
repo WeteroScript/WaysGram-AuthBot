@@ -7,6 +7,9 @@ import db_split
 import aiosqlite
 from pathlib import Path
 from types import SimpleNamespace
+from io import BytesIO
+
+from PIL import Image
 
 from messenger_api import init_messenger_storage
 from telegram_mtproto import TelegramMTProtoGiftCatalog
@@ -86,6 +89,45 @@ class FakeMTProtoClient:
     async def download_media(self, document, file=bytes):
         self.download_calls.append(document)
         return b"telegram-mtproto-sticker"
+
+
+def test_mtproto_preview_falls_back_to_a_smaller_valid_thumbnail() -> None:
+    class Thumb:
+        def __init__(self, width: int, height: int):
+            self.w = width
+            self.h = height
+
+    large = Thumb(512, 512)
+    small = Thumb(96, 96)
+    image_buffer = BytesIO()
+    Image.new("RGB", (8, 8), (90, 120, 160)).save(image_buffer, format="PNG")
+    png = image_buffer.getvalue()
+
+    class ThumbnailClient:
+        def __init__(self):
+            self.calls = []
+
+        async def download_media(self, document, file=bytes, thumb=None):
+            self.calls.append(thumb)
+            return b"not an image" if thumb is large else png
+
+    async def scenario() -> None:
+        client = ThumbnailClient()
+        document = SimpleNamespace(
+            mime_type="video/webm",
+            attributes=[DocumentAttributeSticker("🎁", "PlushPepe")],
+            thumbs=[large, small],
+        )
+        gift = SimpleNamespace(id=123456789, sticker=document)
+        provider = TelegramMTProtoGiftCatalog(client)
+        provider._gifts["123456789"] = gift
+
+        content, mime_type = await provider.download_sticker_preview("123456789")
+        assert content == png
+        assert mime_type == "image/png"
+        assert client.calls == [large, small]
+
+    asyncio.run(scenario())
 
 
 def test_mtproto_gift_name_uses_human_readable_sticker_pack_name(tmp_path: Path) -> None:
