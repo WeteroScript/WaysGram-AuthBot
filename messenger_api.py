@@ -3770,19 +3770,13 @@ def build_messenger_router(
                    VALUES('purchase',?,?,NULL,?,?)""",
                 (serial, title, uid, now),
             )
-            # Keep the gift receipt inside WaysGram history and route it to
-            # the actual recipient's DM. Self-purchases go to Saved Messages.
-            is_self_purchase = owner == uid
-            receipt_body = (
-                f"Вы приобрели коллекционный подарок «{title}»"
-                if is_self_purchase
-                else f"Вы отправили подарок «{title}»"
-            )
+            # Persist a structured gift-service event; Android renders the
+            # native-style action and collectible card from message_gifts.
             cur = await db.execute(
                 """INSERT INTO messages
                    (sender_telegram_id,recipient_telegram_id,body,created_at)
                    VALUES(?,?,?,?)""",
-                (uid, owner, receipt_body, now),
+                (uid, owner, "", now),
             )
             receipt_message_id = int(cur.lastrowid)
             await db.execute(
@@ -5075,7 +5069,8 @@ def build_messenger_router(
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 """SELECT l.id,l.serial_number,l.seller_telegram_id,l.price_grams,
-                          g.id AS gift_instance_id,g.gift_name,g.telegram_gift_id
+                          g.id AS gift_instance_id,g.gift_name,g.telegram_gift_id,
+                          g.upgrade_level,g.attributes_json
                    FROM gift_market_listings l
                    JOIN user_gifts g ON g.serial_number=l.serial_number
                    WHERE l.id=? AND l.status='active'
@@ -5151,17 +5146,29 @@ def build_messenger_router(
                 """INSERT INTO messages
                    (sender_telegram_id,recipient_telegram_id,body,created_at)
                    VALUES(?,?,?,?)""",
-                (buyer_id, buyer_id,
-                 f"Вы приобрели коллекционный подарок «{listing['gift_name']}»", now),
+                (buyer_id, buyer_id, "", now),
             )
             saved_message_id = int(cur.lastrowid)
+            try:
+                market_gift_attributes = json.loads(str(listing["attributes_json"] or "{}"))
+            except (TypeError, ValueError):
+                market_gift_attributes = {}
+            if not isinstance(market_gift_attributes, dict):
+                market_gift_attributes = {}
+            market_gift_attributes.update({
+                "event_type": "purchase",
+                "native_action": "star_gift_purchase",
+                "price_grams": price,
+                "currency": "grams",
+            })
             await db.execute(
                 """INSERT INTO message_gifts
                    (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
-                   VALUES(?,?,?,?,0,?)""",
+                   VALUES(?,?,?,?,?,?)""",
                 (saved_message_id, serial, str(listing["gift_name"]),
                  str(listing["telegram_gift_id"] or ""),
-                 json.dumps({"event_type": "purchase"}, separators=(",", ":"))),
+                 max(0, int(listing["upgrade_level"] or 0)),
+                 json.dumps(market_gift_attributes, ensure_ascii=False, separators=(",", ":"))),
             )
             await record_event(
                 db, "dm", saved_message_id, "new_message", buyer_id,
@@ -5183,6 +5190,7 @@ def build_messenger_router(
     async def upgrade_gift(
         serial_number: str,
         authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         uid = int(user["telegram_id"])
@@ -5190,9 +5198,15 @@ def build_messenger_router(
         if not GIFT_SERIAL_RE.fullmatch(serial):
             raise HTTPException(status_code=400, detail="Некорректный серийный номер подарка")
         now = int(time.time())
+        scope = f"/api/gifts/{serial}/upgrade"
+        descriptor = idempotency_descriptor(scope, {}, idempotency_key)
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
             cur = await db.execute(
                 """SELECT id,gift_name,telegram_gift_id,upgrade_level,attributes_json
                    FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?""",
@@ -5286,16 +5300,45 @@ def build_messenger_router(
                    VALUES('upgrade',?,?,?, ?,?)""",
                 (serial, str(gift["gift_name"]), uid, uid, now),
             )
+
+            # Update existing message attachments for this WaysGram gift.
+            # Purchase events remain persistent, but their gift card reflects
+            # the current collectible level and the same stable NFT traits.
+            cur = await db.execute(
+                "SELECT message_id,attributes_json FROM message_gifts WHERE serial_number=?",
+                (serial,),
+            )
+            attachments = await cur.fetchall()
+            for attachment in attachments:
+                try:
+                    message_attributes = json.loads(str(attachment["attributes_json"] or "{}"))
+                except (TypeError, ValueError):
+                    message_attributes = {}
+                if not isinstance(message_attributes, dict):
+                    message_attributes = {}
+                message_attributes.update(attributes)
+                await db.execute(
+                    """UPDATE message_gifts
+                       SET upgrade_level=?,attributes_json=? WHERE message_id=?""",
+                    (
+                        new_level,
+                        json.dumps(message_attributes, ensure_ascii=False, separators=(",", ":")),
+                        int(attachment["message_id"]),
+                    ),
+                )
+
+            result = {
+                "status": "upgraded",
+                "serial_number": serial,
+                "gift_name": str(gift["gift_name"]),
+                "upgrade_level": new_level,
+                "price_stars": price,
+                "stars_balance": new_balance,
+                "attributes": attributes,
+            }
+            await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
-        return {
-            "status": "upgraded",
-            "serial_number": serial,
-            "gift_name": str(gift["gift_name"]),
-            "upgrade_level": new_level,
-            "price_stars": price,
-            "stars_balance": new_balance,
-            "attributes": attributes,
-        }
+        return result
 
     @router.get("/api/channels")
     async def list_channels(authorization: str | None = Header(default=None)) -> dict[str, Any]:
