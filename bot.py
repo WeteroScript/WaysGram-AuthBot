@@ -1752,6 +1752,8 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
     return rows
 
 def telegram_gift_display_name(title: Any, sticker_set_name: Any, gift_id: str = "") -> str:
+    if str(gift_id or "").strip() == "5936013938331222567":
+        return "Plush Pepe"
     raw_title = str(title or "").strip()
     generic = (
         not raw_title
@@ -1763,7 +1765,8 @@ def telegram_gift_display_name(title: Any, sticker_set_name: Any, gift_id: str =
         return raw_title[:160]
 
     slug = str(sticker_set_name or "").strip()
-    if slug.casefold().startswith("plushpepe"):
+    compact_slug = "".join(character for character in slug.casefold() if character.isalnum())
+    if compact_slug.startswith("plushpepe"):
         return "Plush Pepe"
     if slug:
         readable = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", slug)
