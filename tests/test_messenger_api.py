@@ -2676,6 +2676,13 @@ def test_telegram_gift_purchases_create_cards_in_favorites_and_recipient_chat(ap
     run(scenario())
 
 
+def test_gift_display_title_uses_real_sticker_set_name() -> None:
+    assert messenger_api._gift_display_title("Telegram Gift 123", "PlushPepe") == "Plush Pepe"
+    assert messenger_api._gift_display_title("", "GoldenDuck") == "Golden Duck"
+    assert messenger_api._gift_display_title("Original Gift Name", "SomeSet") == "Original Gift Name"
+    assert messenger_api._gift_display_title("🎁", "TelegramGifts") == "Подарок Telegram"
+
+
 def test_assigned_labels_are_exposed_on_account_and_channel(api_env) -> None:
     path, _auth_store, _fake_bot, app = api_env
     add_account(api_env, 87701, "label_owner")
@@ -2799,7 +2806,7 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert gift["remaining"] == 3
             assert gift["telegram_star_count"] == 25
             assert gift["id"] == "gift_123"
-            assert gift["title"] == "🎁"
+            assert gift["title"] == "Подарок Telegram"
             assert gift["star_count"] == 25
             assert gift["upgrade_star_count"] == 100
             assert gift["is_premium"] is True
