@@ -84,12 +84,41 @@ def _sticker_metadata(document: Any) -> dict[str, Any]:
     }
 
 
+def _gift_display_name(title: Any, sticker_set_name: Any) -> str:
+    value = str(title or "").strip()
+    if value and not value.casefold().startswith("telegram gift") and value.casefold() not in {
+        "gift", "star gift", "telegram"
+    } and any(character.isalnum() for character in value):
+        return value[:160]
+
+    slug = str(sticker_set_name or "").strip()
+    if slug.casefold().startswith("plushpepe"):
+        return "Plush Pepe"
+    if not slug:
+        return "Подарок Telegram"
+    slug = slug.replace("_", " ").replace("-", " ").strip()
+    words = []
+    current = ""
+    for character in slug:
+        if character.isupper() and current and current[-1].islower():
+            words.append(current)
+            current = character
+        else:
+            current += character
+    if current:
+        words.append(current)
+    readable = " ".join(words).strip()
+    if readable.casefold().startswith("telegram gift"):
+        readable = readable[len("telegram gift"):].strip()
+    return readable[:160] if readable else "Подарок Telegram"
+
+
 def _gift_payload(gift: Any, position: int, synced_at: int) -> dict[str, Any]:
     document = _value(gift, "sticker")
     sticker = _sticker_metadata(document)
     gift_id = _int_value(gift, "id")
     emoji = sticker["emoji"]
-    title = str(_value(gift, "title", "") or emoji or "Подарок Telegram")
+    title = _gift_display_name(_value(gift, "title", ""), sticker["set_name"])
     return {
         "gift_id": str(gift_id),
         "title": title[:160],
@@ -304,7 +333,7 @@ class TelegramMTProtoGiftCatalog:
             }
 
     async def download_sticker_preview(self, gift_id: str) -> tuple[bytes, str]:
-        """Download the largest still thumbnail; Android consumes static image bitmaps."""
+        """Try available still thumbnails from largest to smallest."""
         key = str(gift_id)
         cache_key = "preview:" + key
         cached = self._media_cache.get(cache_key)
@@ -318,32 +347,49 @@ class TelegramMTProtoGiftCatalog:
         document = _value(gift, "sticker")
         metadata = _sticker_metadata(document)
         thumbnails = list(_value(document, "thumbs", []) or [])
-        image_thumbnails = [
+        candidates = [
             thumb for thumb in thumbnails
             if "VideoSize" not in type(thumb).__name__
             and "PhotoPathSize" not in type(thumb).__name__
         ]
-        if image_thumbnails:
-            thumb = max(
-                image_thumbnails,
-                key=lambda value: (
-                    (_int_value(value, "w") or 0) * (_int_value(value, "h") or 0)
-                ),
-            )
-            payload = await self.client.download_media(document, file=bytes, thumb=thumb)
+        candidates.sort(
+            key=lambda value: (
+                (_int_value(value, "w") or 0) * (_int_value(value, "h") or 0)
+            ),
+            reverse=True,
+        )
+        content = b""
+        mime_type = ""
+        for thumb in candidates:
+            try:
+                payload = await self.client.download_media(document, file=bytes, thumb=thumb)
+            except Exception:
+                continue
             if hasattr(payload, "getvalue"):
                 payload = payload.getvalue()
             if not isinstance(payload, (bytes, bytearray)) or not payload:
-                raise RuntimeError("MTProto did not return a static gift thumbnail")
-            content = bytes(payload)
-            mime_type = "image/jpeg"
-        elif metadata["is_animated"] or metadata["is_video"]:
-            raise RuntimeError("Animated Telegram gift has no static thumbnail")
-        else:
+                continue
+            candidate = bytes(payload)
+            if len(candidate) > MAX_STICKER_BYTES:
+                continue
+            if candidate.startswith(bytes.fromhex("89504E470D0A1A0A")):
+                content, mime_type = candidate, "image/png"
+                break
+            if candidate.startswith(bytes.fromhex("FFD8FF")):
+                content, mime_type = candidate, "image/jpeg"
+                break
+            if candidate.startswith((b"GIF87a", b"GIF89a")):
+                content, mime_type = candidate, "image/gif"
+                break
+            if len(candidate) >= 12 and candidate[:4] == b"RIFF" and candidate[8:12] == b"WEBP":
+                content, mime_type = candidate, "image/webp"
+                break
+
+        if not content:
+            if metadata["is_animated"] or metadata["is_video"]:
+                raise RuntimeError("Animated Telegram gift has no decodable still thumbnail")
             return await self.download_sticker(key)
 
-        if len(content) > MAX_STICKER_BYTES:
-            raise ValueError("Telegram gift thumbnail exceeds the supported size")
         result = (content, mime_type)
         self._media_cache[cache_key] = result
         while len(self._media_cache) > MAX_STICKER_CACHE_ITEMS:
