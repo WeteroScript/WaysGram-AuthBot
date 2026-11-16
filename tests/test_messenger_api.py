@@ -2676,6 +2676,53 @@ def test_telegram_gift_purchases_create_cards_in_favorites_and_recipient_chat(ap
     run(scenario())
 
 
+def test_assigned_labels_are_exposed_on_account_and_channel(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 87701, "label_owner")
+    add_account(api_env, 87702, "label_target")
+    add_session(path, 87701, "label-owner-session")
+    add_session(path, 87702, "label-target-session")
+
+    now = 1_800_000_000
+    with db_split.sqlite_connect(path) as db:
+        cur = db.execute(
+            "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES(?,?,?,?)",
+            ("labelled_channel", "Labelled Channel", 87701, now),
+        )
+        channel_id = int(cur.lastrowid)
+        cur = db.execute(
+            "INSERT INTO waysgram_labels(label_text,color,created_by,created_at) VALUES(?,?,?,?)",
+            ("Official", "#1769AA", 87701, now),
+        )
+        label_id = int(cur.lastrowid)
+        db.execute(
+            """INSERT INTO waysgram_label_assignments
+               (label_id,target_type,target_id,assigned_by,assigned_at)
+               VALUES(?,?,?,?,?)""",
+            (label_id, "account", 87702, 87701, now),
+        )
+        db.execute(
+            """INSERT INTO waysgram_label_assignments
+               (label_id,target_type,target_id,assigned_by,assigned_at)
+               VALUES(?,?,?,?,?)""",
+            (label_id, "channel", channel_id, 87701, now),
+        )
+        db.commit()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            viewer = {"Authorization": "Bearer label-owner-session"}
+            profile = await client.get("/api/users/87702", headers=viewer)
+            assert profile.status_code == 200
+            assert profile.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+            channel = await client.get(f"/api/channels/{channel_id}", headers=viewer)
+            assert channel.status_code == 200
+            assert channel.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+    run(scenario())
+
+
 def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> None:
     path, _auth_store, fake_bot, app = api_env
     add_account(api_env, 87001, "telegram_gift_user")
