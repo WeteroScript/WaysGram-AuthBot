@@ -4226,7 +4226,13 @@ def build_messenger_router(
                     bot = bot_provider()
                     if bot is None:
                         continue
-                    is_motion = bool(sticker_row["sticker_is_animated"]) or bool(sticker_row["sticker_is_video"])
+                    sticker_mime = str(sticker_row["sticker_mime_type"] or "").lower()
+                    is_motion = (
+                        bool(sticker_row["sticker_is_animated"])
+                        or bool(sticker_row["sticker_is_video"])
+                        or sticker_mime == "application/x-tgsticker"
+                        or sticker_mime.startswith("video/")
+                    )
                     preview_file_id = (
                         str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
                         if is_motion else ""
