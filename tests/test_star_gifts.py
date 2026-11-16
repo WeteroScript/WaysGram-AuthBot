@@ -121,6 +121,17 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert mine[0]["sticker_available"] is True
             assert mine[0]["sticker_url"] == "/api/telegram/gifts/g1/sticker"
             assert mine[0]["gift_emoji"] == "🎁"
+            assert mine[0]["telegram_gift"]["emoji"] == "🎁"
+            conn = db_split.sqlite_connect(path)
+            try:
+                stored_snapshot = conn.execute(
+                    "SELECT gift_emoji,telegram_gift_metadata_json FROM user_gifts WHERE serial_number=?",
+                    (mine[0]["serial_number"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert stored_snapshot[0] == "🎁"
+            assert json.loads(stored_snapshot[1])["emoji"] == "🎁"
             assert mine[0]["telegram_gift"]["catalog_source"] == "telegram_gift_catalog"
             assert mine[0]["telegram_gift"]["emoji"] == "🎁"
             assert mine[0]["telegram_gift"]["upgrade_star_count"] == 10
@@ -921,6 +932,58 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["gift_emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["upgrade_star_count"] == 10
+            assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
+            assert receipt["gift_emoji"] == "🎁"
+
+    run(scenario())
+
+
+def test_mtproto_metadata_falls_back_to_bot_api_emoji_for_owned_gifts(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=35, supply=1)
+        async with await client_for(app) as client:
+            purchased = await client.post(
+                "/api/telegram/gifts/g1/purchase", headers=headers(101), json={}
+            )
+            assert purchased.status_code == 201
+            serial = purchased.json()["gift"]["serial_number"]
+
+            conn = db_split.sqlite_connect(path)
+            try:
+                conn.execute(
+                    """INSERT OR REPLACE INTO telegram_mtproto_gift_catalog
+                       (gift_id,title,sticker_emoji,sticker_document_id,source_payload,synced_at)
+                       VALUES('g1','Gift title','',987654,'{}',?)""",
+                    (int(time.time()),),
+                )
+                conn.execute(
+                    "UPDATE telegram_gift_sync_state SET source='telegram_mtproto' WHERE id=1"
+                )
+                conn.execute(
+                    """UPDATE user_gifts
+                       SET gift_emoji='',telegram_gift_metadata_json='{}'
+                       WHERE serial_number=?""",
+                    (serial,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert inventory[0]["gift_emoji"] == "🎁"
+            assert inventory[0]["telegram_gift"]["emoji"] == "🎁"
+            assert inventory[0]["sticker_available"] is True
+            assert inventory[0]["sticker_url"] == "/api/telegram/gifts/g1/sticker"
+
+            saved = await client.get("/api/messages?with=101", headers=headers(101))
+            receipt = next(
+                item for item in saved.json()["messages"]
+                if item.get("gift_serial_number") == serial
+            )
+            assert receipt["gift_emoji"] == "🎁"
+            assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
 
     run(scenario())
 
