@@ -2786,6 +2786,10 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             full_catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
             assert full_catalog.status_code == 200
             assert full_catalog.json()["count"] == 0
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('gift_123',40,3,0,1)"
+                )
 
             catalog = await client.get("/api/telegram/gifts", headers=auth)
             payload = catalog.json()
