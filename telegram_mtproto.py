@@ -16,6 +16,7 @@ from telethon import functions
 
 MAX_STICKER_BYTES = 20 * 1024 * 1024
 MAX_STICKER_CACHE_ITEMS = 48
+PLUSH_PEPE_GIFT_ID = "5936013938331222567"
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -87,7 +88,10 @@ def _sticker_metadata(document: Any) -> dict[str, Any]:
     }
 
 
-def _gift_display_name(title: Any, sticker_set_name: Any) -> str:
+def _gift_display_name(title: Any, sticker_set_name: Any, gift_id: Any = "") -> str:
+    if str(gift_id or "").strip() == PLUSH_PEPE_GIFT_ID:
+        return "Plush Pepe"
+
     value = str(title or "").strip()
     if value and not value.casefold().startswith("telegram gift") and value.casefold() not in {
         "gift", "star gift", "telegram"
@@ -95,7 +99,8 @@ def _gift_display_name(title: Any, sticker_set_name: Any) -> str:
         return value[:160]
 
     slug = str(sticker_set_name or "").strip()
-    if slug.casefold().startswith("plushpepe"):
+    compact_slug = "".join(character for character in slug.casefold() if character.isalnum())
+    if compact_slug.startswith("plushpepe"):
         return "Plush Pepe"
     if not slug:
         return "Подарок Telegram"
@@ -121,7 +126,7 @@ def _gift_payload(gift: Any, position: int, synced_at: int) -> dict[str, Any]:
     sticker = _sticker_metadata(document)
     gift_id = _int_value(gift, "id")
     emoji = sticker["emoji"]
-    title = _gift_display_name(_value(gift, "title", ""), sticker["set_name"])
+    title = _gift_display_name(_value(gift, "title", ""), sticker["set_name"], gift_id)
     return {
         "gift_id": str(gift_id),
         "title": title[:160],
@@ -201,6 +206,7 @@ class TelegramMTProtoGiftCatalog:
     def __init__(self, client: Any):
         self.client = client
         self._sync_lock = asyncio.Lock()
+        self._media_load_lock = asyncio.Lock()
         self._gifts: dict[str, Any] = {}
         self._media_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
 
@@ -335,6 +341,30 @@ class TelegramMTProtoGiftCatalog:
                 "source": "telegram_mtproto",
             }
 
+    async def _ensure_gift_documents(self) -> None:
+        """Rehydrate process-local Telegram sticker documents after a restart."""
+        if self._gifts:
+            return
+        async with self._media_load_lock:
+            if self._gifts:
+                return
+            response = await self.client(
+                functions.payments.GetStarGiftsRequest(hash=-1)
+            )
+            if type(response).__name__ == "StarGiftsNotModified":
+                raise LookupError("Telegram returned no gift documents for a cold cache")
+            gifts = _value(response, "gifts")
+            if not isinstance(gifts, (list, tuple)):
+                raise RuntimeError("MTProto did not return a gift document list")
+            loaded = {
+                str(_value(gift, "id")): gift
+                for gift in gifts
+                if _int_value(gift, "id") is not None and _value(gift, "sticker") is not None
+            }
+            if not loaded:
+                raise LookupError("Telegram gift documents are unavailable")
+            self._gifts = loaded
+
     async def download_sticker_preview(self, gift_id: str) -> tuple[bytes, str]:
         """Try available still thumbnails from largest to smallest."""
         key = str(gift_id)
@@ -344,6 +374,7 @@ class TelegramMTProtoGiftCatalog:
             self._media_cache.move_to_end(cache_key)
             return cached
 
+        await self._ensure_gift_documents()
         gift = self._gifts.get(key)
         if gift is None:
             raise LookupError("Telegram gift is not present in the current MTProto cache")
@@ -411,6 +442,7 @@ class TelegramMTProtoGiftCatalog:
             self._media_cache.move_to_end(key)
             return cached
 
+        await self._ensure_gift_documents()
         gift = self._gifts.get(key)
         if gift is None:
             raise LookupError("Telegram gift is not present in the current MTProto cache")

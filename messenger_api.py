@@ -1191,7 +1191,9 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
     return result
 
 
-def _gift_display_title(title: Any, sticker_set_name: Any) -> str:
+def _gift_display_title(title: Any, sticker_set_name: Any, gift_id: str = "") -> str:
+    if str(gift_id or "").strip() == "5936013938331222567":
+        return "Plush Pepe"
     value = str(title or "").strip()
     generic = (
         not value
@@ -1317,7 +1319,7 @@ async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | Non
     video = bool(row["sticker_is_video"]) or bool(
         fallback_row is not None and fallback_row["sticker_is_video"]
     )
-    title = _gift_display_title(fallback_value("title"), fallback_value("sticker_set_name"))
+    title = _gift_display_title(fallback_value("title"), fallback_value("sticker_set_name"), gift_id)
     emoji = str(fallback_value("sticker_emoji") or "")
     sticker_available = primary_sticker_available or fallback_sticker_available
     return {
@@ -3981,7 +3983,7 @@ def build_messenger_router(
                     "id": gift_id,
                     "source": "telegram",
                     "catalog_source": "telegram_mtproto",
-                    "title": _gift_display_title(row["title"], row["sticker_set_name"]),
+                    "title": _gift_display_title(row["title"], row["sticker_set_name"], gift_id),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["stars"]),
                     "currency": "telegram_stars",
@@ -4032,7 +4034,7 @@ def build_messenger_router(
                     "id": gift_id,
                     "source": "telegram",
                     "catalog_source": "telegram_bot_api",
-                    "title": _gift_display_title(row["title"], row["sticker_set_name"]),
+                    "title": _gift_display_title(row["title"], row["sticker_set_name"], gift_id),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["star_count"]),
                     "currency": "telegram_stars",
@@ -4091,7 +4093,7 @@ def build_messenger_router(
                         "id": gift_id,
                         "source": "telegram",
                         "catalog_source": "telegram_bot_api",
-                        "title": _gift_display_title(row["title"], row["sticker_set_name"]),
+                        "title": _gift_display_title(row["title"], row["sticker_set_name"], gift_id),
                         "emoji": str(row["sticker_emoji"] or ""),
                         "star_count": int(row["star_count"]),
                         "currency": "telegram_stars",
@@ -4148,7 +4150,7 @@ def build_messenger_router(
                         "id": gift_id,
                         "source": "telegram",
                         "catalog_source": "telegram_mtproto",
-                        "title": _gift_display_title(row["title"], row["sticker_set_name"]),
+                        "title": _gift_display_title(row["title"], row["sticker_set_name"], gift_id),
                         "emoji": str(row["sticker_emoji"] or ""),
                         "star_count": int(row["stars"]),
                         "currency": "telegram_stars",

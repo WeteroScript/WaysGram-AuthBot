@@ -12,7 +12,7 @@ from io import BytesIO
 from PIL import Image
 
 from messenger_api import init_messenger_storage
-from telegram_mtproto import TelegramMTProtoGiftCatalog
+from telegram_mtproto import TelegramMTProtoGiftCatalog, _gift_display_name
 
 
 class DocumentAttributeSticker:
@@ -82,13 +82,35 @@ class FakeMTProtoClient:
 
     async def __call__(self, request):
         self.requests.append(request)
-        if self.not_modified:
+        if self.not_modified and getattr(request, "hash", 0) != -1:
             return type("StarGiftsNotModified", (), {})()
         return SimpleNamespace(gifts=self.gifts)
 
     async def download_media(self, document, file=bytes):
         self.download_calls.append(document)
         return b"telegram-mtproto-sticker"
+
+
+
+def test_plush_pepe_name_resolves_from_gift_id_and_normalized_slug() -> None:
+    assert _gift_display_name("Telegram Gift 123", "", "5936013938331222567") == "Plush Pepe"
+    assert _gift_display_name("Telegram Gift 123", "plush_pepe") == "Plush Pepe"
+
+
+def test_mtproto_download_rehydrates_gift_documents_after_process_restart() -> None:
+    async def scenario() -> None:
+        client = FakeMTProtoClient()
+        client.not_modified = True
+        provider = TelegramMTProtoGiftCatalog(client)
+
+        sticker, mime_type = await provider.download_sticker("123456789")
+
+        assert sticker == b"telegram-mtproto-sticker"
+        assert mime_type == "image/webp"
+        assert [request.hash for request in client.requests] == [-1]
+        assert "123456789" in provider._gifts
+
+    asyncio.run(scenario())
 
 
 def test_mtproto_preview_returns_raw_animation_when_still_thumbnails_fail() -> None:
