@@ -6,6 +6,9 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
+from io import BytesIO
+
+from PIL import Image, UnidentifiedImageError
 
 import aiosqlite
 from telethon import functions
@@ -371,6 +374,11 @@ class TelegramMTProtoGiftCatalog:
                 continue
             candidate = bytes(payload)
             if len(candidate) > MAX_STICKER_BYTES:
+                continue
+            try:
+                with Image.open(BytesIO(candidate)) as image:
+                    image.verify()
+            except (UnidentifiedImageError, OSError, ValueError):
                 continue
             if candidate.startswith(bytes.fromhex("89504E470D0A1A0A")):
                 content, mime_type = candidate, "image/png"
