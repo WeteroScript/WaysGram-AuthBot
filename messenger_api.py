@@ -650,6 +650,24 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON online_scheduled_messages(status,created_at,id);
             CREATE INDEX IF NOT EXISTS idx_online_scheduled_owner
                 ON online_scheduled_messages(sender_telegram_id,recipient_telegram_id,status);
+            CREATE TABLE IF NOT EXISTS waysgram_labels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label_text TEXT NOT NULL CHECK(length(trim(label_text)) BETWEEN 1 AND 32),
+                color TEXT NOT NULL CHECK(length(color)=7),
+                created_by INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS waysgram_label_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label_id INTEGER NOT NULL REFERENCES waysgram_labels(id) ON DELETE CASCADE,
+                target_type TEXT NOT NULL CHECK(target_type IN ('account','channel')),
+                target_id INTEGER NOT NULL,
+                assigned_by INTEGER NOT NULL,
+                assigned_at INTEGER NOT NULL,
+                UNIQUE(label_id,target_type,target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_waysgram_label_assignments_target
+                ON waysgram_label_assignments(target_type,target_id);
             CREATE TABLE IF NOT EXISTS telegram_gift_prices (
                 gift_id TEXT PRIMARY KEY,
                 price_stars INTEGER NOT NULL DEFAULT 0 CHECK(price_stars >= 0),
