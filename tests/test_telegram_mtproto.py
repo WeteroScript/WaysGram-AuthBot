@@ -7,6 +7,9 @@ import db_split
 import aiosqlite
 from pathlib import Path
 from types import SimpleNamespace
+from io import BytesIO
+
+from PIL import Image
 
 from messenger_api import init_messenger_storage
 from telegram_mtproto import TelegramMTProtoGiftCatalog
@@ -86,6 +89,108 @@ class FakeMTProtoClient:
     async def download_media(self, document, file=bytes):
         self.download_calls.append(document)
         return b"telegram-mtproto-sticker"
+
+
+def test_mtproto_preview_returns_raw_animation_when_still_thumbnails_fail() -> None:
+    class Thumb:
+        w = 256
+        h = 256
+
+    class AnimatedClient:
+        def __init__(self):
+            self.calls = []
+
+        async def download_media(self, document, file=bytes, thumb=None):
+            self.calls.append(thumb)
+            if thumb is not None:
+                return b"not an image"
+            return b"raw-tgs-animation"
+
+    async def scenario() -> None:
+        client = AnimatedClient()
+        document = SimpleNamespace(
+            id=9002,
+            dc_id=2,
+            size=32,
+            mime_type="application/x-tgsticker",
+            attributes=[
+                DocumentAttributeSticker("🎁", "PlushPepe"),
+                type("DocumentAttributeAnimated", (), {})(),
+            ],
+            thumbs=[Thumb()],
+        )
+        gift = SimpleNamespace(id=123456790, sticker=document)
+        provider = TelegramMTProtoGiftCatalog(client)
+        provider._gifts["123456790"] = gift
+
+        content, mime_type = await provider.download_sticker_preview("123456790")
+        assert content == b"raw-tgs-animation"
+        assert mime_type == "application/x-tgsticker"
+        assert client.calls == [document.thumbs[0], None]
+
+    asyncio.run(scenario())
+
+
+def test_mtproto_preview_falls_back_to_a_smaller_valid_thumbnail() -> None:
+    class Thumb:
+        def __init__(self, width: int, height: int):
+            self.w = width
+            self.h = height
+
+    large = Thumb(512, 512)
+    small = Thumb(96, 96)
+    image_buffer = BytesIO()
+    Image.new("RGB", (8, 8), (90, 120, 160)).save(image_buffer, format="PNG")
+    png = image_buffer.getvalue()
+
+    class ThumbnailClient:
+        def __init__(self):
+            self.calls = []
+
+        async def download_media(self, document, file=bytes, thumb=None):
+            self.calls.append(thumb)
+            return b"not an image" if thumb is large else png
+
+    async def scenario() -> None:
+        client = ThumbnailClient()
+        document = SimpleNamespace(
+            mime_type="video/webm",
+            attributes=[DocumentAttributeSticker("🎁", "PlushPepe")],
+            thumbs=[large, small],
+        )
+        gift = SimpleNamespace(id=123456789, sticker=document)
+        provider = TelegramMTProtoGiftCatalog(client)
+        provider._gifts["123456789"] = gift
+
+        content, mime_type = await provider.download_sticker_preview("123456789")
+        assert content == png
+        assert mime_type == "image/png"
+        assert client.calls == [large, small]
+
+    asyncio.run(scenario())
+
+
+def test_mtproto_gift_name_uses_human_readable_sticker_pack_name(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "waysgram.sqlite3"
+        async with aiosqlite.connect(database) as db:
+            await db.execute("CREATE TABLE user_gifts (id INTEGER PRIMARY KEY, serial_number TEXT)")
+            await db.execute("CREATE TABLE gift_transactions (serial_number TEXT)")
+            await db.commit()
+        await init_messenger_storage(database)
+        client = FakeMTProtoClient()
+        client.gift.title = "Telegram Gift 123"
+        client.gift.sticker.attributes[0].stickerset.short_name = "PlushPepe"
+        provider = TelegramMTProtoGiftCatalog(client)
+
+        await provider.sync(database)
+        with db_split.sqlite_connect(database) as db:
+            row = db.execute(
+                "SELECT title,sticker_set_name FROM telegram_mtproto_gift_catalog WHERE gift_id='123456789'"
+            ).fetchone()
+        assert row == ("Plush Pepe", "PlushPepe")
+
+    asyncio.run(scenario())
 
 
 def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Path) -> None:

@@ -73,6 +73,8 @@ MESSENGER_TABLES = frozenset(
         "auction_bids",
         "gift_collectible_auctions",
         "gift_collectible_auction_bids",
+        "waysgram_labels",
+        "waysgram_label_assignments",
         "economy_transactions",
         "telegram_gift_catalog",
         "telegram_gift_prices",

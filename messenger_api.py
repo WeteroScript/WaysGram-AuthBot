@@ -650,6 +650,24 @@ async def init_messenger_storage(database_path: Path) -> None:
                 ON online_scheduled_messages(status,created_at,id);
             CREATE INDEX IF NOT EXISTS idx_online_scheduled_owner
                 ON online_scheduled_messages(sender_telegram_id,recipient_telegram_id,status);
+            CREATE TABLE IF NOT EXISTS waysgram_labels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label_text TEXT NOT NULL CHECK(length(trim(label_text)) BETWEEN 1 AND 32),
+                color TEXT NOT NULL CHECK(length(color)=7),
+                created_by INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS waysgram_label_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label_id INTEGER NOT NULL REFERENCES waysgram_labels(id) ON DELETE CASCADE,
+                target_type TEXT NOT NULL CHECK(target_type IN ('account','channel')),
+                target_id INTEGER NOT NULL,
+                assigned_by INTEGER NOT NULL,
+                assigned_at INTEGER NOT NULL,
+                UNIQUE(label_id,target_type,target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_waysgram_label_assignments_target
+                ON waysgram_label_assignments(target_type,target_id);
             CREATE TABLE IF NOT EXISTS telegram_gift_prices (
                 gift_id TEXT PRIMARY KEY,
                 price_stars INTEGER NOT NULL DEFAULT 0 CHECK(price_stars >= 0),
@@ -1173,6 +1191,41 @@ def _public_account(row: Any, include_phone: bool = False) -> dict[str, Any]:
     return result
 
 
+def _gift_display_title(title: Any, sticker_set_name: Any) -> str:
+    value = str(title or "").strip()
+    generic = (
+        not value
+        or value.casefold().startswith("telegram gift")
+        or value.casefold() in {"gift", "star gift", "telegram"}
+        or not any(character.isalnum() for character in value)
+    )
+    if not generic:
+        return value[:160]
+
+    slug = str(sticker_set_name or "").strip()
+    compact = "".join(character for character in slug.casefold() if character.isalnum())
+    if compact.startswith("plushpepe"):
+        return "Plush Pepe"
+    if not slug or compact.startswith("telegramgift"):
+        return "Подарок Telegram"
+
+    slug = slug.replace("_", " ").replace("-", " ").strip()
+    words: list[str] = []
+    current = ""
+    for character in slug:
+        if character.isupper() and current and current[-1].islower():
+            words.append(current)
+            current = character
+        else:
+            current += character
+    if current:
+        words.append(current)
+    readable = " ".join(words).strip()
+    if readable and any(character.isalnum() for character in readable):
+        return readable[:160]
+    return "Подарок Telegram"
+
+
 async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | None:
     """Return merged Telegram catalogue metadata for one gift ID."""
     gift_id = str(gift_id or "").strip()
@@ -1264,7 +1317,7 @@ async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | Non
     video = bool(row["sticker_is_video"]) or bool(
         fallback_row is not None and fallback_row["sticker_is_video"]
     )
-    title = str(fallback_value("title") or "")
+    title = _gift_display_title(fallback_value("title"), fallback_value("sticker_set_name"))
     emoji = str(fallback_value("sticker_emoji") or "")
     sticker_available = primary_sticker_available or fallback_sticker_available
     return {
@@ -1767,6 +1820,22 @@ def build_messenger_router(
             )
             await db.commit()
         return user
+
+    async def entity_labels(target_type: str, target_id: int) -> list[dict[str, str]]:
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT l.label_text AS text,l.color
+                   FROM waysgram_label_assignments a
+                   JOIN waysgram_labels l ON l.id=a.label_id
+                   WHERE a.target_type=? AND a.target_id=?
+                   ORDER BY a.assigned_at,a.id""",
+                (target_type, target_id),
+            )
+            return [
+                {"text": str(row["text"]), "color": str(row["color"])}
+                for row in await cur.fetchall()
+            ]
 
     def public_session_id(token_hash: str) -> str:
         return hashlib.sha256(
@@ -2935,6 +3004,7 @@ def build_messenger_router(
             if re.fullmatch(r"\+[1-9]\d{7,14}", number):
                 result["phone"] = number
         result["is_admin"] = is_admin_user(user)
+        result["labels"] = await entity_labels("account", int(user["telegram_id"]))
         return result
 
     @router.put("/api/me/avatar")
@@ -3402,6 +3472,7 @@ def build_messenger_router(
             )
             common_contacts = [dict(item) for item in await cur.fetchall()]
         profile = dict(row)
+        profile["labels"] = await entity_labels("account", user_id)
         metadata_by_id: dict[str, dict[str, Any] | None] = {}
         async with aiosqlite.connect(db_path()) as gift_db:
             gift_db.row_factory = aiosqlite.Row
@@ -3852,7 +3923,9 @@ def build_messenger_router(
         all: int = 0,
     ) -> dict[str, Any]:
         user = await current_user(authorization)
-        show_all = bool(all)
+        # The app storefront must never expose unlisted catalog entries, including
+        # to an administrator's personal WaysGram session. Admin editing lives in AuthBot.
+        show_all = False
         state = await ensure_telegram_gifts_fresh()
         source = str(state.get("source") or "telegram_bot_api")
         async with aiosqlite.connect(db_path()) as db:
@@ -3869,6 +3942,12 @@ def build_messenger_router(
                               gifts_per_round,auction_start_date,upgrade_variants,background_json,
                               sticker_document_id,sticker_dc_id,sticker_size,position,synced_at
                        FROM telegram_mtproto_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_mtproto_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
                        ORDER BY is_available DESC, position ASC"""
                 )
                 rows = await cur.fetchall()
@@ -3881,6 +3960,12 @@ def build_messenger_router(
                               unique_gift_variant_count,background_json,publisher_chat_json,
                               position,synced_at
                        FROM telegram_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
                        ORDER BY is_available DESC, position ASC"""
                 )
                 rows = await cur.fetchall()
@@ -3896,7 +3981,7 @@ def build_messenger_router(
                     "id": gift_id,
                     "source": "telegram",
                     "catalog_source": "telegram_mtproto",
-                    "title": str(row["title"]),
+                    "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["stars"]),
                     "currency": "telegram_stars",
@@ -3947,7 +4032,7 @@ def build_messenger_router(
                     "id": gift_id,
                     "source": "telegram",
                     "catalog_source": "telegram_bot_api",
-                    "title": str(row["title"]),
+                    "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                     "emoji": str(row["sticker_emoji"] or ""),
                     "star_count": int(row["star_count"]),
                     "currency": "telegram_stars",
@@ -3988,7 +4073,14 @@ def build_messenger_router(
                               total_count,remaining_count,personal_total_count,personal_remaining_count,
                               unique_gift_variant_count,background_json,publisher_chat_json,
                               synced_at
-                       FROM telegram_gift_catalog ORDER BY synced_at DESC"""
+                       FROM telegram_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
+                       ORDER BY synced_at DESC"""
                 )
                 historical_rows = await cur.fetchall()
                 for row in historical_rows:
@@ -3999,7 +4091,7 @@ def build_messenger_router(
                         "id": gift_id,
                         "source": "telegram",
                         "catalog_source": "telegram_bot_api",
-                        "title": str(row["title"]),
+                        "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                         "emoji": str(row["sticker_emoji"] or ""),
                         "star_count": int(row["star_count"]),
                         "currency": "telegram_stars",
@@ -4038,7 +4130,14 @@ def build_messenger_router(
                               per_user_total,per_user_remains,locked_until_date,auction_slug,
                               gifts_per_round,auction_start_date,upgrade_variants,background_json,
                               synced_at
-                       FROM telegram_mtproto_gift_catalog ORDER BY synced_at DESC"""
+                       FROM telegram_mtproto_gift_catalog
+                       WHERE EXISTS (
+                           SELECT 1 FROM telegram_gift_prices p
+                           WHERE p.gift_id=telegram_mtproto_gift_catalog.gift_id
+                             AND p.price_stars>0
+                             AND (p.supply>=2000000000 OR p.supply>p.sold)
+                       )
+                       ORDER BY synced_at DESC"""
                 )
                 historical_rows = await cur.fetchall()
                 for row in historical_rows:
@@ -4049,7 +4148,7 @@ def build_messenger_router(
                         "id": gift_id,
                         "source": "telegram",
                         "catalog_source": "telegram_mtproto",
-                        "title": str(row["title"]),
+                        "title": _gift_display_title(row["title"], row["sticker_set_name"]),
                         "emoji": str(row["sticker_emoji"] or ""),
                         "star_count": int(row["stars"]),
                         "currency": "telegram_stars",
@@ -4156,8 +4255,8 @@ def build_messenger_router(
                 unlimited_supply or gift["remaining"] > 0
             )
         if not show_all:
-            # Nothing is for sale until the administrator sets a price and a stock for the gift.
-            # The app asks for everything (all=1) to be able to draw the gifts a user already owns.
+            # The legacy all=1 parameter is ignored above: inventory metadata is served
+            # through profile endpoints, while the storefront lists only active offers.
             gifts = [gift for gift in gifts if gift["for_sale"]]
 
         synced_at = int(state["last_synced_at"])
@@ -4191,7 +4290,8 @@ def build_messenger_router(
             for candidate in source_order:
                 if candidate == "telegram_mtproto":
                     cur = await db.execute(
-                        """SELECT sticker_mime_type,sticker_document_id,sticker_dc_id,sticker_size
+                        """SELECT sticker_mime_type,sticker_document_id,sticker_dc_id,sticker_size,
+                                  sticker_is_animated,sticker_is_video
                            FROM telegram_mtproto_gift_catalog WHERE gift_id=?""",
                         (gift_id,),
                     )
@@ -4216,6 +4316,17 @@ def build_messenger_router(
                     if provider is None:
                         continue
                     content, media_type = await provider.download_sticker_preview(gift_id)
+                    try:
+                        content, media_type = _normalize_gift_preview(content)
+                    except ValueError:
+                        is_motion = (
+                            bool(sticker_row["sticker_is_animated"])
+                            or bool(sticker_row["sticker_is_video"])
+                            or str(sticker_row["sticker_mime_type"] or "").lower() == "application/x-tgsticker"
+                            or str(sticker_row["sticker_mime_type"] or "").lower().startswith("video/")
+                        )
+                        if not is_motion:
+                            raise
                 else:
                     bot = bot_provider()
                     if bot is None:
@@ -4227,16 +4338,39 @@ def build_messenger_router(
                         or sticker_mime == "application/x-tgsticker"
                         or sticker_mime.startswith("video/")
                     )
-                    preview_file_id = (
-                        str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
-                        if is_motion else ""
-                    ) or str(sticker_row["sticker_file_id"] or "").strip()
-                    content, media_type = await fetch_telegram_sticker(
-                        bot,
-                        preview_file_id,
-                        str(sticker_row["sticker_mime_type"] or ""),
-                    )
-                content, media_type = _normalize_gift_preview(content)
+                    preview_file_ids = []
+                    thumbnail_id = str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
+                    main_file_id = str(sticker_row["sticker_file_id"] or "").strip()
+                    if is_motion and thumbnail_id:
+                        preview_file_ids.append(thumbnail_id)
+                    if main_file_id and main_file_id not in preview_file_ids:
+                        preview_file_ids.append(main_file_id)
+                    if not preview_file_ids:
+                        continue
+                    normalized_preview = None
+                    raw_motion_preview = None
+                    for preview_file_id in preview_file_ids:
+                        try:
+                            candidate_bytes, candidate_mime = await fetch_telegram_sticker(
+                                bot,
+                                preview_file_id,
+                                str(sticker_row["sticker_mime_type"] or ""),
+                            )
+                            try:
+                                normalized_preview = _normalize_gift_preview(candidate_bytes)
+                                break
+                            except ValueError:
+                                if is_motion and preview_file_id == main_file_id:
+                                    raw_motion_preview = (candidate_bytes, candidate_mime)
+                        except Exception:
+                            continue
+                    if normalized_preview is not None:
+                        content, media_type = normalized_preview
+                    elif raw_motion_preview is not None:
+                        # WaysGram's Telegram renderer can extract a frame from raw TGS/WebM.
+                        content, media_type = raw_motion_preview
+                    else:
+                        continue
                 return Response(
                     content=content,
                     media_type=media_type,
@@ -5486,7 +5620,9 @@ def build_messenger_router(
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         await require_channel_access(channel_id, int(user["telegram_id"]))
-        return await channel_row(channel_id)
+        channel = await channel_row(channel_id)
+        channel["labels"] = await entity_labels("channel", channel_id)
+        return channel
 
     @router.patch("/api/channels/{channel_id}")
     async def update_channel(

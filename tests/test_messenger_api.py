@@ -2676,6 +2676,60 @@ def test_telegram_gift_purchases_create_cards_in_favorites_and_recipient_chat(ap
     run(scenario())
 
 
+def test_gift_display_title_uses_real_sticker_set_name() -> None:
+    assert messenger_api._gift_display_title("Telegram Gift 123", "PlushPepe") == "Plush Pepe"
+    assert messenger_api._gift_display_title("", "GoldenDuck") == "Golden Duck"
+    assert messenger_api._gift_display_title("Original Gift Name", "SomeSet") == "Original Gift Name"
+    assert messenger_api._gift_display_title("🎁", "TelegramGifts") == "Подарок Telegram"
+
+
+def test_assigned_labels_are_exposed_on_account_and_channel(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 87701, "label_owner")
+    add_account(api_env, 87702, "label_target")
+    add_session(path, 87701, "label-owner-session")
+    add_session(path, 87702, "label-target-session")
+
+    now = 1_800_000_000
+    with db_split.sqlite_connect(path) as db:
+        cur = db.execute(
+            "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES(?,?,?,?)",
+            ("labelled_channel", "Labelled Channel", 87701, now),
+        )
+        channel_id = int(cur.lastrowid)
+        cur = db.execute(
+            "INSERT INTO waysgram_labels(label_text,color,created_by,created_at) VALUES(?,?,?,?)",
+            ("Official", "#1769AA", 87701, now),
+        )
+        label_id = int(cur.lastrowid)
+        db.execute(
+            """INSERT INTO waysgram_label_assignments
+               (label_id,target_type,target_id,assigned_by,assigned_at)
+               VALUES(?,?,?,?,?)""",
+            (label_id, "account", 87702, 87701, now),
+        )
+        db.execute(
+            """INSERT INTO waysgram_label_assignments
+               (label_id,target_type,target_id,assigned_by,assigned_at)
+               VALUES(?,?,?,?,?)""",
+            (label_id, "channel", channel_id, 87701, now),
+        )
+        db.commit()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            viewer = {"Authorization": "Bearer label-owner-session"}
+            profile = await client.get("/api/users/87702", headers=viewer)
+            assert profile.status_code == 200
+            assert profile.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+            channel = await client.get(f"/api/channels/{channel_id}", headers=viewer)
+            assert channel.status_code == 200
+            assert channel.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+    run(scenario())
+
+
 def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> None:
     path, _auth_store, fake_bot, app = api_env
     add_account(api_env, 87001, "telegram_gift_user")
@@ -2732,18 +2786,17 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert payload["source"] == "telegram_bot_api"
             assert payload["scope"] == "gifts_available_to_authbot"
             assert payload["currency"] == "stars"
-            # The storefront is sale-filtered, but the Android catalog must be able
-            # to display every Telegram gift even before a WaysGram price is assigned.
+            # The app storefront only lists offers after AuthBot configures price and stock.
             assert payload["count"] == 0
+            # The legacy all=1 switch is ignored; private admin inventory remains in AuthBot only.
             full_catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
             assert full_catalog.status_code == 200
-            assert full_catalog.json()["count"] == 1
-            assert full_catalog.json()["gifts"][0]["id"] == "gift_123"
-            assert full_catalog.json()["gifts"][0]["for_sale"] is False
+            assert full_catalog.json()["count"] == 0
             with db_split.sqlite_connect(path) as db:
                 db.execute(
                     "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('gift_123',40,3,0,1)"
                 )
+
             catalog = await client.get("/api/telegram/gifts", headers=auth)
             payload = catalog.json()
             assert payload["count"] == 1
@@ -2753,7 +2806,7 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert gift["remaining"] == 3
             assert gift["telegram_star_count"] == 25
             assert gift["id"] == "gift_123"
-            assert gift["title"] == "🎁"
+            assert gift["title"] == "Подарок Telegram"
             assert gift["star_count"] == 25
             assert gift["upgrade_star_count"] == 100
             assert gift["is_premium"] is True
