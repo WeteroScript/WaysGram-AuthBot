@@ -925,6 +925,50 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
     run(scenario())
 
 
+
+def test_purchase_uses_sticker_emoji_when_catalog_title_is_generic(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=25, supply=1)
+        async with await client_for(app) as client:
+            # Simulate an older or incomplete catalogue row which stored the
+            # generic label even though its sticker metadata contains the emoji.
+            catalog = await client.get(
+                "/api/telegram/gifts?all=1",
+                headers=headers(101),
+            )
+            assert catalog.status_code == 200
+            conn = db_split.sqlite_connect(path)
+            try:
+                conn.execute(
+                    "UPDATE telegram_gift_catalog SET title=? WHERE gift_id=?",
+                    ("Подарок Telegram", "g1"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert bought.status_code == 201
+            assert bought.json()["gift"]["gift_name"] == "🎁"
+
+            history = await client.get("/api/messages?with=101", headers=headers(101))
+            assert history.status_code == 200
+            receipt = next(
+                message for message in history.json()["messages"]
+                if message.get("gift_serial_number") == bought.json()["gift"]["serial_number"]
+            )
+            assert receipt["body"] == "Вы приобрели коллекционный подарок «🎁»"
+            assert receipt["gift_name"] == "🎁"
+
+    run(scenario())
+
+
 def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env) -> None:
     path, app = env
 
