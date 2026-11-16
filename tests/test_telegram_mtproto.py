@@ -115,7 +115,7 @@ def test_mtproto_preview_returns_raw_animation_when_still_thumbnails_fail() -> N
             mime_type="application/x-tgsticker",
             attributes=[
                 DocumentAttributeSticker("🎁", "PlushPepe"),
-                DocumentAttributeAnimated(),
+                type("DocumentAttributeAnimated", (), {})(),
             ],
             thumbs=[Thumb()],
         )
