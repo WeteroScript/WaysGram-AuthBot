@@ -115,8 +115,11 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
                 ).fetchone()
             finally:
                 conn.close()
-            assert self_receipt[:3] == (101, 101, "Вы приобрели коллекционный подарок «🎁»")
-            assert json.loads(self_receipt[3])["event_type"] == "purchase"
+            assert self_receipt[:3] == (101, 101, "")
+            self_attributes = json.loads(self_receipt[3])
+            assert self_attributes["event_type"] == "purchase"
+            assert self_attributes["native_action"] == "star_gift_purchase"
+            assert self_attributes["price_stars"] == 40
             assert mine[0]["telegram_gift_id"] == "g1"
             assert mine[0]["sticker_available"] is True
             assert mine[0]["sticker_url"] == "/api/telegram/gifts/g1/sticker"
@@ -169,8 +172,9 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             finally:
                 conn.close()
             assert len(receipts) == 1
-            assert receipts[0][:3] == (101, 102, "Вы отправили подарок «🎁»")
+            assert receipts[0][:3] == (101, 102, "")
             assert json.loads(receipts[0][4])["event_type"] == "purchase"
+            assert json.loads(receipts[0][4])["native_action"] == "star_gift_purchase"
             assert event is not None and event[:3] == ("dm", 101, 102)
 
             # The stock was 2, so the next purchase fails and costs nothing.
@@ -575,7 +579,15 @@ def test_gift_market_listing_purchase_and_cancellation(env) -> None:
             assert len(purchase_receipts) == 1
             assert purchase_receipts[0]["gift_name"] == buyer_inventory[0]["gift_name"]
             assert purchase_receipts[0]["gift_telegram_gift_id"] == "g1"
-            assert purchase_receipts[0]["gift_attributes"] == {"event_type": "purchase"}
+            assert purchase_receipts[0]["body"] == ""
+            assert purchase_receipts[0]["gift_upgrade_level"] == 1
+            market_attributes = purchase_receipts[0]["gift_attributes"]
+            assert market_attributes["event_type"] == "purchase"
+            assert market_attributes["native_action"] == "star_gift_purchase"
+            assert market_attributes["price_grams"] == 7
+            assert market_attributes["currency"] == "grams"
+            assert market_attributes["upgrade_level"] == 1
+            assert market_attributes["collectible_traits"] == traits
             assert (await client.get("/api/gift-market", headers=headers(101))).json()["count"] == 0
 
             # A sold listing cannot be purchased a second time.
@@ -813,11 +825,22 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
         async with await client_for(app) as client:
             bought = await client.post("/api/telegram/gifts/g1/purchase", headers=headers(101), json={})
             serial = bought.json()["gift"]["serial_number"]
-            upgraded = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            upgrade_headers = {**headers(101), "Idempotency-Key": "wg-gift-upgrade-test-0001"}
+            upgraded = await client.post(
+                f"/api/gifts/{serial}/upgrade", headers=upgrade_headers
+            )
             assert upgraded.status_code == 200
             assert upgraded.json()["upgrade_level"] == 1
             assert upgraded.json()["price_stars"] == 10
             assert upgraded.json()["stars_balance"] == 4970
+
+            # Replaying a successful upgrade request must not debit Stars twice.
+            replayed = await client.post(
+                f"/api/gifts/{serial}/upgrade", headers=upgrade_headers
+            )
+            assert replayed.status_code == 200
+            assert replayed.json() == upgraded.json()
+            assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 4970
             traits = upgraded.json()["attributes"]["collectible_traits"]
             assert traits["version"] == 1
             assert traits["rarity"] in {"Обычная", "Необычная", "Редкая", "Эпическая", "Легендарная"}
@@ -826,10 +849,25 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert mine[0]["upgrade_level"] == 1
             assert mine[0]["attributes"]["upgrade_source"] == "waysgram_internal"
+
+            saved = await client.get("/api/messages?with=101", headers=headers(101))
+            receipt = next(
+                item for item in saved.json()["messages"]
+                if item.get("gift_serial_number") == serial
+            )
+            assert receipt["body"] == ""
+            assert receipt["gift_upgrade_level"] == 1
+            assert receipt["gift_attributes"]["event_type"] == "purchase"
+            assert receipt["gift_attributes"]["native_action"] == "star_gift_purchase"
+            assert receipt["gift_attributes"]["upgrade_source"] == "waysgram_internal"
+            assert receipt["gift_attributes"]["collectible_traits"] == upgraded.json()["attributes"]["collectible_traits"]
             assert mine[0]["attributes"]["collectible_traits"] == traits
 
             # A later level-up changes the level but never rerolls the collectible traits.
-            second_upgrade = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            second_headers = {**headers(101), "Idempotency-Key": "wg-gift-upgrade-test-0002"}
+            second_upgrade = await client.post(
+                f"/api/gifts/{serial}/upgrade", headers=second_headers
+            )
             assert second_upgrade.status_code == 200
             assert second_upgrade.json()["upgrade_level"] == 2
             assert second_upgrade.json()["attributes"]["collectible_traits"] == traits
@@ -924,7 +962,7 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             receipt = receipts[0]
             assert receipt["sender_id"] == 101
             assert receipt["recipient_id"] == 101
-            assert receipt["body"] == "Вы приобрели коллекционный подарок «🎁»"
+            assert receipt["body"] == ""
             assert receipt["gift_name"] == "🎁"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
