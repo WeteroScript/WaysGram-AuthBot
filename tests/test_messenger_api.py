@@ -2732,6 +2732,9 @@ def test_assigned_labels_are_exposed_on_account_and_channel(api_env) -> None:
 
 def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> None:
     path, _auth_store, fake_bot, app = api_env
+    # Even when the signed-in Telegram account is the administrator's account,
+    # the WaysGram app session has no AuthBot catalogue-edit privileges.
+    monkeypatch.setattr(bot_module, "ADMIN_ID", 87001)
     add_account(api_env, 87001, "telegram_gift_user")
     add_session(path, 87001, "telegram-gift-session")
 
@@ -2844,6 +2847,14 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert internal_catalog.json()["gifts"] == []
 
     run(scenario())
+
+
+
+def test_gift_name_resolves_plush_pepe_from_gift_id() -> None:
+    assert messenger_api._gift_display_title(
+        "Telegram Gift 5936013938331222567", "", "5936013938331222567"
+    ) == "Plush Pepe"
+    assert messenger_api._gift_display_title("Telegram Gift", "plush_pepe") == "Plush Pepe"
 
 
 def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
