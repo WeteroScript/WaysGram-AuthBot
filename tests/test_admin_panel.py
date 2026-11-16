@@ -155,6 +155,55 @@ def test_only_admin_can_use_the_new_functions(panel) -> None:
     assert query(path, "SELECT COUNT(*) FROM accounts")[0][0] == 0
 
 
+def test_admin_creates_reusable_labels_and_assigns_accounts_and_channels(panel) -> None:
+    path, store = panel
+    run(store.upsert_user(770801, 770801))
+    run(bot_module.ensure_account(770801, "+15550770801", "label_account", "Label Account"))
+    now = int(time.time())
+    with db_split.sqlite_connect(path) as db:
+        cur = db.execute(
+            "INSERT INTO channels(username,title,owner_telegram_id,created_at) VALUES(?,?,?,?)",
+            ("label_channel", "Label Channel", 770801, now),
+        )
+        channel_id = int(cur.lastrowid)
+        db.commit()
+
+    menu = press("wgadm:labels")
+    assert "шаблонов" in menu.sent[0][0].lower()
+    press("wgadm:labelnew")
+    assert "текст метки" in type_text("Official").sent[0][0].lower()
+    assert "цвет метки" in type_text("#1769AA").sent[0][0].lower()
+    created = type_text("#1769AA")
+    assert "Шаблон метки сохранён" in created.sent[0][0]
+    assert query(path, "SELECT label_text,color FROM waysgram_labels") == [("Official", "#1769AA")]
+    label_id = query(path, "SELECT id FROM waysgram_labels")[0][0]
+
+    press(f"wgadm:labelassign:{label_id}")
+    press(f"wgadm:labeltarget:account:{label_id}")
+    assigned_account = type_text("770801")
+    assert "метка выдана аккаунту" in assigned_account.sent[0][0].lower()
+
+    press(f"wgadm:labelassign:{label_id}")
+    press(f"wgadm:labeltarget:channel:{label_id}")
+    assigned_channel = type_text("@label_channel")
+    assert "метка выдана каналу" in assigned_channel.sent[0][0].lower()
+
+    assignments = query(
+        path,
+        "SELECT target_type,target_id FROM waysgram_label_assignments WHERE label_id=? ORDER BY target_type",
+        (label_id,),
+    )
+    assert assignments == [("account", 770801), ("channel", channel_id)]
+    # Assigning the same saved template twice is idempotent.
+    assert run(bot_module.admin_assign_label(label_id, "account", 770801)) is False
+
+
+def test_admin_gift_display_name_uses_sticker_set_name() -> None:
+    assert bot_module.telegram_gift_display_name("Telegram Gift 123", "PlushPepe", "123") == "Plush Pepe"
+    assert bot_module.telegram_gift_display_name("", "GoldenDuck", "456") == "Golden Duck"
+    assert bot_module.telegram_gift_display_name("Rare Gift", "SomeSet", "789") == "Rare Gift"
+
+
 def test_admin_edits_telegram_gift_prices_from_the_bot(panel) -> None:
     path, store = panel
     gifts = [
