@@ -64,12 +64,12 @@ def test_gifts_are_hidden_until_admin_sets_price_and_supply(env) -> None:
         async with await client_for(app) as client:
             hidden = (await client.get("/api/telegram/gifts", headers=headers(101))).json()
             assert hidden["count"] == 0
-            # The full list is available to the app (it needs it to draw owned gifts); nothing in it is for sale.
+            # The app storefront never exposes unlisted catalog entries, even via all=1
+            # or when the authenticated WaysGram account is also an AuthBot administrator.
             full = (await client.get("/api/telegram/gifts?all=1", headers=headers(101))).json()
-            assert full["count"] == 2 and not any(g["for_sale"] for g in full["gifts"])
+            assert full["count"] == 0
             everything = (await client.get("/api/telegram/gifts?all=1", headers=headers(ADMIN))).json()
-            assert {g["id"] for g in everything["gifts"]} == {"g1", "g2"}
-            assert all(g["price_stars"] == 0 and g["for_sale"] is False for g in everything["gifts"])
+            assert everything["count"] == 0
 
             # Price and stock are managed only through the AuthBot Telegram admin panel,
             # not through authenticated app REST sessions, even for the admin account.
