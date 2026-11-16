@@ -3699,21 +3699,31 @@ def build_messenger_router(
             if source == "telegram_mtproto"
             else ("telegram_gift_catalog", "telegram_mtproto_gift_catalog")
         )
+        generic_titles = {"подарок telegram", "подарок waysgram", "gift"}
+        fallback_title = ""
+        fallback_emoji = ""
         for table in tables:
             cur = await db.execute(
-                f"SELECT title FROM {table} WHERE gift_id=?",
+                f"SELECT title,sticker_emoji FROM {table} WHERE gift_id=?",
                 (gift_id,),
             )
             row = await cur.fetchone()
-            if row and str(row[0]).strip():
-                return str(row[0])
-        cur = await db.execute(
-            "SELECT 1 FROM telegram_gift_prices WHERE gift_id=?",
-            (gift_id,),
-        )
-        if await cur.fetchone():
-            return "Подарок Telegram"
-        return ""
+            if not row:
+                continue
+            title = str(row[0] or "").strip()
+            emoji = str(row[1] or "").strip()
+            if title and title.casefold() not in generic_titles:
+                return title
+            if emoji and not fallback_emoji:
+                fallback_emoji = emoji
+            if title and not fallback_title:
+                fallback_title = title
+
+        # A generic catalogue fallback must never become a purchase receipt name
+        # when the source sticker already provides its actual emoji.
+        if fallback_emoji:
+            return fallback_emoji
+        return fallback_title
 
     @router.get("/api/telegram/gifts")
     async def telegram_gift_catalog(
