@@ -199,6 +199,7 @@ def test_admin_creates_reusable_labels_and_assigns_accounts_and_channels(panel) 
 
 def test_admin_gift_display_name_uses_sticker_set_name() -> None:
     assert bot_module.telegram_gift_display_name("Telegram Gift 123", "PlushPepe", "123") == "Plush Pepe"
+    assert bot_module.telegram_gift_display_name("Telegram Gift 123", "plush_pepe", "5936013938331222567") == "Plush Pepe"
     assert bot_module.telegram_gift_display_name("", "GoldenDuck", "456") == "Golden Duck"
     assert bot_module.telegram_gift_display_name("Rare Gift", "SomeSet", "789") == "Rare Gift"
 
