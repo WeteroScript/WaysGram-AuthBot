@@ -394,8 +394,8 @@ class TelegramMTProtoGiftCatalog:
                 break
 
         if not content:
-            if metadata["is_animated"] or metadata["is_video"]:
-                raise RuntimeError("Animated Telegram gift has no decodable still thumbnail")
+            # Android can decode the original TGS/WebM file with AnimatedFileDrawable
+            # and use its first frame when Telegram supplies no usable still thumbnail.
             return await self.download_sticker(key)
 
         result = (content, mime_type)
