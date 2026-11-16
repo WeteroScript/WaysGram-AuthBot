@@ -2538,6 +2538,138 @@ def test_internal_botfather_create_commands_and_message_runtime(api_env) -> None
     run(scenario())
 
 
+def test_telegram_gift_purchases_create_cards_in_favorites_and_recipient_chat(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    buyer_id = 87011
+    recipient_id = 87012
+    add_account(api_env, buyer_id, "gift_card_buyer")
+    add_account(api_env, recipient_id, "gift_card_recipient")
+    add_session(path, buyer_id, "gift-card-buyer-session")
+    add_session(path, recipient_id, "gift-card-recipient-session")
+
+    now = int(time.time())
+    with db_split.sqlite_connect(path) as db:
+        db.execute("UPDATE accounts SET stars=500 WHERE telegram_id=?", (buyer_id,))
+        db.execute(
+            """INSERT INTO telegram_gift_sync_state(id,last_synced_at,gift_count,source)
+               VALUES(1,?,0,'telegram_bot_api')""",
+            (now,),
+        )
+        db.execute(
+            """INSERT INTO telegram_gift_prices
+               (gift_id,price_stars,supply,sold,updated_at)
+               VALUES('waysgram_card_test',50,2,0,?)""",
+            (now,),
+        )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            buyer = {"Authorization": "Bearer gift-card-buyer-session"}
+            recipient = {"Authorization": "Bearer gift-card-recipient-session"}
+
+            self_purchase = await client.post(
+                "/api/telegram/gifts/waysgram_card_test/purchase",
+                headers={**buyer, "Idempotency-Key": "gift-card-self-purchase-01"},
+                json={},
+            )
+            assert self_purchase.status_code == 201
+            self_serial = self_purchase.json()["gift"]["serial_number"]
+            assert self_purchase.json()["gift"]["owner_id"] == buyer_id
+
+            self_inventory = await client.get("/api/me/gifts", headers=buyer)
+            assert self_inventory.status_code == 200
+            assert self_inventory.json()["gifts"][0]["serial_number"] == self_serial
+
+            favorites = await client.get(
+                f"/api/messages?with={buyer_id}",
+                headers=buyer,
+            )
+            assert favorites.status_code == 200
+            self_card = next(
+                item for item in favorites.json()["messages"]
+                if item["gift_serial_number"] == self_serial
+            )
+            assert self_card["sender_id"] == buyer_id
+            assert self_card["recipient_id"] == buyer_id
+            assert self_card["gift_telegram_gift_id"] == "waysgram_card_test"
+            assert self_card["gift_attributes"]["event_type"] == "purchase"
+            assert self_card["gift_attributes"]["price_stars"] == 50
+
+            buyer_conversations = await client.get("/api/conversations", headers=buyer)
+            assert buyer_conversations.status_code == 200
+            assert any(
+                item["id"] == buyer_id
+                and item["last_message_id"] == self_card["id"]
+                for item in buyer_conversations.json()["conversations"]
+            )
+
+            friend_purchase = await client.post(
+                "/api/telegram/gifts/waysgram_card_test/purchase",
+                headers={**buyer, "Idempotency-Key": "gift-card-friend-purchase-01"},
+                json={"recipient_id": recipient_id},
+            )
+            assert friend_purchase.status_code == 201
+            friend_serial = friend_purchase.json()["gift"]["serial_number"]
+            assert friend_purchase.json()["gift"]["owner_id"] == recipient_id
+
+            buyer_inventory = await client.get("/api/me/gifts", headers=buyer)
+            assert buyer_inventory.status_code == 200
+            assert [item["serial_number"] for item in buyer_inventory.json()["gifts"]] == [self_serial]
+
+            recipient_inventory = await client.get("/api/me/gifts", headers=recipient)
+            assert recipient_inventory.status_code == 200
+            assert recipient_inventory.json()["gifts"][0]["serial_number"] == friend_serial
+
+            sent_chat = await client.get(
+                f"/api/messages?with={recipient_id}",
+                headers=buyer,
+            )
+            received_chat = await client.get(
+                f"/api/messages?with={buyer_id}",
+                headers=recipient,
+            )
+            assert sent_chat.status_code == 200
+            assert received_chat.status_code == 200
+            sent_card = next(
+                item for item in sent_chat.json()["messages"]
+                if item["gift_serial_number"] == friend_serial
+            )
+            received_card = next(
+                item for item in received_chat.json()["messages"]
+                if item["gift_serial_number"] == friend_serial
+            )
+            for card in (sent_card, received_card):
+                assert card["sender_id"] == buyer_id
+                assert card["recipient_id"] == recipient_id
+                assert card["gift_telegram_gift_id"] == "waysgram_card_test"
+                assert card["gift_attributes"]["event_type"] == "purchase"
+                assert card["gift_attributes"]["price_stars"] == 50
+
+            sender_conversations = await client.get("/api/conversations", headers=buyer)
+            recipient_conversations = await client.get("/api/conversations", headers=recipient)
+            assert any(
+                item["id"] == recipient_id
+                and item["last_message_id"] == sent_card["id"]
+                for item in sender_conversations.json()["conversations"]
+            )
+            assert any(
+                item["id"] == buyer_id
+                and item["last_message_id"] == received_card["id"]
+                for item in recipient_conversations.json()["conversations"]
+            )
+
+            recipient_events = await client.get("/api/events?after_id=0", headers=recipient)
+            assert recipient_events.status_code == 200
+            assert any(
+                event["kind"] == "new_message"
+                and event["scope"] == "dm"
+                and event["message_id"] == received_card["id"]
+                for event in recipient_events.json()["events"]
+            )
+
+    run(scenario())
+
+
 def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> None:
     path, _auth_store, fake_bot, app = api_env
     add_account(api_env, 87001, "telegram_gift_user")
