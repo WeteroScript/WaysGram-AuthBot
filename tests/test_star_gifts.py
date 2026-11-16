@@ -928,7 +928,11 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["gift_name"] == "🎁"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
-            assert receipt["gift_attributes"] == {"event_type": "purchase", "price_stars": 35}
+            assert receipt["gift_attributes"] == {
+                "event_type": "purchase",
+                "native_action": "star_gift_purchase",
+                "price_stars": 35,
+            }
             assert receipt["gift_emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["upgrade_star_count"] == 10
