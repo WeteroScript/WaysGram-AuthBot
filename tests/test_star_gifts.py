@@ -403,7 +403,14 @@ def test_removed_telegram_gift_cannot_be_purchased(env, monkeypatch: pytest.Monk
             ).fetchone()
             assert receipt is not None
             assert receipt[0:2] == (101, 101)
-            assert "коллекционный подарок" in receipt[2].lower()
+            assert receipt[2] == ""
+            event = connection.execute(
+                "SELECT attributes_json FROM message_gifts WHERE serial_number=?",
+                (receipt[3],),
+            ).fetchone()
+            event_attributes = json.loads(event[0])
+            assert event_attributes["native_action"] == "star_gift_purchase"
+            assert event_attributes["event_type"] == "purchase"
             assert receipt[4] == "g1"
         finally:
             connection.close()
