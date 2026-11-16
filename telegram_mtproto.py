@@ -215,13 +215,6 @@ class TelegramMTProtoGiftCatalog:
             response = await self.client(
                 functions.payments.GetStarGiftsRequest(hash=0)
             )
-            # A fresh database does not imply that this process has the document
-            # objects needed to download stickers. Force a full response when the
-            # server says "not modified" but this process has no in-memory cache.
-            if type(response).__name__ == "StarGiftsNotModified" and not self._gifts:
-                response = await self.client(
-                    functions.payments.GetStarGiftsRequest(hash=-1)
-                )
             if type(response).__name__ == "StarGiftsNotModified":
                 now = int(time.time())
                 async with aiosqlite.connect(database_path) as db:
