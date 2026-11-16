@@ -928,7 +928,11 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["gift_name"] == "🎁"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
-            assert receipt["gift_attributes"] == {"event_type": "purchase", "price_stars": 35}
+            assert receipt["gift_attributes"] == {
+                "event_type": "purchase",
+                "native_action": "star_gift_purchase",
+                "price_stars": 35,
+            }
             assert receipt["gift_emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["emoji"] == "🎁"
             assert receipt["gift_telegram_metadata"]["upgrade_star_count"] == 10
@@ -1168,3 +1172,78 @@ def test_waysgram_auction_requires_historical_telegram_auction_origin(env) -> No
 
     run(scenario())
 
+
+
+def test_messenger_storage_repairs_missing_gift_inventory_columns(env) -> None:
+    path, _ = env
+    connection = db_split.sqlite_connect(path)
+    try:
+        for column in ("telegram_gift_id", "gift_emoji", "telegram_gift_metadata_json"):
+            connection.execute(f"ALTER TABLE messenger.user_gifts DROP COLUMN {column}")
+        connection.execute(
+            "ALTER TABLE messenger.telegram_gift_catalog DROP COLUMN sticker_thumbnail_file_id"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    run(init_messenger_storage(path))
+
+    connection = db_split.sqlite_connect(path)
+    try:
+        user_gift_columns = {
+            row[1] for row in connection.execute("PRAGMA messenger.table_info(user_gifts)").fetchall()
+        }
+        catalog_columns = {
+            row[1] for row in connection.execute("PRAGMA messenger.table_info(telegram_gift_catalog)").fetchall()
+        }
+    finally:
+        connection.close()
+
+    assert {"telegram_gift_id", "gift_emoji", "telegram_gift_metadata_json"} <= user_gift_columns
+    assert "sticker_thumbnail_file_id" in catalog_columns
+
+
+def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, app = env
+    expected_png = _png()
+    downloaded_file_ids: list[str] = []
+
+    async def fake_download(bot, file_id: str, preferred_mime: str = ""):
+        downloaded_file_ids.append(file_id)
+        return expected_png, "image/png"
+
+    monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_download)
+
+    async def scenario() -> None:
+        await messenger_api.store_telegram_gifts(
+            path,
+            [{
+                "id": "g1",
+                "sticker": {
+                    "file_id": "animated-sticker-file",
+                    "file_unique_id": "animated-sticker-unique",
+                    "thumbnail": {"file_id": "static-thumbnail-file"},
+                    "type": "video",
+                    "width": 512,
+                    "height": 512,
+                    "is_animated": False,
+                    "is_video": True,
+                    "emoji": "🎁",
+                    "mime_type": "video/webm",
+                },
+                "star_count": 25,
+            }],
+        )
+
+        async with await client_for(app) as client:
+            response = await client.get(
+                "/api/telegram/gifts/g1/sticker",
+                headers=headers(101),
+            )
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("image/png")
+            assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert downloaded_file_ids == ["static-thumbnail-file"]
+
+    run(scenario())

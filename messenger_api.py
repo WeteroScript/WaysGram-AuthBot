@@ -705,6 +705,7 @@ async def init_messenger_storage(database_path: Path) -> None:
                 gift_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 sticker_file_id TEXT NOT NULL,
+                sticker_thumbnail_file_id TEXT NOT NULL DEFAULT '',
                 sticker_file_unique_id TEXT NOT NULL DEFAULT '',
                 sticker_type TEXT NOT NULL DEFAULT 'regular',
                 sticker_emoji TEXT NOT NULL DEFAULT '',
@@ -956,6 +957,24 @@ async def init_messenger_storage(database_path: Path) -> None:
                 f"ALTER TABLE {db_split.SCHEMA}.user_gifts "
                 "ADD COLUMN attributes_json TEXT NOT NULL DEFAULT '{}'"
             )
+        # /api/me/gifts depends on these columns. Migrate them here as well as
+        # in the admin initializer so the messenger API remains self-contained.
+        for column, definition in (
+            ("telegram_gift_id", "TEXT NOT NULL DEFAULT ''"),
+            ("gift_emoji", "TEXT NOT NULL DEFAULT ''"),
+            ("telegram_gift_metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            if column not in user_gift_columns:
+                await db.execute(
+                    f"ALTER TABLE {db_split.SCHEMA}.user_gifts ADD COLUMN {column} {definition}"
+                )
+        cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(telegram_gift_catalog)")
+        telegram_gift_columns = {str(row[1]) for row in await cur.fetchall()}
+        if "sticker_thumbnail_file_id" not in telegram_gift_columns:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.telegram_gift_catalog "
+                "ADD COLUMN sticker_thumbnail_file_id TEXT NOT NULL DEFAULT ''"
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(chat_groups)")
         chat_group_columns = {str(row[1]) for row in await cur.fetchall()}
         if "slow_mode_seconds" not in chat_group_columns:
@@ -1185,7 +1204,7 @@ async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | Non
             cur = await db.execute(
                 """SELECT gift_id,title,sticker_emoji,sticker_set_name,sticker_width,
                           sticker_height,sticker_is_animated,sticker_is_video,sticker_mime_type,
-                          sticker_file_id,star_count,upgrade_star_count,unique_gift_variant_count,
+                          sticker_file_id,sticker_thumbnail_file_id,star_count,upgrade_star_count,unique_gift_variant_count,
                           is_premium,has_colors,total_count,remaining_count,background_json
                    FROM telegram_gift_catalog WHERE gift_id=?""",
                 (gift_id,),
@@ -1366,12 +1385,18 @@ async def store_telegram_gifts(
         sticker_file_id = str(sticker.get("file_id") or "").strip()
         if not sticker_file_id:
             continue
+        thumbnail = sticker.get("thumbnail")
+        sticker_thumbnail_file_id = (
+            str(thumbnail.get("file_id") or "").strip()
+            if isinstance(thumbnail, dict) else ""
+        )
         emoji = str(sticker.get("emoji") or "")
         title = str(gift.get("title") or emoji or "Подарок Telegram")
         normalized.append((
             gift_id,
             title[:160],
             sticker_file_id,
+            sticker_thumbnail_file_id,
             str(sticker.get("file_unique_id") or ""),
             str(sticker.get("type") or "regular"),
             emoji[:32],
@@ -1404,17 +1429,19 @@ async def store_telegram_gifts(
         for row in normalized:
             await db.execute(
                 """INSERT INTO telegram_gift_catalog (
-                       gift_id,title,sticker_file_id,sticker_file_unique_id,sticker_type,
+                       gift_id,title,sticker_file_id,sticker_thumbnail_file_id,
+                       sticker_file_unique_id,sticker_type,
                        sticker_emoji,sticker_set_name,sticker_width,sticker_height,
                        sticker_is_animated,sticker_is_video,sticker_mime_type,star_count,
                        upgrade_star_count,is_premium,has_colors,total_count,remaining_count,
                        personal_total_count,personal_remaining_count,unique_gift_variant_count,
                        background_json,publisher_chat_json,source_payload,position,synced_at,
                        is_available
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
                    ON CONFLICT(gift_id) DO UPDATE SET
                        title=excluded.title,
                        sticker_file_id=excluded.sticker_file_id,
+                       sticker_thumbnail_file_id=excluded.sticker_thumbnail_file_id,
                        sticker_file_unique_id=excluded.sticker_file_unique_id,
                        sticker_type=excluded.sticker_type,
                        sticker_emoji=excluded.sticker_emoji,
@@ -1472,8 +1499,22 @@ async def sync_telegram_gifts(database_path: Path, bot: Any) -> dict[str, Any]:
     return await store_telegram_gifts(database_path, gifts)
 
 
+def _normalize_gift_preview(content: bytes) -> tuple[bytes, str]:
+    """Return one static PNG frame suitable for Android GiftCell and GiftMessageView."""
+    try:
+        with Image.open(BytesIO(content)) as source:
+            source.seek(0)
+            preview = ImageOps.exif_transpose(source).convert("RGBA")
+            preview.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            output = BytesIO()
+            preview.save(output, format="PNG", optimize=True)
+            return output.getvalue(), "image/png"
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError("Telegram gift does not provide a decodable static thumbnail") from exc
+
+
 async def fetch_telegram_sticker(bot: Any, file_id: str, preferred_mime: str = "") -> tuple[bytes, str]:
-    """Download a sticker without ever exposing the AuthBot token to the client."""
+    """Download a sticker or its Bot API thumbnail without exposing the AuthBot token."""
     token = str(getattr(bot, "token", "") or "").strip()
     if not token:
         raise RuntimeError("Telegram bot token is unavailable")
@@ -3749,7 +3790,11 @@ def build_messenger_router(
                    (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
                    VALUES(?,?,?,?,0,?)""",
                 (receipt_message_id, serial, title, gift_id,
-                 json.dumps({"event_type": "purchase", "price_stars": price}, separators=(",", ":"))),
+                 json.dumps({
+                     "event_type": "purchase",
+                     "native_action": "star_gift_purchase",
+                     "price_stars": price,
+                 }, separators=(",", ":"))),
             )
             await record_event(
                 db, "dm", receipt_message_id, "new_message", uid,
@@ -4158,7 +4203,8 @@ def build_messenger_router(
                     )
                 else:
                     cur = await db.execute(
-                        """SELECT sticker_file_id,sticker_mime_type
+                        """SELECT sticker_file_id,sticker_thumbnail_file_id,
+                                  sticker_is_animated,sticker_is_video,sticker_mime_type
                            FROM telegram_gift_catalog WHERE gift_id=?""",
                         (gift_id,),
                     )
@@ -4175,16 +4221,28 @@ def build_messenger_router(
                     provider = mtproto_gift_provider() if mtproto_gift_provider else None
                     if provider is None:
                         continue
-                    content, media_type = await provider.download_sticker(gift_id)
+                    content, media_type = await provider.download_sticker_preview(gift_id)
                 else:
                     bot = bot_provider()
                     if bot is None:
                         continue
+                    sticker_mime = str(sticker_row["sticker_mime_type"] or "").lower()
+                    is_motion = (
+                        bool(sticker_row["sticker_is_animated"])
+                        or bool(sticker_row["sticker_is_video"])
+                        or sticker_mime == "application/x-tgsticker"
+                        or sticker_mime.startswith("video/")
+                    )
+                    preview_file_id = (
+                        str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
+                        if is_motion else ""
+                    ) or str(sticker_row["sticker_file_id"] or "").strip()
                     content, media_type = await fetch_telegram_sticker(
                         bot,
-                        str(sticker_row["sticker_file_id"]),
+                        preview_file_id,
                         str(sticker_row["sticker_mime_type"] or ""),
                     )
+                content, media_type = _normalize_gift_preview(content)
                 return Response(
                     content=content,
                     media_type=media_type,

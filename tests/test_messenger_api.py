@@ -40,6 +40,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_preview_png() -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (16, 16), (40, 120, 220, 255)).save(output, format="PNG")
+    return output.getvalue()
+
+
 @pytest.fixture
 def api_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     path = tmp_path / "waysgram.sqlite3"
@@ -2712,7 +2718,7 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
         assert bot.token == "test-telegram-bot-token"
         assert file_id == "telegram-file-id"
         assert preferred_mime == "image/webp"
-        return b"fake-webp-sticker", "image/webp"
+        return test_preview_png(), "image/png"
 
     monkeypatch.setattr(messenger_api, "fetch_telegram_gifts", fake_fetch_telegram_gifts)
     monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_fetch_telegram_sticker)
@@ -2758,8 +2764,8 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
 
             sticker = await client.get(gift["sticker"]["url"], headers=auth)
             assert sticker.status_code == 200
-            assert sticker.content == b"fake-webp-sticker"
-            assert sticker.headers["content-type"].startswith("image/webp")
+            assert sticker.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert sticker.headers["content-type"].startswith("image/png")
             assert "private" in sticker.headers["cache-control"]
 
             # A second request inside the one-minute cache interval must not call Telegram again.
@@ -2837,7 +2843,7 @@ def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
 
         async def download_media(self, document, file=bytes):
             assert document is self.document
-            return b"mtproto-gift-sticker"
+            return test_preview_png()
 
     mtproto_client = FakeMTProtoClient()
     provider = TelegramMTProtoGiftCatalog(mtproto_client)
@@ -2884,8 +2890,8 @@ def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
 
             sticker = await client.get(gift["sticker"]["url"], headers=auth)
             assert sticker.status_code == 200
-            assert sticker.content == b"mtproto-gift-sticker"
-            assert sticker.headers["content-type"].startswith("image/webp")
+            assert sticker.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert sticker.headers["content-type"].startswith("image/png")
 
     run(scenario())
 
