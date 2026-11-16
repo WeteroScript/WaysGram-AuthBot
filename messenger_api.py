@@ -2969,6 +2969,7 @@ def build_messenger_router(
             if re.fullmatch(r"\+[1-9]\d{7,14}", number):
                 result["phone"] = number
         result["is_admin"] = is_admin_user(user)
+        result["labels"] = await entity_labels("account", int(user["telegram_id"]))
         return result
 
     @router.put("/api/me/avatar")
@@ -4193,8 +4194,8 @@ def build_messenger_router(
                 unlimited_supply or gift["remaining"] > 0
             )
         if not show_all:
-            # Nothing is for sale until the administrator sets a price and a stock for the gift.
-            # The app asks for everything (all=1) to be able to draw the gifts a user already owns.
+            # The legacy all=1 parameter is ignored above: inventory metadata is served
+            # through profile endpoints, while the storefront lists only active offers.
             gifts = [gift for gift in gifts if gift["for_sale"]]
 
         synced_at = int(state["last_synced_at"])
