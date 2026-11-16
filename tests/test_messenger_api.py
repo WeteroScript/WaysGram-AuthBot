@@ -2779,8 +2779,7 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert payload["source"] == "telegram_bot_api"
             assert payload["scope"] == "gifts_available_to_authbot"
             assert payload["currency"] == "stars"
-            # The storefront is sale-filtered, but the Android catalog must be able
-            # to display every Telegram gift even before a WaysGram price is assigned.
+            # The app storefront only lists offers after AuthBot configures price and stock.
             assert payload["count"] == 0
             # The legacy all=1 switch is ignored; private admin inventory remains in AuthBot only.
             full_catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
