@@ -303,6 +303,53 @@ class TelegramMTProtoGiftCatalog:
                 "source": "telegram_mtproto",
             }
 
+    async def download_sticker_preview(self, gift_id: str) -> tuple[bytes, str]:
+        """Download the largest still thumbnail; Android consumes static image bitmaps."""
+        key = str(gift_id)
+        cache_key = "preview:" + key
+        cached = self._media_cache.get(cache_key)
+        if cached is not None:
+            self._media_cache.move_to_end(cache_key)
+            return cached
+
+        gift = self._gifts.get(key)
+        if gift is None:
+            raise LookupError("Telegram gift is not present in the current MTProto cache")
+        document = _value(gift, "sticker")
+        metadata = _sticker_metadata(document)
+        thumbnails = list(_value(document, "thumbs", []) or [])
+        image_thumbnails = [
+            thumb for thumb in thumbnails
+            if "VideoSize" not in type(thumb).__name__
+            and "PhotoPathSize" not in type(thumb).__name__
+        ]
+        if image_thumbnails:
+            thumb = max(
+                image_thumbnails,
+                key=lambda value: (
+                    (_int_value(value, "w") or 0) * (_int_value(value, "h") or 0)
+                ),
+            )
+            payload = await self.client.download_media(document, file=bytes, thumb=thumb)
+            if hasattr(payload, "getvalue"):
+                payload = payload.getvalue()
+            if not isinstance(payload, (bytes, bytearray)) or not payload:
+                raise RuntimeError("MTProto did not return a static gift thumbnail")
+            content = bytes(payload)
+            mime_type = "image/jpeg"
+        elif metadata["is_animated"] or metadata["is_video"]:
+            raise RuntimeError("Animated Telegram gift has no static thumbnail")
+        else:
+            return await self.download_sticker(key)
+
+        if len(content) > MAX_STICKER_BYTES:
+            raise ValueError("Telegram gift thumbnail exceeds the supported size")
+        result = (content, mime_type)
+        self._media_cache[cache_key] = result
+        while len(self._media_cache) > MAX_STICKER_CACHE_ITEMS:
+            self._media_cache.popitem(last=False)
+        return result
+
     async def download_sticker(self, gift_id: str) -> tuple[bytes, str]:
         key = str(gift_id)
         cached = self._media_cache.get(key)
