@@ -3790,7 +3790,11 @@ def build_messenger_router(
                    (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
                    VALUES(?,?,?,?,0,?)""",
                 (receipt_message_id, serial, title, gift_id,
-                 json.dumps({"event_type": "purchase", "price_stars": price}, separators=(",", ":"))),
+                 json.dumps({
+                     "event_type": "purchase",
+                     "native_action": "star_gift_purchase",
+                     "price_stars": price,
+                 }, separators=(",", ":"))),
             )
             await record_event(
                 db, "dm", receipt_message_id, "new_message", uid,
