@@ -1118,6 +1118,24 @@ async def init_admin_storage() -> None:
             details TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS waysgram_labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label_text TEXT NOT NULL CHECK(length(trim(label_text)) BETWEEN 1 AND 32),
+            color TEXT NOT NULL CHECK(length(color)=7),
+            created_by INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS waysgram_label_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label_id INTEGER NOT NULL REFERENCES waysgram_labels(id) ON DELETE CASCADE,
+            target_type TEXT NOT NULL CHECK(target_type IN ('account','channel')),
+            target_id INTEGER NOT NULL,
+            assigned_by INTEGER NOT NULL,
+            assigned_at INTEGER NOT NULL,
+            UNIQUE(label_id,target_type,target_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_waysgram_label_assignments_target
+            ON waysgram_label_assignments(target_type,target_id);
         CREATE TABLE IF NOT EXISTS gift_auctions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             gift_id INTEGER NOT NULL,
@@ -1252,6 +1270,127 @@ async def admin_log(action: str, target: str = "", details: str = "") -> None:
             (ADMIN_ID, action, target[:120], details[:500], int(time.time())))
         await db.commit()
 
+async def admin_labels_page() -> tuple[str, InlineKeyboardMarkup]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT l.id,l.label_text,l.color,
+                      (SELECT COUNT(*) FROM waysgram_label_assignments a
+                       WHERE a.label_id=l.id) AS assigned_count
+               FROM waysgram_labels l ORDER BY l.id DESC"""
+        )
+        rows = await cur.fetchall()
+    keyboard = [[("➕ Создать новую метку", "wgadm:labelnew")]]
+    for row in rows:
+        keyboard.append([(
+            f"{row['label_text']} · {row['color']} · {int(row['assigned_count'])}"[:64],
+            f"wgadm:label:{int(row['id'])}",
+        )])
+    keyboard.append([("⬅️ В меню", "wgadm:home")])
+    body = (
+        f"Метки WaysGram · шаблонов: {len(rows)}\\n"
+        "Создайте метку один раз — она сохранится как шаблон для повторной выдачи."
+    )
+    return body, admin_keyboard(keyboard)
+
+
+async def admin_label_card(label_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT l.id,l.label_text,l.color,
+                      (SELECT COUNT(*) FROM waysgram_label_assignments a
+                       WHERE a.label_id=l.id) AS assigned_count
+               FROM waysgram_labels l WHERE l.id=?""",
+            (label_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    body = (
+        f"Метка #{int(row['id'])}\\n\\n"
+        f"Текст: {row['label_text']}\\nЦвет: {row['color']}\\n"
+        f"Назначений: {int(row['assigned_count'])}"
+    )
+    return body, admin_keyboard([
+        [("Выдать метку", f"wgadm:labelassign:{label_id}")],
+        [("Удалить шаблон", f"wgadm:labeldeleteask:{label_id}")],
+        [("⬅️ К меткам", "wgadm:labels")],
+    ])
+
+
+async def admin_find_label_target(target_type: str, value: str) -> tuple[int, str] | None:
+    value = value.strip()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if target_type == "account":
+            if value.isdigit():
+                cur = await db.execute(
+                    "SELECT telegram_id,username,display_name FROM accounts WHERE telegram_id=?",
+                    (int(value),),
+                )
+            else:
+                cur = await db.execute(
+                    """SELECT telegram_id,username,display_name FROM accounts
+                       WHERE lower(username)=? COLLATE NOCASE LIMIT 1""",
+                    (value.lstrip("@").lower(),),
+                )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            username = str(row["username"] or "").strip()
+            title = f"@{username}" if username else (
+                str(row["display_name"] or "").strip() or f"TG {int(row['telegram_id'])}"
+            )
+            return int(row["telegram_id"]), title
+
+        if target_type == "channel":
+            if value.isdigit():
+                cur = await db.execute(
+                    "SELECT id,title,username FROM channels WHERE id=?",
+                    (int(value),),
+                )
+            else:
+                cur = await db.execute(
+                    """SELECT id,title,username FROM channels
+                       WHERE lower(username)=? COLLATE NOCASE LIMIT 1""",
+                    (value.lstrip("@").lower(),),
+                )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            username = str(row["username"] or "").strip()
+            title = f"@{username}" if username else (
+                str(row["title"] or f"Канал #{int(row['id'])}")
+            )
+            return int(row["id"]), title
+    return None
+
+
+async def admin_assign_label(label_id: int, target_type: str, target_id: int) -> bool:
+    now = int(time.time())
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT 1 FROM waysgram_labels WHERE id=?", (label_id,))
+        if await cur.fetchone() is None:
+            await db.rollback()
+            return False
+        cur = await db.execute(
+            """INSERT OR IGNORE INTO waysgram_label_assignments
+               (label_id,target_type,target_id,assigned_by,assigned_at)
+               VALUES(?,?,?,?,?)""",
+            (label_id, target_type, target_id, ADMIN_ID, now),
+        )
+        added = cur.rowcount == 1
+        if added:
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, "label_assign", f"{target_type}:{target_id}", f"label_id={label_id}", now),
+            )
+        await db.commit()
+    return added
+
+
 def admin_keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
@@ -1264,6 +1403,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [("📊 Статистика", "wgadm:stats")],
         [("👥 Аккаунты", "wgadm:accounts"), ("🎁 Подарки", "wgadm:gifts")],
         [("🎁 Подарки Telegram (цены и остатки)", "wgadm:tggifts")],
+        [("🏷 Метки", "wgadm:labels")],
         [("➕ Создать аккаунт", "wgadm:newacct"), ("🏷 Создать юзернейм", "wgadm:newuname")],
         [("📦 Инвентарь", "wgadm:inventory"), ("🧾 Операции", "wgadm:transactions")],
         [("🎟 Аукционы подарков", "wgadm:auctions")],
@@ -1561,11 +1701,8 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
             if table is None:
                 continue
             cur = await db.execute(
-                f"""SELECT g.gift_id AS id,
-                           CASE WHEN lower(trim(COALESCE(g.title,''))) LIKE 'telegram gift%'
-                                     OR trim(COALESCE(g.title,''))=''
-                                THEN COALESCE(NULLIF(g.sticker_emoji,''),'Подарок Telegram')
-                                ELSE g.title END AS title,
+                f"""SELECT g.gift_id AS id,g.title AS title,
+                           g.sticker_emoji AS sticker_emoji,g.sticker_set_name AS sticker_set_name,
                            COALESCE(p.price_stars,0) AS price_stars,
                            COALESCE(p.supply,0) AS supply,
                            COALESCE(p.sold,0) AS sold,
@@ -1578,6 +1715,9 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
                 if gift_id in by_id:
                     continue
                 item = dict(row)
+                item["title"] = telegram_gift_display_name(
+                    item.get("title"), item.get("sticker_set_name"), gift_id
+                )
                 item["catalog_source"] = catalog_source
                 item["telegram_available"] = bool(item.get("telegram_available"))
                 by_id[gift_id] = item
@@ -1610,6 +1750,31 @@ async def telegram_gift_rows() -> list[dict[str, Any]]:
         )
     )
     return rows
+
+def telegram_gift_display_name(title: Any, sticker_set_name: Any, gift_id: str = "") -> str:
+    raw_title = str(title or "").strip()
+    generic = (
+        not raw_title
+        or raw_title.casefold().startswith("telegram gift")
+        or raw_title.casefold() in {"gift", "star gift", "telegram"}
+        or not any(character.isalnum() for character in raw_title)
+    )
+    if not generic:
+        return raw_title[:160]
+
+    slug = str(sticker_set_name or "").strip()
+    if slug.casefold().startswith("plushpepe"):
+        return "Plush Pepe"
+    if slug:
+        readable = re.sub(r"([a-z0-9])([A-Z])", r"\\1 \\2", slug)
+        readable = re.sub(r"([A-Z])([A-Z][a-z])", r"\\1 \\2", readable)
+        readable = re.sub(r"[_-]+", " ", readable)
+        readable = re.sub(r"\\s+", " ", readable).strip()
+        readable = re.sub(r"^(?:telegram\\s*)?gift\\s*", "", readable, flags=re.IGNORECASE).strip()
+        if readable and any(character.isalnum() for character in readable):
+            return readable[:160]
+    return "Подарок Telegram"
+
 
 def telegram_gift_label(row: dict[str, Any]) -> str:
     remaining = max(int(row["supply"]) - int(row["sold"]), 0)
@@ -1788,6 +1953,84 @@ async def admin_callback(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     action = parts[1]
     await callback.answer()
+    if action == "labels":
+        body, keyboard = await admin_labels_page()
+        await callback.message.answer(body, reply_markup=keyboard)
+    elif action == "labelnew":
+        ADMIN_INPUT[ADMIN_ID] = ("label_text", None)
+        await callback.message.answer("Введите текст метки (1–32 символа).")
+    elif action == "label" and len(parts) == 3:
+        try:
+            label_id = int(parts[2])
+        except ValueError:
+            return
+        card = await admin_label_card(label_id)
+        if card:
+            await callback.message.answer(card[0], reply_markup=card[1])
+        else:
+            await callback.message.answer("Шаблон метки не найден.")
+    elif action == "labelassign" and len(parts) == 3:
+        try:
+            label_id = int(parts[2])
+        except ValueError:
+            return
+        if not await admin_label_card(label_id):
+            await callback.message.answer("Шаблон метки не найден.")
+            return
+        await callback.message.answer(
+            "Кому выдать метку?",
+            reply_markup=admin_keyboard([
+                [("👤 Аккаунту", f"wgadm:labeltarget:account:{label_id}")],
+                [("📢 Каналу", f"wgadm:labeltarget:channel:{label_id}")],
+                [("⬅️ К метке", f"wgadm:label:{label_id}")],
+            ]),
+        )
+    elif action == "labeltarget" and len(parts) == 4 and parts[2] in {"account", "channel"}:
+        try:
+            label_id = int(parts[3])
+        except ValueError:
+            return
+        ADMIN_INPUT[ADMIN_ID] = ("label_target", (label_id, parts[2]))
+        target_hint = "Telegram ID или @username аккаунта" if parts[2] == "account" else "ID или @username канала"
+        await callback.message.answer(f"Введите {target_hint}.")
+    elif action == "labeldeleteask" and len(parts) == 3:
+        try:
+            label_id = int(parts[2])
+        except ValueError:
+            return
+        if not await admin_label_card(label_id):
+            await callback.message.answer("Шаблон метки не найден.")
+            return
+        await callback.message.answer(
+            "Удалить шаблон и снять эту метку со всех аккаунтов и каналов?",
+            reply_markup=admin_keyboard([
+                [("Удалить", f"wgadm:labeldelete:{label_id}")],
+                [("Отмена", f"wgadm:label:{label_id}")],
+            ]),
+        )
+    elif action == "labeldelete" and len(parts) == 3:
+        try:
+            label_id = int(parts[2])
+        except ValueError:
+            return
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute("SELECT label_text FROM waysgram_labels WHERE id=?", (label_id,))
+            row = await cur.fetchone()
+            if row is None:
+                await db.rollback()
+                await callback.message.answer("Шаблон метки уже удалён.")
+                return
+            await db.execute("DELETE FROM waysgram_label_assignments WHERE label_id=?", (label_id,))
+            await db.execute("DELETE FROM waysgram_labels WHERE id=?", (label_id,))
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, "label_delete", str(label_id), str(row[0]), int(time.time())),
+            )
+            await db.commit()
+        await callback.message.answer("Шаблон удалён, его назначения сняты.")
+        body, keyboard = await admin_labels_page()
+        await callback.message.answer(body, reply_markup=keyboard)
     if action == "home":
         await callback.message.answer("Панель администратора WaysGram", reply_markup=admin_home_keyboard())
 
@@ -2643,7 +2886,52 @@ async def admin_text_input(message: Message) -> None:
         return
     kind, payload = state
     value = (message.text or "").strip()
-    if kind == "search":
+    if kind == "label_text":
+        if not 1 <= len(value) <= 32:
+            await message.answer("Текст метки должен содержать от 1 до 32 символов. Попробуйте ещё раз.")
+            return
+        ADMIN_INPUT[ADMIN_ID] = ("label_color", value)
+        await message.answer("Введите цвет метки в HEX-формате, например #2A82DA.")
+    elif kind == "label_color":
+        color = value.upper()
+        if not re.fullmatch(r"#[0-9A-F]{6}", color):
+            await message.answer("Некорректный цвет. Нужен формат #RRGGBB, например #2A82DA.")
+            return
+        now = int(time.time())
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            cur = await db.execute(
+                """INSERT INTO waysgram_labels(label_text,color,created_by,created_at)
+                   VALUES(?,?,?,?)""",
+                (str(payload), color, ADMIN_ID, now),
+            )
+            label_id = int(cur.lastrowid)
+            await db.execute(
+                "INSERT INTO admin_logs(admin_id,action,target,details,created_at) VALUES(?,?,?,?,?)",
+                (ADMIN_ID, "label_create", str(label_id), f"{payload}; color={color}", now),
+            )
+            await db.commit()
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        card = await admin_label_card(label_id)
+        await message.answer("Шаблон метки сохранён.")
+        if card:
+            await message.answer(card[0], reply_markup=card[1])
+    elif kind == "label_target":
+        label_id, target_type = payload
+        target = await admin_find_label_target(str(target_type), value)
+        if target is None:
+            target_name = "Аккаунт" if target_type == "account" else "Канал"
+            await message.answer(f"{target_name} не найден. Проверьте ID или username и повторите.")
+            return
+        target_id, target_title = target
+        assigned = await admin_assign_label(int(label_id), str(target_type), int(target_id))
+        ADMIN_INPUT.pop(ADMIN_ID, None)
+        target_word = "аккаунту" if target_type == "account" else "каналу"
+        result = "Метка выдана" if assigned else "Эта метка уже назначена"
+        await message.answer(f"{result} {target_word} {target_title}.")
+        card = await admin_label_card(int(label_id))
+        if card:
+            await message.answer(card[0], reply_markup=card[1])
+    elif kind == "search":
         ADMIN_INPUT.pop(ADMIN_ID, None)
         async with aiosqlite.connect(DATABASE_PATH) as db:
             db.row_factory = aiosqlite.Row
