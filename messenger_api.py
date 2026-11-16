@@ -4290,7 +4290,8 @@ def build_messenger_router(
             for candidate in source_order:
                 if candidate == "telegram_mtproto":
                     cur = await db.execute(
-                        """SELECT sticker_mime_type,sticker_document_id,sticker_dc_id,sticker_size
+                        """SELECT sticker_mime_type,sticker_document_id,sticker_dc_id,sticker_size,
+                                  sticker_is_animated,sticker_is_video
                            FROM telegram_mtproto_gift_catalog WHERE gift_id=?""",
                         (gift_id,),
                     )
@@ -4315,6 +4316,17 @@ def build_messenger_router(
                     if provider is None:
                         continue
                     content, media_type = await provider.download_sticker_preview(gift_id)
+                    try:
+                        content, media_type = _normalize_gift_preview(content)
+                    except ValueError:
+                        is_motion = (
+                            bool(sticker_row["sticker_is_animated"])
+                            or bool(sticker_row["sticker_is_video"])
+                            or str(sticker_row["sticker_mime_type"] or "").lower() == "application/x-tgsticker"
+                            or str(sticker_row["sticker_mime_type"] or "").lower().startswith("video/")
+                        )
+                        if not is_motion:
+                            raise
                 else:
                     bot = bot_provider()
                     if bot is None:
@@ -4336,6 +4348,7 @@ def build_messenger_router(
                     if not preview_file_ids:
                         continue
                     normalized_preview = None
+                    raw_motion_preview = None
                     for preview_file_id in preview_file_ids:
                         try:
                             candidate_bytes, candidate_mime = await fetch_telegram_sticker(
@@ -4343,15 +4356,21 @@ def build_messenger_router(
                                 preview_file_id,
                                 str(sticker_row["sticker_mime_type"] or ""),
                             )
-                            normalized_preview = _normalize_gift_preview(candidate_bytes)
-                            break
+                            try:
+                                normalized_preview = _normalize_gift_preview(candidate_bytes)
+                                break
+                            except ValueError:
+                                if is_motion and preview_file_id == main_file_id:
+                                    raw_motion_preview = (candidate_bytes, candidate_mime)
                         except Exception:
                             continue
-                    if normalized_preview is None:
+                    if normalized_preview is not None:
+                        content, media_type = normalized_preview
+                    elif raw_motion_preview is not None:
+                        # WaysGram's Telegram renderer can extract a frame from raw TGS/WebM.
+                        content, media_type = raw_motion_preview
+                    else:
                         continue
-                    content, media_type = normalized_preview
-                if catalog_source == "telegram_mtproto":
-                    content, media_type = _normalize_gift_preview(content)
                 return Response(
                     content=content,
                     media_type=media_type,
