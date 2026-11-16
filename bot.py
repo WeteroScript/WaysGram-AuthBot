@@ -1086,7 +1086,10 @@ async def init_admin_storage() -> None:
             gift_id INTEGER REFERENCES gift_catalog(id) ON DELETE SET NULL,
             gift_name TEXT NOT NULL,
             owner_telegram_id INTEGER NOT NULL,
-            acquired_at INTEGER NOT NULL
+            acquired_at INTEGER NOT NULL,
+            telegram_gift_id TEXT NOT NULL DEFAULT '',
+            gift_emoji TEXT NOT NULL DEFAULT '',
+            telegram_gift_metadata_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE TABLE IF NOT EXISTS economy_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1160,6 +1163,12 @@ async def init_admin_storage() -> None:
         user_gift_columns = {str(row[1]) for row in await cur.fetchall()}
         if "telegram_gift_id" not in user_gift_columns:
             await db.execute("ALTER TABLE user_gifts ADD COLUMN telegram_gift_id TEXT NOT NULL DEFAULT ''")
+        if "gift_emoji" not in user_gift_columns:
+            await db.execute("ALTER TABLE user_gifts ADD COLUMN gift_emoji TEXT NOT NULL DEFAULT ''")
+        if "telegram_gift_metadata_json" not in user_gift_columns:
+            await db.execute(
+                "ALTER TABLE user_gifts ADD COLUMN telegram_gift_metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
         await db.commit()
 
 
