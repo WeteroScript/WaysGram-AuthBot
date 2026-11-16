@@ -1243,7 +1243,7 @@ def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.Mo
             )
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("image/png")
-            assert response.content.startswith(b"\\x89PNG\\r\\n\\x1a\\n")
+            assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
             assert downloaded_file_ids == ["static-thumbnail-file"]
 
     run(scenario())
