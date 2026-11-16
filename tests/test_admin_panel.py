@@ -171,7 +171,7 @@ def test_admin_creates_reusable_labels_and_assigns_accounts_and_channels(panel) 
     menu = press("wgadm:labels")
     assert "шаблонов" in menu.sent[0][0].lower()
     press("wgadm:labelnew")
-    assert "текст метки" in type_text("Official").sent[0][0].lower()
+    assert "цвет метки" in type_text("Official").sent[0][0].lower()
     created = type_text("#1769AA")
     assert "Шаблон метки сохранён" in created.sent[0][0]
     assert query(path, "SELECT label_text,color FROM waysgram_labels") == [("Official", "#1769AA")]
