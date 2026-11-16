@@ -1203,16 +1203,24 @@ def _gift_display_title(title: Any, sticker_set_name: Any) -> str:
         return value[:160]
 
     slug = str(sticker_set_name or "").strip()
-    compact = re.sub(r"[^a-z0-9]", "", slug.casefold())
+    compact = "".join(character for character in slug.casefold() if character.isalnum())
     if compact.startswith("plushpepe"):
         return "Plush Pepe"
     if not slug or compact.startswith("telegramgift"):
         return "Подарок Telegram"
 
-    readable = re.sub(r"([a-z0-9])([A-Z])", r"\\1 \\2", slug)
-    readable = re.sub(r"([A-Z])([A-Z][a-z])", r"\\1 \\2", readable)
-    readable = re.sub(r"[_-]+", " ", readable)
-    readable = re.sub(r"\\s+", " ", readable).strip()
+    slug = slug.replace("_", " ").replace("-", " ").strip()
+    words: list[str] = []
+    current = ""
+    for character in slug:
+        if character.isupper() and current and current[-1].islower():
+            words.append(current)
+            current = character
+        else:
+            current += character
+    if current:
+        words.append(current)
+    readable = " ".join(words).strip()
     if readable and any(character.isalnum() for character in readable):
         return readable[:160]
     return "Подарок Telegram"
@@ -4342,7 +4350,8 @@ def build_messenger_router(
                     if normalized_preview is None:
                         continue
                     content, media_type = normalized_preview
-                content, media_type = _normalize_gift_preview(content) if catalog_source == "telegram_mtproto" else (content, media_type)
+                if catalog_source == "telegram_mtproto":
+                    content, media_type = _normalize_gift_preview(content)
                 return Response(
                     content=content,
                     media_type=media_type,
