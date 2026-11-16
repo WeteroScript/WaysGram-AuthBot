@@ -1766,11 +1766,11 @@ def telegram_gift_display_name(title: Any, sticker_set_name: Any, gift_id: str =
     if slug.casefold().startswith("plushpepe"):
         return "Plush Pepe"
     if slug:
-        readable = re.sub(r"([a-z0-9])([A-Z])", r"\\1 \\2", slug)
-        readable = re.sub(r"([A-Z])([A-Z][a-z])", r"\\1 \\2", readable)
+        readable = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", slug)
+        readable = re.sub(r"([A-Z])([A-Z][a-z])", r"\1 \2", readable)
         readable = re.sub(r"[_-]+", " ", readable)
-        readable = re.sub(r"\\s+", " ", readable).strip()
-        readable = re.sub(r"^(?:telegram\\s*)?gift\\s*", "", readable, flags=re.IGNORECASE).strip()
+        readable = re.sub(r"\s+", " ", readable).strip()
+        readable = re.sub(r"^(?:telegram\s*)?gift\s*", "", readable, flags=re.IGNORECASE).strip()
         if readable and any(character.isalnum() for character in readable):
             return readable[:160]
     return "Подарок Telegram"
