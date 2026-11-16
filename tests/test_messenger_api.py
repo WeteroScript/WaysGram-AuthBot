@@ -5322,3 +5322,49 @@ def test_manual_telegram_gift_id_without_catalog_metadata_is_purchasable_in_ways
     manual = next(row for row in manual_rows if row["id"] == "5807641025165919973")
     assert manual["catalog_source"] == "waysgram_manual"
     assert manual["telegram_available"] is False
+
+def test_admin_labels_are_exposed_on_account_and_channel_profiles(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 85001, "label_viewer")
+    add_account(api_env, 85002, "label_target")
+    token = "label-viewer-session"
+    add_session(path, 85001, token)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            created = await client.post(
+                "/api/channels",
+                headers=headers,
+                json={"username": "label_target_channel", "title": "Label Target Channel"},
+            )
+            assert created.status_code == 201
+            channel_id = created.json()["id"]
+
+            now = int(time.time())
+            with db_split.sqlite_connect(path) as db:
+                cursor = db.execute(
+                    "INSERT INTO waysgram_labels(label_text,color,created_by,created_at) VALUES(?,?,?,?)",
+                    ("Official", "#1769AA", 424242, now),
+                )
+                label_id = int(cursor.lastrowid)
+                db.executemany(
+                    """INSERT INTO waysgram_label_assignments
+                       (label_id,target_type,target_id,assigned_by,assigned_at)
+                       VALUES(?,?,?,?,?)""",
+                    [
+                        (label_id, "account", 85002, 424242, now),
+                        (label_id, "channel", channel_id, 424242, now),
+                    ],
+                )
+
+            profile = await client.get("/api/users/85002", headers=headers)
+            assert profile.status_code == 200
+            assert profile.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+            channel = await client.get(f"/api/channels/{channel_id}", headers=headers)
+            assert channel.status_code == 200
+            assert channel.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+    run(scenario())
+
