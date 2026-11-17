@@ -3538,6 +3538,8 @@ def build_messenger_router(
             common_contacts = [dict(item) for item in await cur.fetchall()]
         profile = dict(row)
         profile["labels"] = await entity_labels("account", user_id)
+        for contact in common_contacts:
+            contact["labels"] = await entity_labels("account", int(contact["id"]))
         metadata_by_id: dict[str, dict[str, Any] | None] = {}
         async with aiosqlite.connect(db_path()) as gift_db:
             gift_db.row_factory = aiosqlite.Row
