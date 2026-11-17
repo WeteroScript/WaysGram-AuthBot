@@ -3174,7 +3174,6 @@ def build_messenger_router(
                 )
                 item["can_upgrade"] = bool(
                     telegram_gift and telegram_gift.get("can_upgrade")
-                    and int(item.get("upgrade_level") or 0) == 0
                 )
                 item["sticker_available"] = bool(
                     item.get("sticker_available")
