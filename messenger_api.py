@@ -8757,7 +8757,12 @@ def build_messenger_router(
                 (uid, uid, uid, uid, uid, uid, uid, uid, uid),
             )
             rows = await cur.fetchall()
-        return {"conversations": [dict(row) for row in rows]}
+        conversations = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("account", int(item["id"]))
+            conversations.append(item)
+        return {"conversations": conversations}
 
     # Group chats: membership and role checks are enforced on every read/write.
     @router.get("/api/groups")
