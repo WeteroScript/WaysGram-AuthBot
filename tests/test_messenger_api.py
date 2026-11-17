@@ -5434,5 +5434,46 @@ def test_admin_labels_are_exposed_on_account_and_channel_profiles(api_env) -> No
                 {"text": "Official", "color": "#1769AA"}
             ]
 
+            added_admin = await client.post(
+                f"/api/channels/{channel_id}/admins",
+                headers=headers,
+                json={"telegram_id": 85002},
+            )
+            assert added_admin.status_code == 201
+            admins = await client.get(
+                f"/api/channels/{channel_id}/admins", headers=headers
+            )
+            assert admins.status_code == 200
+            target_admin = next(
+                item for item in admins.json()["admins"]
+                if item["telegram_id"] == 85002
+            )
+            assert target_admin["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
+            group = await client.post(
+                "/api/groups", headers=headers, json={"title": "Label Test Group"}
+            )
+            assert group.status_code == 201
+            group_id = group.json()["id"]
+            added_member = await client.post(
+                f"/api/groups/{group_id}/members",
+                headers=headers,
+                json={"telegram_id": 85002},
+            )
+            assert added_member.status_code == 201
+            group_detail = await client.get(
+                f"/api/groups/{group_id}", headers=headers
+            )
+            assert group_detail.status_code == 200
+            target_member = next(
+                item for item in group_detail.json()["members"]
+                if item["telegram_id"] == 85002
+            )
+            assert target_member["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
     run(scenario())
 
