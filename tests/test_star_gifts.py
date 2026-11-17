@@ -104,7 +104,7 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert bought.json()["price_stars"] == 40
             assert bought.json()["stars"] == 5000 - 40
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
-            assert len(mine) == 1 and mine[0]["gift_name"] == "🎁"
+            assert len(mine) == 1 and mine[0]["gift_name"] == "Подарок Telegram"
             conn = db_split.sqlite_connect(path)
             try:
                 self_receipt = conn.execute(
@@ -512,7 +512,7 @@ def test_public_profile_includes_received_gifts(env) -> None:
             assert len(data["gifts"]) == 1
             gift = data["gifts"][0]
             assert gift["telegram_gift_id"] == "g1"
-            assert gift["gift_name"] == "🎁"
+            assert gift["gift_name"] == "Подарок Telegram"
             assert gift["serial_number"] == purchase.json()["gift"]["serial_number"]
 
             # Public profile output must not include account credentials or phone data.
@@ -970,7 +970,7 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["sender_id"] == 101
             assert receipt["recipient_id"] == 101
             assert receipt["body"] == ""
-            assert receipt["gift_name"] == "🎁"
+            assert receipt["gift_name"] == "Подарок Telegram"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
             assert receipt["gift_attributes"] == {
@@ -1114,7 +1114,7 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
             for history in (sender_history, receiver_history):
                 item = next(message for message in history["messages"] if message["id"] == sent.json()["id"])
                 assert item["gift_serial_number"] == serial
-                assert item["gift_name"] == "🎁"
+                assert item["gift_name"] == "Подарок Telegram"
                 assert item["gift_upgrade_level"] == 1
                 assert item["gift_emoji"] == "🎁"
                 assert item["gift_telegram_metadata"]["emoji"] == "🎁"
@@ -1252,10 +1252,13 @@ def test_messenger_storage_repairs_missing_gift_inventory_columns(env) -> None:
 def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.MonkeyPatch) -> None:
     path, app = env
     expected_png = _png()
+    raw_webm = bytes.fromhex("1a45dfa3") + b"waysgram-test-animation"
     downloaded_file_ids: list[str] = []
 
     async def fake_download(bot, file_id: str, preferred_mime: str = ""):
         downloaded_file_ids.append(file_id)
+        if file_id == "animated-sticker-file":
+            return raw_webm, "video/webm"
         return expected_png, "image/png"
 
     monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_download)
@@ -1288,7 +1291,77 @@ def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.Mo
             )
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("image/png")
-            assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert response.content.startswith(bytes.fromhex("89504e470d0a1a0a"))
             assert downloaded_file_ids == ["static-thumbnail-file"]
+
+            animated_response = await client.get(
+                "/api/telegram/gifts/g1/sticker?animated=1",
+                headers=headers(101),
+            )
+            assert animated_response.status_code == 200
+            assert animated_response.headers["content-type"].startswith("video/webm")
+            assert animated_response.content == raw_webm
+            assert downloaded_file_ids[-1] == "animated-sticker-file"
+
+    run(scenario())
+
+
+
+def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) -> None:
+    path, app = env
+    gift_id = "5922558454332916696"
+    receipt_body = (
+        "Вы приобрели коллекционный подарок "
+        + "«Telegram Gift " + gift_id + "»"
+    )
+
+    async def scenario() -> None:
+        await messenger_api.store_telegram_gifts(
+            path,
+            [{
+                "id": gift_id,
+                "title": "Telegram Gift " + gift_id,
+                "sticker_set_name": "AlgorithmCup",
+                "sticker": {
+                    "file_id": "legacy-gift-sticker",
+                    "file_unique_id": "legacy-gift-sticker-unique",
+                    "type": "regular",
+                    "width": 512,
+                    "height": 512,
+                    "is_animated": False,
+                    "is_video": False,
+                    "emoji": "🏆",
+                    "mime_type": "image/webp",
+                    "set_name": "AlgorithmCup",
+                },
+                "star_count": 25,
+            }],
+        )
+        connection = db_split.sqlite_connect(path)
+        try:
+            connection.execute(
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(101,101,?,?)""",
+                (receipt_body, int(time.time())),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        async with await client_for(app) as client:
+            result = await client.get("/api/messages?with=101", headers=headers(101))
+            assert result.status_code == 200
+            receipt = next(
+                item for item in result.json()["messages"]
+                if item["body"] == receipt_body
+            )
+            assert receipt["gift_name"] == "Algorithm Cup"
+            assert receipt["gift_telegram_gift_id"] == gift_id
+            assert receipt["gift_telegram_metadata"]["title"] == "Algorithm Cup"
+            assert receipt["gift_telegram_metadata"]["sticker_available"] is True
+            assert receipt["gift_attributes"]["event_type"] == "purchase"
+            assert receipt["gift_attributes"]["native_action"] == "star_gift_purchase"
+            assert receipt["gift_attributes"]["legacy_receipt"] is True
 
     run(scenario())
