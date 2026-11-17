@@ -5477,3 +5477,42 @@ def test_admin_labels_are_exposed_on_account_and_channel_profiles(api_env) -> No
 
     run(scenario())
 
+
+def test_mtproto_sticker_proxy_falls_back_without_catalog_row(api_env) -> None:
+    path, auth_store, fake_bot, _old_app = api_env
+    add_account(api_env, 88120, "plush_preview_user")
+    add_session(path, 88120, "plush-preview-session")
+
+    class FakeMTProtoProvider:
+        async def download_sticker_preview(self, gift_id: str):
+            assert gift_id == "5936013938331222567"
+            return test_preview_png(), "image/png"
+
+        async def download_sticker(self, gift_id: str):
+            assert gift_id == "5936013938331222567"
+            return test_preview_png(), "image/png"
+
+    provider = FakeMTProtoProvider()
+    app = FastAPI()
+    app.include_router(
+        build_messenger_router(
+            path,
+            auth_store,
+            lambda: fake_bot,
+            bot_module.account_is_banned,
+            lambda: provider,
+        )
+    )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.get(
+                "/api/telegram/gifts/5936013938331222567/sticker",
+                headers={"Authorization": "Bearer plush-preview-session"},
+            )
+            assert response.status_code == 200
+            assert response.content.startswith(b"\\x89PNG\\r\\n\\x1a\\n")
+            assert response.headers["content-type"].startswith("image/png")
+
+    run(scenario())
+
