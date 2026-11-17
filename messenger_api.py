@@ -3419,7 +3419,12 @@ def build_messenger_router(
                 (uid,),
             )
             rows = await cur.fetchall()
-        return {"blocked_users": [dict(row) for row in rows], "count": len(rows)}
+        blocked_users = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("account", int(item["id"]))
+            blocked_users.append(item)
+        return {"blocked_users": blocked_users, "count": len(blocked_users)}
 
     @router.post("/api/blocks", status_code=201)
     async def block_user(
