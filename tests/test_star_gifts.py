@@ -987,6 +987,11 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
     run(scenario())
 
 
+def test_ordinary_chat_text_is_not_treated_as_gift_purchase_receipt() -> None:
+    assert messenger_api._legacy_gift_purchase_details("Я купил подарок сегодня") is None
+    assert messenger_api._legacy_gift_purchase_details("I bought a gift yesterday") is None
+
+
 def test_purchase_snapshot_recovers_missing_sticker_available_flag() -> None:
     current = {
         "id": "5936013938331222567",
