@@ -5511,7 +5511,7 @@ def test_mtproto_sticker_proxy_falls_back_without_catalog_row(api_env) -> None:
                 headers={"Authorization": "Bearer plush-preview-session"},
             )
             assert response.status_code == 200
-            assert response.content.startswith(b"\\x89PNG\\r\\n\\x1a\\n")
+            assert response.content.startswith(bytes.fromhex("89504e470d0a1a0a"))
             assert response.headers["content-type"].startswith("image/png")
 
     run(scenario())
