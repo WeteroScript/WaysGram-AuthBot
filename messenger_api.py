@@ -4470,12 +4470,14 @@ def build_messenger_router(
                 return None
 
         if not candidates:
-            provider_response = await mtproto_sticker_fallback()
-            if provider_response is not None:
-                return provider_response
+            # Prefer the exact purchase-time snapshot when present; it preserves
+            # the media representation already associated with the user's gift.
             snapshot_response = await purchase_snapshot_fallback()
             if snapshot_response is not None:
                 return snapshot_response
+            provider_response = await mtproto_sticker_fallback()
+            if provider_response is not None:
+                return provider_response
             raise HTTPException(status_code=404, detail="Подарок не найден в текущем или историческом каталоге")
 
         if animated:
