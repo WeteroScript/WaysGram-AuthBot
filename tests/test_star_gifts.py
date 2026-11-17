@@ -1430,3 +1430,28 @@ def test_purchase_snapshot_keeps_sticker_available_after_catalog_rows_are_remove
             assert animated.content == raw_webm
 
     run(scenario())
+
+
+def test_public_profile_returns_all_owned_gifts_without_a_50_item_cap(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=1, supply=60)
+        async with await client_for(app) as client:
+            for index in range(55):
+                purchased = await client.post(
+                    "/api/telegram/gifts/g1/purchase",
+                    headers={
+                        **headers(101),
+                        "Idempotency-Key": f"profile-gift-page-regression-{index:03d}",
+                    },
+                    json={},
+                )
+                assert purchased.status_code == 201
+
+            profile = await client.get("/api/users/101", headers=headers(102))
+            assert profile.status_code == 200
+            assert len(profile.json()["gifts"]) == 55
+            assert len({gift["serial_number"] for gift in profile.json()["gifts"]}) == 55
+
+    run(scenario())
