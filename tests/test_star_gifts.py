@@ -1252,10 +1252,13 @@ def test_messenger_storage_repairs_missing_gift_inventory_columns(env) -> None:
 def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.MonkeyPatch) -> None:
     path, app = env
     expected_png = _png()
+    raw_webm = b"\\x1a\\x45\\xdf\\xa3waysgram-test-animation"
     downloaded_file_ids: list[str] = []
 
     async def fake_download(bot, file_id: str, preferred_mime: str = ""):
         downloaded_file_ids.append(file_id)
+        if file_id == "animated-sticker-file":
+            return raw_webm, "video/webm"
         return expected_png, "image/png"
 
     monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_download)
@@ -1288,7 +1291,17 @@ def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.Mo
             )
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("image/png")
-            assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+            assert response.content.startswith(b"\\x89PNG\\r\\n\\x1a\\n")
             assert downloaded_file_ids == ["static-thumbnail-file"]
 
+            animated_response = await client.get(
+                "/api/telegram/gifts/g1/sticker?animated=1",
+                headers=headers(101),
+            )
+            assert animated_response.status_code == 200
+            assert animated_response.headers["content-type"].startswith("video/webm")
+            assert animated_response.content == raw_webm
+            assert downloaded_file_ids[-1] == "animated-sticker-file"
+
     run(scenario())
+
