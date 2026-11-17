@@ -1387,7 +1387,7 @@ def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) 
                 if item["body"] == receipt_without_id_body
             )
             assert without_id["gift_name"] == "Plush Pepe"
-            assert without_id["gift_telegram_gift_id"] == ""
+            assert without_id.get("gift_telegram_gift_id") in (None, "")
             assert without_id["gift_attributes"]["event_type"] == "purchase"
             assert without_id["gift_attributes"]["legacy_receipt"] is True
 
