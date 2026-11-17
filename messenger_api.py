@@ -3159,14 +3159,13 @@ def build_messenger_router(
     @router.get("/api/me/gifts")
     async def my_gifts(
         authorization: str | None = Header(default=None),
-        limit: int = Query(default=100, ge=1, le=200),
+        limit: int | None = Query(default=None, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
         user = await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,gift_emoji,
+            query = """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,gift_emoji,
                           telegram_gift_metadata_json,acquired_at,upgrade_level,attributes_json,
                           EXISTS(SELECT 1 FROM gift_market_listings l
                                  WHERE l.serial_number=user_gifts.serial_number
@@ -3185,12 +3184,21 @@ def build_messenger_router(
                           ) AS sticker_available,
                           EXISTS(SELECT 1 FROM telegram_auction_gift_registry r
                                  WHERE r.gift_id=user_gifts.telegram_gift_id) AS auction_eligible
-                   FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC LIMIT ? OFFSET ?""",
-                (int(user["telegram_id"]), limit + 1, offset),
-            )
+                   FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC"""
+            query_params: tuple[Any, ...] = (int(user["telegram_id"]),)
+            if limit is not None:
+                query += " LIMIT ? OFFSET ?"
+                query_params += (limit + 1, offset)
+            elif offset:
+                query += " LIMIT -1 OFFSET ?"
+                query_params += (offset,)
+            cur = await db.execute(query, query_params)
             rows = await cur.fetchall()
-        has_more = len(rows) > limit
-        rows = rows[:limit]
+        if limit is None:
+            has_more = False
+        else:
+            has_more = len(rows) > limit
+            rows = rows[:limit]
         gifts = []
         metadata_by_id: dict[str, dict[str, Any] | None] = {}
         async with aiosqlite.connect(db_path()) as gift_db:
