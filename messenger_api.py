@@ -3449,7 +3449,7 @@ def build_messenger_router(
                                  WHERE r.gift_id=user_gifts.telegram_gift_id) AS auction_eligible
                    FROM user_gifts
                    WHERE owner_telegram_id=?
-                   ORDER BY id DESC LIMIT 50""",
+                   ORDER BY id DESC""",
                 (user_id,),
             )
             gifts = [dict(item) for item in await cur.fetchall()]
