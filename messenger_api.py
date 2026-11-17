@@ -1228,6 +1228,31 @@ def _gift_display_title(title: Any, sticker_set_name: Any, gift_id: str = "") ->
     return "Подарок Telegram"
 
 
+def _legacy_gift_purchase_details(body: Any) -> dict[str, str] | None:
+    """Recognize historical human-readable gift purchase receipts as structured events."""
+    value = str(body or "").strip()
+    if not value:
+        return None
+    purchase_pattern = re.compile(
+        r"(?:\bвы\s+)?(?:приобрели|купили)\s+(?:коллекционный\s+)?подарок"
+        r"|(?:\byou\s+)?(?:purchased|bought)\s+(?:a\s+)?(?:collectible\s+)?gift",
+        re.IGNORECASE,
+    )
+    if purchase_pattern.search(value) is None:
+        return None
+    gift_match = re.search(
+        r"(?:telegram\s+)?gift[\s:#-]*([0-9]{5,})",
+        value,
+        re.IGNORECASE,
+    )
+    quoted_match = re.search(r"[«“\"']([^»”\"']{1,160})[»”\"']", value)
+    title = quoted_match.group(1).strip() if quoted_match else ""
+    return {
+        "gift_id": gift_match.group(1) if gift_match else "",
+        "title": title,
+    }
+
+
 async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | None:
     """Return merged Telegram catalogue metadata for one gift ID."""
     gift_id = str(gift_id or "").strip()
@@ -6314,23 +6339,20 @@ def build_messenger_router(
                         except (TypeError, ValueError):
                             parsed_snapshot = {}
                         snapshot = parsed_snapshot if isinstance(parsed_snapshot, dict) else {}
-                # Backfill the structured gift attachment for historical text receipts.
-                # Older purchases only stored "Telegram Gift <id>" in the message body.
-                if not gift_id and str(item.get("body") or "").startswith(
-                    "Вы приобрели коллекционный подарок"
-                ):
-                    legacy_match = re.search(
-                        r"(?:Telegram\s+)?Gift\s+([0-9]{5,})",
-                        str(item.get("body") or ""),
-                        re.IGNORECASE,
-                    )
-                    if legacy_match:
-                        gift_id = legacy_match.group(1)
+                # Backfill every known legacy receipt shape, not only one exact prefix.
+                # Some older purchases used localized copy, quote variants or omitted the
+                # numeric Telegram ID; they must still render as gift cards in Saved Messages.
+                legacy_receipt = _legacy_gift_purchase_details(item.get("body"))
+                if legacy_receipt is not None:
+                    if not gift_id and legacy_receipt["gift_id"]:
+                        gift_id = legacy_receipt["gift_id"]
                         item["gift_telegram_gift_id"] = gift_id
-                        if not serial:
-                            title = await telegram_gift_title(gift_db, gift_id)
-                            if title:
-                                item["gift_name"] = title
+                    if not item.get("gift_name"):
+                        if gift_id and not serial:
+                            item["gift_name"] = await telegram_gift_title(gift_db, gift_id)
+                        if not item.get("gift_name") and legacy_receipt["title"]:
+                            item["gift_name"] = legacy_receipt["title"]
+                    if not item["gift_attributes"].get("event_type"):
                         item["gift_attributes"] = {
                             "event_type": "purchase",
                             "native_action": "star_gift_purchase",
