@@ -1328,7 +1328,9 @@ async def _telegram_gift_metadata(db: Any, gift_id: str) -> dict[str, Any] | Non
         sold_out = is_limited and int(row["remaining_count"] or 0) <= 0
         total_count = _optional_int(row["total_count"])
         remaining_count = _optional_int(row["remaining_count"])
-        primary_sticker_available = bool(row["sticker_file_id"])
+        primary_sticker_available = bool(
+            row["sticker_file_id"] or row["sticker_thumbnail_file_id"]
+        )
         fallback_sticker_available = bool(fallback_row is not None and fallback_row["sticker_document_id"])
 
     raw_background = row["background_json"] or (
@@ -1402,7 +1404,14 @@ def _merge_telegram_gift_metadata(
     if isinstance(current_sticker, dict):
         sticker.update(current_sticker)
     current_available = bool(current.get("sticker_available"))
-    snapshot_available = bool(snapshot.get("sticker_available"))
+    snapshot_has_sticker_media = isinstance(snapshot_sticker, dict) and (
+        bool(str(snapshot_sticker.get("set_name") or "").strip())
+        or bool(str(snapshot_sticker.get("file_id") or "").strip())
+        or bool(str(snapshot_sticker.get("document_id") or "").strip())
+        or str(snapshot_sticker.get("mime_type") or "").lower() == "application/x-tgsticker"
+        or str(snapshot_sticker.get("mime_type") or "").lower().startswith(("image/", "video/"))
+    )
+    snapshot_available = bool(snapshot.get("sticker_available") or snapshot_has_sticker_media)
     merged["sticker_available"] = current_available or snapshot_available
     if not current_available and snapshot_available:
         merged["sticker"] = snapshot_sticker or sticker
@@ -3157,7 +3166,8 @@ def build_messenger_router(
                           (
                               EXISTS(SELECT 1 FROM telegram_gift_catalog c
                                      WHERE c.gift_id=user_gifts.telegram_gift_id
-                                       AND COALESCE(c.sticker_file_id,'')<>'')
+                                       AND (COALESCE(c.sticker_file_id,'')<>''
+                                            OR COALESCE(c.sticker_thumbnail_file_id,'')<>''))
                               OR EXISTS(SELECT 1 FROM telegram_mtproto_gift_catalog m
                                         WHERE m.gift_id=user_gifts.telegram_gift_id
                                           AND COALESCE(m.sticker_document_id,'')<>'')
@@ -4467,7 +4477,7 @@ def build_messenger_router(
                     preview_file_ids = []
                     thumbnail_id = str(sticker_row["sticker_thumbnail_file_id"] or "").strip()
                     main_file_id = str(sticker_row["sticker_file_id"] or "").strip()
-                    if is_motion and thumbnail_id:
+                    if thumbnail_id and (is_motion or not main_file_id):
                         preview_file_ids.append(thumbnail_id)
                     if main_file_id and main_file_id not in preview_file_ids:
                         preview_file_ids.append(main_file_id)
