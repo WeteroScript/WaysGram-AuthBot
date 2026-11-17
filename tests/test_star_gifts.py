@@ -1365,3 +1365,68 @@ def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) 
             assert receipt["gift_attributes"]["legacy_receipt"] is True
 
     run(scenario())
+
+
+def test_purchase_snapshot_keeps_sticker_available_after_catalog_rows_are_removed(env) -> None:
+    path, app = env
+    expected_png = _png()
+    raw_webm = bytes.fromhex("1a45dfa3") + b"snapshot-gift-animation"
+
+    class SnapshotProvider:
+        async def download_sticker_preview(self, gift_id: str):
+            assert gift_id == "g1"
+            return expected_png, "image/png"
+
+        async def download_sticker(self, gift_id: str):
+            assert gift_id == "g1"
+            return raw_webm, "video/webm"
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=20, supply=1)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101),
+                json={},
+            )
+            assert bought.status_code == 201
+
+        connection = db_split.sqlite_connect(path)
+        try:
+            connection.execute("DELETE FROM telegram_gift_catalog WHERE gift_id='g1'")
+            connection.execute("DELETE FROM telegram_mtproto_gift_catalog WHERE gift_id='g1'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        snapshot_app = FastAPI()
+        snapshot_store = bot_module.Store(path)
+        snapshot_app.include_router(
+            build_messenger_router(
+                path,
+                snapshot_store,
+                lambda: FakeBot(),
+                bot_module.account_is_banned,
+                mtproto_gift_provider=lambda: SnapshotProvider(),
+                admin_id=ADMIN,
+            )
+        )
+
+        async with await client_for(snapshot_app) as client:
+            still = await client.get(
+                "/api/telegram/gifts/g1/sticker",
+                headers=headers(101),
+            )
+            assert still.status_code == 200
+            assert still.headers["content-type"].startswith("image/png")
+            assert still.content == expected_png
+
+            animated = await client.get(
+                "/api/telegram/gifts/g1/sticker?animated=1",
+                headers=headers(101),
+            )
+            assert animated.status_code == 200
+            assert animated.headers["content-type"].startswith("video/webm")
+            assert animated.content == raw_webm
+
+    run(scenario())

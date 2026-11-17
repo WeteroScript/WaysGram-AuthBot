@@ -4320,7 +4320,57 @@ def build_messenger_router(
                 if sticker_row is not None:
                     candidates.append((candidate, sticker_row))
 
+        async def purchase_snapshot_fallback() -> Response | None:
+            # A gift can remain in a user's inventory after its row has disappeared
+            # from the current and historical catalogue tables. Its purchase-time
+            # snapshot still proves that WaysGram has stored Telegram sticker metadata.
+            async with aiosqlite.connect(db_path()) as snapshot_db:
+                cur = await snapshot_db.execute(
+                    """SELECT telegram_gift_metadata_json FROM user_gifts
+                       WHERE telegram_gift_id=? AND telegram_gift_metadata_json IS NOT NULL
+                       ORDER BY id DESC LIMIT 20""",
+                    (gift_id,),
+                )
+                snapshot_rows = await cur.fetchall()
+            has_sticker_snapshot = False
+            for snapshot_row in snapshot_rows:
+                try:
+                    snapshot = json.loads(snapshot_row[0] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(snapshot, dict):
+                    continue
+                sticker = snapshot.get("sticker")
+                if isinstance(sticker, dict) and (
+                    snapshot.get("sticker_available")
+                    or sticker.get("set_name")
+                    or sticker.get("mime_type")
+                ):
+                    has_sticker_snapshot = True
+                    break
+            if not has_sticker_snapshot:
+                return None
+
+            provider = mtproto_gift_provider() if mtproto_gift_provider else None
+            if provider is None:
+                return None
+            try:
+                if animated:
+                    content, media_type = await provider.download_sticker(gift_id)
+                else:
+                    content, media_type = await provider.download_sticker_preview(gift_id)
+                return Response(
+                    content=content,
+                    media_type=media_type,
+                    headers={"Cache-Control": "private, max-age=3600"},
+                )
+            except Exception:
+                return None
+
         if not candidates:
+            snapshot_response = await purchase_snapshot_fallback()
+            if snapshot_response is not None:
+                return snapshot_response
             raise HTTPException(status_code=404, detail="Подарок не найден в текущем или историческом каталоге")
 
         if animated:
@@ -4429,6 +4479,9 @@ def build_messenger_router(
                 )
             except Exception:
                 continue
+        snapshot_response = await purchase_snapshot_fallback()
+        if snapshot_response is not None:
+            return snapshot_response
         raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram из доступных источников")
 
     @router.get("/api/gifts")
