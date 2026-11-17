@@ -5664,7 +5664,12 @@ def build_messenger_router(
                 (uid, uid, uid, uid, uid, uid),
             )
             rows = await cur.fetchall()
-        return {"channels": [dict(row) for row in rows]}
+        channels = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("channel", int(item["id"]))
+            channels.append(item)
+        return {"channels": channels}
 
     @router.post("/api/channels", status_code=201)
     async def create_channel(
