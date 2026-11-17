@@ -5866,11 +5866,16 @@ def build_messenger_router(
         role = "owner" if uid == owner_id else (
             "admin" if any(int(row["telegram_id"]) == uid for row in rows) else "member"
         )
+        admins = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("account", int(item["telegram_id"]))
+            admins.append(item)
         return {
             "channel_id": channel_id,
             "owner_telegram_id": owner_id,
             "my_role": role,
-            "admins": [dict(row) for row in rows],
+            "admins": admins,
         }
 
     async def attach_my_reactions(items: list[dict[str, Any]], scope: str, chat_id: int, user_id: int) -> None:
@@ -8866,7 +8871,11 @@ def build_messenger_router(
         result = dict(group)
         result["my_role"] = membership["role"]
         result["my_telegram_id"] = uid
-        result["members"] = [dict(row) for row in members]
+        result["members"] = []
+        for row in members:
+            item = dict(row)
+            item["labels"] = await entity_labels("account", int(item["telegram_id"]))
+            result["members"].append(item)
         return result
 
     @router.put("/api/groups/{group_id}/slow-mode")
