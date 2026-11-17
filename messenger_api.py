@@ -3173,6 +3173,11 @@ def build_messenger_router(
                     or (str(telegram_gift.get("emoji") or "").strip() if telegram_gift else "")
                 )
                 item["can_upgrade"] = bool(
+                    telegram_gift
+                    and telegram_gift.get("can_upgrade")
+                    and int(item.get("upgrade_level") or 0) == 0
+                )
+                item["waysgram_can_upgrade"] = bool(
                     telegram_gift and telegram_gift.get("can_upgrade")
                 )
                 item["sticker_available"] = bool(
@@ -3518,6 +3523,7 @@ def build_messenger_router(
                 gift["can_upgrade"] = bool(
                     telegram_gift
                     and telegram_gift["can_upgrade"]
+                    and max(attributes_level, stored_level) == 0
                 )
         profile["gifts"] = gifts
         profile["common_groups"] = common_groups
@@ -4261,12 +4267,10 @@ def build_messenger_router(
         if not show_all:
             # The legacy all=1 parameter is ignored above: inventory metadata is served
             # through profile endpoints, while the storefront lists only active offers.
-            # An ID-only administrative placeholder has no Telegram sticker metadata;
-            # exposing it creates a catalog card that can never render its artwork.
-            gifts = [
-                gift for gift in gifts
-                if gift["for_sale"] and gift.get("catalog_source") != "waysgram_manual"
-            ]
+            # WaysGram administrators may intentionally add historical or
+            # manually identified gifts. Such entries retain a placeholder preview
+            # until Telegram metadata is available.
+            gifts = [gift for gift in gifts if gift["for_sale"]]
 
         synced_at = int(state["last_synced_at"])
         return {
