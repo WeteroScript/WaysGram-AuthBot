@@ -3303,7 +3303,12 @@ def build_messenger_router(
                 (uid,),
             )
             rows = await cur.fetchall()
-        return {"contacts": [dict(row) for row in rows], "count": len(rows)}
+        contacts = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("account", int(item["id"]))
+            contacts.append(item)
+        return {"contacts": contacts, "count": len(contacts)}
 
     @router.post("/api/contacts", status_code=201)
     async def add_contact(
