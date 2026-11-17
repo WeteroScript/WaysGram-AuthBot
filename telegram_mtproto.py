@@ -349,7 +349,7 @@ class TelegramMTProtoGiftCatalog:
             if self._gifts:
                 return
             response = await self.client(
-                functions.payments.GetStarGiftsRequest(hash=-1)
+                functions.payments.GetStarGiftsRequest(hash=0)
             )
             if type(response).__name__ == "StarGiftsNotModified":
                 raise LookupError("Telegram returned no gift documents for a cold cache")
