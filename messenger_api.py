@@ -3279,7 +3279,12 @@ def build_messenger_router(
                     (f"%{q}%", f"%{q}%"),
                 )
             rows = await cur.fetchall()
-        return {"users": [dict(row) for row in rows]}
+        users = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("account", int(item["id"]))
+            users.append(item)
+        return {"users": users}
 
     @router.get("/api/contacts")
     async def list_contacts(authorization: str | None = Header(default=None)) -> dict[str, Any]:
