@@ -1252,7 +1252,7 @@ def test_messenger_storage_repairs_missing_gift_inventory_columns(env) -> None:
 def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.MonkeyPatch) -> None:
     path, app = env
     expected_png = _png()
-    raw_webm = b"\\x1a\\x45\\xdf\\xa3waysgram-test-animation"
+    raw_webm = bytes.fromhex("1a45dfa3") + b"waysgram-test-animation"
     downloaded_file_ids: list[str] = []
 
     async def fake_download(bot, file_id: str, preferred_mime: str = ""):
@@ -1291,7 +1291,7 @@ def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.Mo
             )
             assert response.status_code == 200
             assert response.headers["content-type"].startswith("image/png")
-            assert response.content.startswith(b"\\x89PNG\\r\\n\\x1a\\n")
+            assert response.content.startswith(bytes.fromhex("89504e470d0a1a0a"))
             assert downloaded_file_ids == ["static-thumbnail-file"]
 
             animated_response = await client.get(
@@ -1332,6 +1332,7 @@ def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) 
                     "is_video": False,
                     "emoji": "🏆",
                     "mime_type": "image/webp",
+                    "set_name": "AlgorithmCup",
                 },
                 "star_count": 25,
             }],
