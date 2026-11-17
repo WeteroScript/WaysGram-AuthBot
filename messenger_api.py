@@ -1229,7 +1229,7 @@ def _gift_display_title(title: Any, sticker_set_name: Any, gift_id: str = "") ->
 
 
 def _legacy_gift_purchase_details(body: Any) -> dict[str, str] | None:
-    """Recognize historical human-readable gift purchase receipts as structured events."""
+    """Recognize historical collectible-gift purchase receipts without matching ordinary chat text."""
     value = str(body or "").strip()
     if not value:
         return None
@@ -1247,6 +1247,13 @@ def _legacy_gift_purchase_details(body: Any) -> dict[str, str] | None:
     )
     quoted_match = re.search(r"[«“\"']([^»”\"']{1,160})[»”\"']", value)
     title = quoted_match.group(1).strip() if quoted_match else ""
+    explicit_collectible = bool(re.search(
+        r"\bколлекционный\s+подарок\b|\bcollectible\s+gift\b",
+        value,
+        re.IGNORECASE,
+    ))
+    if not explicit_collectible and not gift_match and not title:
+        return None
     return {
         "gift_id": gift_match.group(1) if gift_match else "",
         "title": title,
