@@ -3166,6 +3166,8 @@ def build_messenger_router(
                     metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
                 telegram_gift = _merge_telegram_gift_metadata(metadata_by_id[gift_id], snapshot)
                 item["telegram_gift"] = telegram_gift
+                if telegram_gift and str(telegram_gift.get("title") or "").strip():
+                    item["gift_name"] = str(telegram_gift["title"]).strip()
                 item["gift_emoji"] = (
                     str(item.get("gift_emoji") or "").strip()
                     or (str(telegram_gift.get("emoji") or "").strip() if telegram_gift else "")
@@ -3494,6 +3496,8 @@ def build_messenger_router(
                     metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
                 telegram_gift = _merge_telegram_gift_metadata(metadata_by_id[gift_id], snapshot)
                 gift["telegram_gift"] = telegram_gift
+                if telegram_gift and str(telegram_gift.get("title") or "").strip():
+                    gift["gift_name"] = str(telegram_gift["title"]).strip()
                 gift["gift_emoji"] = (
                     str(gift.get("gift_emoji") or "").strip()
                     or (str(telegram_gift.get("emoji") or "").strip() if telegram_gift else "")
@@ -3905,12 +3909,12 @@ def build_messenger_router(
         )
         for table in tables:
             cur = await db.execute(
-                f"SELECT title FROM {table} WHERE gift_id=?",
+                f"SELECT title,sticker_set_name FROM {table} WHERE gift_id=?",
                 (gift_id,),
             )
             row = await cur.fetchone()
-            if row and str(row[0]).strip():
-                return str(row[0])
+            if row and str(row["title"] or row["sticker_set_name"] or "").strip():
+                return _gift_display_title(row["title"], row["sticker_set_name"], gift_id)
         cur = await db.execute(
             "SELECT 1 FROM telegram_gift_prices WHERE gift_id=?",
             (gift_id,),
@@ -4259,7 +4263,12 @@ def build_messenger_router(
         if not show_all:
             # The legacy all=1 parameter is ignored above: inventory metadata is served
             # through profile endpoints, while the storefront lists only active offers.
-            gifts = [gift for gift in gifts if gift["for_sale"]]
+            # An ID-only administrative placeholder has no Telegram sticker metadata;
+            # exposing it creates a catalog card that can never render its artwork.
+            gifts = [
+                gift for gift in gifts
+                if gift["for_sale"] and gift.get("catalog_source") != "waysgram_manual"
+            ]
 
         synced_at = int(state["last_synced_at"])
         return {
@@ -4276,6 +4285,7 @@ def build_messenger_router(
     async def telegram_gift_sticker(
         gift_id: str,
         authorization: str | None = Header(default=None),
+        animated: int = Query(default=0, ge=0, le=1),
     ) -> Response:
         await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
@@ -4310,6 +4320,43 @@ def build_messenger_router(
 
         if not candidates:
             raise HTTPException(status_code=404, detail="Подарок не найден в текущем или историческом каталоге")
+
+        if animated:
+            # Return the original animated asset rather than normalizing it to a still
+            # thumbnail. Android's AnimatedFileDrawable consumes TGS/WebM files.
+            for catalog_source, sticker_row in candidates:
+                is_motion = (
+                    bool(sticker_row["sticker_is_animated"])
+                    or bool(sticker_row["sticker_is_video"])
+                    or str(sticker_row["sticker_mime_type"] or "").lower() == "application/x-tgsticker"
+                    or str(sticker_row["sticker_mime_type"] or "").lower().startswith("video/")
+                )
+                if not is_motion:
+                    continue
+                try:
+                    if catalog_source == "telegram_mtproto":
+                        provider = mtproto_gift_provider() if mtproto_gift_provider else None
+                        if provider is None:
+                            continue
+                        content, media_type = await provider.download_sticker(gift_id)
+                    else:
+                        bot = bot_provider()
+                        if bot is None:
+                            continue
+                        file_id = str(sticker_row["sticker_file_id"] or "").strip()
+                        if not file_id:
+                            continue
+                        content, media_type = await fetch_telegram_sticker(
+                            bot, file_id, str(sticker_row["sticker_mime_type"] or "")
+                        )
+                    return Response(
+                        content=content,
+                        media_type=media_type,
+                        headers={"Cache-Control": "private, max-age=3600"},
+                    )
+                except Exception:
+                    continue
+            raise HTTPException(status_code=502, detail="Не удалось загрузить исходную анимацию подарка")
 
         for catalog_source, sticker_row in candidates:
             try:
@@ -6212,6 +6259,28 @@ def build_messenger_router(
                         except (TypeError, ValueError):
                             parsed_snapshot = {}
                         snapshot = parsed_snapshot if isinstance(parsed_snapshot, dict) else {}
+                # Backfill the structured gift attachment for historical text receipts.
+                # Older purchases only stored "Telegram Gift <id>" in the message body.
+                if not gift_id and str(item.get("body") or "").startswith(
+                    "Вы приобрели коллекционный подарок"
+                ):
+                    legacy_match = re.search(
+                        r"(?:Telegram\\s+)?Gift\\s+([0-9]{5,})",
+                        str(item.get("body") or ""),
+                        re.IGNORECASE,
+                    )
+                    if legacy_match:
+                        gift_id = legacy_match.group(1)
+                        item["gift_telegram_gift_id"] = gift_id
+                        if not serial:
+                            title = await telegram_gift_title(gift_db, gift_id)
+                            if title:
+                                item["gift_name"] = title
+                        item["gift_attributes"] = {
+                            "event_type": "purchase",
+                            "native_action": "star_gift_purchase",
+                            "legacy_receipt": True,
+                        }
                 if gift_id:
                     if gift_id not in metadata_by_id:
                         metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
@@ -6220,6 +6289,8 @@ def build_messenger_router(
                     current_metadata = None
                 telegram_gift = _merge_telegram_gift_metadata(current_metadata, snapshot)
                 item["gift_telegram_metadata"] = telegram_gift
+                if telegram_gift and str(telegram_gift.get("title") or "").strip():
+                    item["gift_name"] = str(telegram_gift["title"]).strip()
                 item["gift_emoji"] = (
                     saved_emoji.strip()
                     or (str(telegram_gift.get("emoji") or "").strip() if telegram_gift else "")
