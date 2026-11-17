@@ -987,6 +987,29 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
     run(scenario())
 
 
+def test_purchase_snapshot_recovers_missing_sticker_available_flag() -> None:
+    current = {
+        "id": "5936013938331222567",
+        "sticker_available": False,
+        "sticker": {"type": "video", "url": ""},
+    }
+    snapshot = {
+        "sticker_available": False,
+        "sticker": {
+            "set_name": "PlushPepe",
+            "mime_type": "video/webm",
+            "is_video": True,
+        },
+    }
+
+    merged = messenger_api._merge_telegram_gift_metadata(current, snapshot)
+
+    assert merged is not None
+    assert merged["sticker_available"] is True
+    assert merged["sticker"]["set_name"] == "PlushPepe"
+    assert merged["sticker"]["mime_type"] == "video/webm"
+
+
 def test_mtproto_metadata_falls_back_to_bot_api_emoji_for_owned_gifts(env) -> None:
     path, app = env
 
