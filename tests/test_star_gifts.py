@@ -104,7 +104,7 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert bought.json()["price_stars"] == 40
             assert bought.json()["stars"] == 5000 - 40
             mine = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
-            assert len(mine) == 1 and mine[0]["gift_name"] == "🎁"
+            assert len(mine) == 1 and mine[0]["gift_name"] == "Подарок Telegram"
             conn = db_split.sqlite_connect(path)
             try:
                 self_receipt = conn.execute(
@@ -512,7 +512,7 @@ def test_public_profile_includes_received_gifts(env) -> None:
             assert len(data["gifts"]) == 1
             gift = data["gifts"][0]
             assert gift["telegram_gift_id"] == "g1"
-            assert gift["gift_name"] == "🎁"
+            assert gift["gift_name"] == "Подарок Telegram"
             assert gift["serial_number"] == purchase.json()["gift"]["serial_number"]
 
             # Public profile output must not include account credentials or phone data.
@@ -970,7 +970,7 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
             assert receipt["sender_id"] == 101
             assert receipt["recipient_id"] == 101
             assert receipt["body"] == ""
-            assert receipt["gift_name"] == "🎁"
+            assert receipt["gift_name"] == "Подарок Telegram"
             assert receipt["gift_telegram_gift_id"] == "g1"
             assert receipt["gift_upgrade_level"] == 0
             assert receipt["gift_attributes"] == {
@@ -1114,7 +1114,7 @@ def test_gift_can_be_sent_as_a_dm_message_with_snapshot_and_atomic_ownership(env
             for history in (sender_history, receiver_history):
                 item = next(message for message in history["messages"] if message["id"] == sent.json()["id"])
                 assert item["gift_serial_number"] == serial
-                assert item["gift_name"] == "🎁"
+                assert item["gift_name"] == "Подарок Telegram"
                 assert item["gift_upgrade_level"] == 1
                 assert item["gift_emoji"] == "🎁"
                 assert item["gift_telegram_metadata"]["emoji"] == "🎁"
