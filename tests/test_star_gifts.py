@@ -1314,6 +1314,11 @@ def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) 
         "Вы приобрели коллекционный подарок "
         + "«Telegram Gift " + gift_id + "»"
     )
+    alternate_receipt_body = (
+        "Квитанция: вы купили коллекционный подарок "
+        + "“Telegram Gift " + gift_id + "”"
+    )
+    receipt_without_id_body = "Успешно: вы купили коллекционный подарок «Plush Pepe»"
 
     async def scenario() -> None:
         await messenger_api.store_telegram_gifts(
@@ -1339,11 +1344,16 @@ def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) 
         )
         connection = db_split.sqlite_connect(path)
         try:
-            connection.execute(
+            now = int(time.time())
+            connection.executemany(
                 """INSERT INTO messages
                    (sender_telegram_id,recipient_telegram_id,body,created_at)
                    VALUES(101,101,?,?)""",
-                (receipt_body, int(time.time())),
+                [
+                    (receipt_body, now),
+                    (alternate_receipt_body, now + 1),
+                    (receipt_without_id_body, now + 2),
+                ],
             )
             connection.commit()
         finally:
@@ -1363,6 +1373,23 @@ def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) 
             assert receipt["gift_attributes"]["event_type"] == "purchase"
             assert receipt["gift_attributes"]["native_action"] == "star_gift_purchase"
             assert receipt["gift_attributes"]["legacy_receipt"] is True
+
+            alternate = next(
+                item for item in result.json()["messages"]
+                if item["body"] == alternate_receipt_body
+            )
+            assert alternate["gift_telegram_gift_id"] == gift_id
+            assert alternate["gift_attributes"]["event_type"] == "purchase"
+            assert alternate["gift_attributes"]["native_action"] == "star_gift_purchase"
+
+            without_id = next(
+                item for item in result.json()["messages"]
+                if item["body"] == receipt_without_id_body
+            )
+            assert without_id["gift_name"] == "Plush Pepe"
+            assert without_id["gift_telegram_gift_id"] == ""
+            assert without_id["gift_attributes"]["event_type"] == "purchase"
+            assert without_id["gift_attributes"]["legacy_receipt"] is True
 
     run(scenario())
 
