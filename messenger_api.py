@@ -3157,7 +3157,11 @@ def build_messenger_router(
         return {"transactions": [dict(row) for row in rows]}
 
     @router.get("/api/me/gifts")
-    async def my_gifts(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    async def my_gifts(
+        authorization: str | None = Header(default=None),
+        limit: int = Query(default=100, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
         user = await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
@@ -3181,10 +3185,12 @@ def build_messenger_router(
                           ) AS sticker_available,
                           EXISTS(SELECT 1 FROM telegram_auction_gift_registry r
                                  WHERE r.gift_id=user_gifts.telegram_gift_id) AS auction_eligible
-                   FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC""",
-                (int(user["telegram_id"]),),
+                   FROM user_gifts WHERE owner_telegram_id=? ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (int(user["telegram_id"]), limit + 1, offset),
             )
             rows = await cur.fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
         gifts = []
         metadata_by_id: dict[str, dict[str, Any] | None] = {}
         async with aiosqlite.connect(db_path()) as gift_db:
@@ -3232,7 +3238,13 @@ def build_messenger_router(
                     else ""
                 )
                 gifts.append(item)
-        return {"gifts": gifts}
+        return {
+            "gifts": gifts,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+            "next_offset": offset + len(gifts) if has_more else None,
+        }
 
     @router.get("/api/me/gifts/transactions")
     async def my_gift_transactions(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -4645,6 +4657,36 @@ def build_messenger_router(
                    (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
                    VALUES('purchase',?,?,NULL,?,?)""",
                 (serial, str(gift["name"]), uid, now),
+            )
+            # Persist the purchase as a structured message gift so the Android client
+            # renders a native-style receipt card in Saved Messages.
+            cur = await db.execute(
+                """INSERT INTO messages
+                   (sender_telegram_id,recipient_telegram_id,body,created_at)
+                   VALUES(?,?,?,?)""",
+                (uid, uid, "", now),
+            )
+            receipt_message_id = int(cur.lastrowid)
+            await db.execute(
+                """INSERT INTO message_gifts
+                   (message_id,serial_number,gift_name,telegram_gift_id,upgrade_level,attributes_json)
+                   VALUES(?,?,?,?,0,?)""",
+                (
+                    receipt_message_id,
+                    serial,
+                    str(gift["name"]),
+                    "",
+                    json.dumps({
+                        "event_type": "purchase",
+                        "native_action": "star_gift_purchase",
+                        "price_grams": price,
+                        "currency": "grams",
+                    }, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            await record_event(
+                db, "dm", receipt_message_id, "new_message", uid,
+                user_a=uid, user_b=uid,
             )
             result = {
                 "status": "purchased",
