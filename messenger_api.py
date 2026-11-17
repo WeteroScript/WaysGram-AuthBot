@@ -4446,7 +4446,33 @@ def build_messenger_router(
             except Exception:
                 return None
 
+        async def mtproto_sticker_fallback() -> Response | None:
+            provider = mtproto_gift_provider() if mtproto_gift_provider else None
+            if provider is None:
+                return None
+            try:
+                if animated:
+                    content, media_type = await provider.download_sticker(gift_id)
+                else:
+                    content, media_type = await provider.download_sticker_preview(gift_id)
+                    try:
+                        content, media_type = _normalize_gift_preview(content)
+                    except ValueError:
+                        # Some video gifts have no separate still thumbnail.
+                        # Preserve the original WebM for the Android sticker decoder.
+                        pass
+                return Response(
+                    content=content,
+                    media_type=media_type,
+                    headers={"Cache-Control": "private, max-age=3600"},
+                )
+            except Exception:
+                return None
+
         if not candidates:
+            provider_response = await mtproto_sticker_fallback()
+            if provider_response is not None:
+                return provider_response
             snapshot_response = await purchase_snapshot_fallback()
             if snapshot_response is not None:
                 return snapshot_response
@@ -4558,6 +4584,9 @@ def build_messenger_router(
                 )
             except Exception:
                 continue
+        provider_response = await mtproto_sticker_fallback()
+        if provider_response is not None:
+            return provider_response
         snapshot_response = await purchase_snapshot_fallback()
         if snapshot_response is not None:
             return snapshot_response
