@@ -5516,3 +5516,86 @@ def test_mtproto_sticker_proxy_falls_back_without_catalog_row(api_env) -> None:
 
     run(scenario())
 
+def test_video_gift_preview_prefers_mtproto_over_bot_api_thumbnail(api_env, monkeypatch) -> None:
+    path, auth_store, fake_bot, _old_app = api_env
+    gift_id = "5936013938331222567"
+    add_account(api_env, 88121, "plush_pepe_preview_user")
+    add_session(path, 88121, "plush-pepe-preview-session")
+
+    expected_webm = bytes.fromhex("1a45dfa3") + b"plush-pepe-mtproto-video"
+
+    class FakeMTProtoClient:
+        def __init__(self):
+            self.document = SimpleNamespace(
+                id=9902,
+                dc_id=2,
+                size=len(expected_webm),
+                mime_type="video/webm",
+                attributes=[],
+                thumbs=[],
+            )
+            self.gift = SimpleNamespace(
+                id=int(gift_id),
+                title="Telegram Gift",
+                sticker=self.document,
+                stars=25,
+                limited=True,
+                sold_out=False,
+            )
+
+        async def __call__(self, request):
+            return SimpleNamespace(gifts=[self.gift])
+
+        async def download_media(self, document, file=bytes, thumb=None):
+            assert document is self.document
+            return expected_webm
+
+    provider = TelegramMTProtoGiftCatalog(FakeMTProtoClient())
+    run(provider.sync(path))
+
+    wrong_bot_thumbnail = test_preview_png()
+    bot_fetch_calls: list[str] = []
+
+    async def fake_fetch_telegram_sticker(bot, file_id: str, preferred_mime: str = ""):
+        bot_fetch_calls.append(file_id)
+        return wrong_bot_thumbnail, "image/png"
+
+    monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_fetch_telegram_sticker)
+
+    with db_split.sqlite_connect(path) as db:
+        db.execute(
+            """INSERT INTO telegram_gift_catalog
+               (gift_id,title,sticker_file_id,sticker_is_video,sticker_mime_type,
+                source_payload,synced_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (gift_id, "Plush Pepe", "stale-bot-thumbnail", 0, "image/png", "{}", int(time.time())),
+        )
+        db.execute(
+            "UPDATE telegram_gift_sync_state SET source='telegram_bot_api' WHERE id=1"
+        )
+        db.commit()
+
+    app = FastAPI()
+    app.include_router(
+        build_messenger_router(
+            path,
+            auth_store,
+            lambda: fake_bot,
+            bot_module.account_is_banned,
+            lambda: provider,
+        )
+    )
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            response = await client.get(
+                f"/api/telegram/gifts/{gift_id}/sticker",
+                headers={"Authorization": "Bearer plush-pepe-preview-session"},
+            )
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("video/webm")
+            assert response.content == expected_webm
+            assert bot_fetch_calls == []
+
+    run(scenario())
+
