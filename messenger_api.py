@@ -3519,7 +3519,6 @@ def build_messenger_router(
                 gift["can_upgrade"] = bool(
                     telegram_gift
                     and telegram_gift["can_upgrade"]
-                    and max(attributes_level, stored_level) == 0
                 )
         profile["gifts"] = gifts
         profile["common_groups"] = common_groups
