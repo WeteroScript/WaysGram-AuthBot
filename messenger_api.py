@@ -6265,7 +6265,7 @@ def build_messenger_router(
                     "Вы приобрели коллекционный подарок"
                 ):
                     legacy_match = re.search(
-                        r"(?:Telegram\\s+)?Gift\\s+([0-9]{5,})",
+                        r"(?:Telegram\s+)?Gift\s+([0-9]{5,})",
                         str(item.get("body") or ""),
                         re.IGNORECASE,
                     )
