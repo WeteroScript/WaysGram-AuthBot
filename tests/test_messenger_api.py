@@ -5383,5 +5383,56 @@ def test_admin_labels_are_exposed_on_account_and_channel_profiles(api_env) -> No
             assert channel.status_code == 200
             assert channel.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
 
+            searched = await client.get("/api/users?q=label_target", headers=headers)
+            assert searched.status_code == 200
+            assert searched.json()["users"][0]["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
+            added = await client.post(
+                "/api/contacts", headers=headers, json={"user_id": 85002}
+            )
+            assert added.status_code == 201
+            contacts = await client.get("/api/contacts", headers=headers)
+            assert contacts.status_code == 200
+            assert contacts.json()["contacts"][0]["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
+            sent = await client.post(
+                "/api/messages", headers=headers,
+                json={"recipient_id": 85002, "body": "Label directory test"},
+            )
+            assert sent.status_code == 201
+            conversations = await client.get("/api/conversations", headers=headers)
+            assert conversations.status_code == 200
+            labeled_conversation = next(
+                item for item in conversations.json()["conversations"]
+                if item["id"] == 85002
+            )
+            assert labeled_conversation["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
+            blocked = await client.post(
+                "/api/blocks", headers=headers, json={"user_id": 85002}
+            )
+            assert blocked.status_code == 201
+            blocks = await client.get("/api/blocks", headers=headers)
+            assert blocks.status_code == 200
+            assert blocks.json()["blocked_users"][0]["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
+            channels = await client.get("/api/channels", headers=headers)
+            assert channels.status_code == 200
+            listed_channel = next(
+                item for item in channels.json()["channels"]
+                if item["id"] == channel_id
+            )
+            assert listed_channel["labels"] == [
+                {"text": "Official", "color": "#1769AA"}
+            ]
+
     run(scenario())
 
