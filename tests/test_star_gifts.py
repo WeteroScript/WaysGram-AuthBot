@@ -987,6 +987,110 @@ def test_gift_purchase_creates_one_collectible_receipt_in_saved_messages(env) ->
     run(scenario())
 
 
+def test_waysgram_catalog_purchase_creates_one_saved_gift_card(env) -> None:
+    path, app = env
+    conn = db_split.sqlite_connect(path)
+    try:
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES('Plush WG',25,2,?)",
+            (now,),
+        )
+        conn.execute("UPDATE accounts SET grams=5000 WHERE telegram_id=101")
+        conn.commit()
+    finally:
+        conn.close()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            purchase_headers = {
+                **headers(101),
+                "Idempotency-Key": "wg-grams-purchase-receipt-0001",
+            }
+            purchased = await client.post(
+                "/api/gifts/1/purchase",
+                headers=purchase_headers,
+                json={},
+            )
+            retried = await client.post(
+                "/api/gifts/1/purchase",
+                headers=purchase_headers,
+                json={},
+            )
+            assert purchased.status_code == 201
+            assert retried.status_code == 201
+            assert retried.json() == purchased.json()
+
+            serial = purchased.json()["gift"]["serial_number"]
+            saved = await client.get("/api/messages?with=101", headers=headers(101))
+            assert saved.status_code == 200
+            receipts = [
+                message for message in saved.json()["messages"]
+                if message.get("gift_serial_number") == serial
+            ]
+            assert len(receipts) == 1
+            receipt = receipts[0]
+            assert receipt["sender_id"] == 101
+            assert receipt["recipient_id"] == 101
+            assert receipt["body"] == ""
+            assert receipt["gift_name"] == "Plush WG"
+            assert receipt["gift_attributes"] == {
+                "event_type": "purchase",
+                "native_action": "star_gift_purchase",
+                "price_grams": 25,
+                "currency": "grams",
+            }
+
+    run(scenario())
+
+
+def test_my_gifts_pagination_returns_all_items_without_overlap(env) -> None:
+    path, app = env
+    conn = db_split.sqlite_connect(path)
+    try:
+        now = int(time.time())
+        for index in range(5):
+            conn.execute(
+                """INSERT INTO user_gifts
+                   (serial_number,gift_id,gift_name,telegram_gift_id,owner_telegram_id,acquired_at)
+                   VALUES(?,NULL,?,'',?,?)""",
+                (f"WG-PAGE-{index}", f"Gift {index}", 101, now + index),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            first = await client.get(
+                "/api/me/gifts?limit=2&offset=0",
+                headers=headers(101),
+            )
+            second = await client.get(
+                "/api/me/gifts?limit=2&offset=2",
+                headers=headers(101),
+            )
+            third = await client.get(
+                "/api/me/gifts?limit=2&offset=4",
+                headers=headers(101),
+            )
+            assert first.status_code == second.status_code == third.status_code == 200
+            assert first.json()["has_more"] is True
+            assert first.json()["next_offset"] == 2
+            assert second.json()["has_more"] is True
+            assert second.json()["next_offset"] == 4
+            assert third.json()["has_more"] is False
+            serials = [
+                item["serial_number"]
+                for page in (first, second, third)
+                for item in page.json()["gifts"]
+            ]
+            assert len(serials) == 5
+            assert len(set(serials)) == 5
+
+    run(scenario())
+
+
 def test_ordinary_chat_text_is_not_treated_as_gift_purchase_receipt() -> None:
     assert messenger_api._legacy_gift_purchase_details("Я купил подарок сегодня") is None
     assert messenger_api._legacy_gift_purchase_details("I bought a gift yesterday") is None
