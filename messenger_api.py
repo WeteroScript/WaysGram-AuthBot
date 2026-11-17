@@ -4399,6 +4399,20 @@ def build_messenger_router(
                 if sticker_row is not None:
                     candidates.append((candidate, sticker_row))
 
+            if not animated and len(candidates) > 1:
+                def preview_priority(candidate_row: tuple[str, Any]) -> int:
+                    source, sticker = candidate_row
+                    mime_type = str(sticker["sticker_mime_type"] or "").lower()
+                    is_motion = (
+                        bool(sticker["sticker_is_animated"])
+                        or bool(sticker["sticker_is_video"])
+                        or mime_type == "application/x-tgsticker"
+                        or mime_type.startswith("video/")
+                    )
+                    return 0 if source == "telegram_mtproto" and is_motion else 1
+
+                candidates.sort(key=preview_priority)
+
         async def purchase_snapshot_fallback() -> Response | None:
             # A gift can remain in a user's inventory after its row has disappeared
             # from the current and historical catalogue tables. Its purchase-time
