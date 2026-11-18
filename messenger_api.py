@@ -44,7 +44,47 @@ PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
 PLUSH_PEPE_GIFT_ID = "5936013938331222567"
 GIFT_SELL_WINDOW_SECONDS = 7 * 86400
+PLUSH_PEPE_ASSET_MAX_BYTES = 5 * 1024 * 1024
+_PLUSH_PEPE_STICKER_CACHE: dict[bool, tuple[bytes, str]] = {}
 LOGGER = logging.getLogger(__name__)
+
+
+async def _fetch_plush_pepe_sticker_asset(animated: bool) -> tuple[bytes, str] | None:
+    """Fetch a vetted static/animated fallback when Telegram has no catalog document."""
+    cache_key = bool(animated)
+    cached = _PLUSH_PEPE_STICKER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    asset_path = (
+        "tgs/by_name/plush_pepe.tgs"
+        if animated
+        else "webp/by_name/plush_pepe.webp"
+    )
+    asset_url = (
+        "https://raw.githubusercontent.com/ssamy2/TelegramGiftsAssests/main/"
+        + asset_path
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            response = await client.get(asset_url)
+            response.raise_for_status()
+        payload = response.content
+        if not payload or len(payload) > PLUSH_PEPE_ASSET_MAX_BYTES:
+            return None
+        if animated:
+            # Telegram's TGS format is gzip-compressed JSON.
+            if not payload.startswith(b"\\x1f\\x8b"):
+                return None
+            media_type = "application/x-tgsticker"
+        else:
+            payload, media_type = _normalize_gift_preview(payload)
+            if not media_type.startswith("image/"):
+                return None
+        cached = (payload, media_type)
+        _PLUSH_PEPE_STICKER_CACHE[cache_key] = cached
+        return cached
+    except (httpx.HTTPError, OSError, ValueError, UnidentifiedImageError):
+        return None
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 FCM_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
