@@ -20,7 +20,7 @@ Environment variables (all optional):
     WAYSGRAM_COMMIT       pin an exact commit (skips update checks)
     WAYSGRAM_SUBDIR       folder with the bot code, default authbot
     WAYSGRAM_HOME         cache directory, default /data/waysgram-new, else ./.waysgram-src
-    WAYSGRAM_MODE         auto | api | archive | local
+    WAYSGRAM_MODE         auto | api | archive
     AUTHBOT_GITHUB_TOKEN  raises the API rate limit and allows a private repository
     AUTHBOT_SYNC_DEPS     1 = install the pulled requirements.txt before start
 
@@ -46,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_REPO = "WeteroScript/WaysGram-New"
-DEFAULT_REF = "main"
+DEFAULT_REF = "arena/00b4c974-waysgram-new"
 DEFAULT_SUBDIR = "authbot"
 ENTRY_NAME = "bot.py"
 HTTP_TIMEOUT = 30
@@ -200,13 +200,6 @@ def latest_cached(home: str, subdir: str) -> str:
 
 
 def ensure_source(repo: str, ref: str, subdir: str, pinned: str, mode: str, token: str, home: str) -> str:
-    if mode == "local":
-        local = os.path.join(ROOT, subdir)
-        log(f"WAYSGRAM_MODE=local: running {local}")
-        if not os.path.isfile(os.path.join(local, ENTRY_NAME)):
-            raise RuntimeError(f"{local} does not contain {ENTRY_NAME}")
-        return local
-
     os.makedirs(home, exist_ok=True)
     sha = pinned or resolve_commit(repo, ref, token)
 
@@ -251,24 +244,6 @@ def ensure_source(repo: str, ref: str, subdir: str, pinned: str, mode: str, toke
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def local_standalone_entry(subdir: str) -> str:
-    """The bot copy that shipped inside this repository, used only when GitHub is unreachable.
-
-    Rename the original bot entry to `bot_standalone.py` before replacing it with the launcher:
-    its sibling modules are still next to it, so it keeps working as-is. The launcher never
-    runs itself, which would otherwise loop forever.
-    """
-    candidates = [
-        os.path.join(ROOT, subdir, ENTRY_NAME),
-        os.path.join(ROOT, _env("WAYSGRAM_LOCAL_ENTRY", "bot_standalone.py")),
-    ]
-    launcher = os.path.realpath(__file__)
-    for candidate in candidates:
-        if os.path.isfile(candidate) and os.path.realpath(candidate) != launcher:
-            return candidate
-    return ""
-
-
 def resolve_entry(repo: str, ref: str, subdir: str, pinned: str, mode: str, token: str, home: str) -> str:
     try:
         return os.path.join(ensure_source(repo, ref, subdir, pinned, mode, token, home), ENTRY_NAME)
@@ -280,13 +255,7 @@ def resolve_entry(repo: str, ref: str, subdir: str, pinned: str, mode: str, toke
     if cached:
         log(f"using the cached copy {cached}")
         return os.path.join(cached, ENTRY_NAME)
-    standalone = local_standalone_entry(subdir)
-    if standalone:
-        log(f"using the standalone copy shipped in this repository: {standalone}")
-        return standalone
-    raise RuntimeError(
-        "no bot sources: the pull failed, the cache is empty and no standalone copy exists"
-    )
+    raise RuntimeError("no bot sources: GitHub is unreachable and the cache is empty")
 
 
 def sync_dependencies(source_dir: str) -> None:
@@ -307,7 +276,7 @@ def main() -> int:
     parser.add_argument("--subdir", default=_env("WAYSGRAM_SUBDIR", DEFAULT_SUBDIR))
     parser.add_argument("--commit", default=_env("WAYSGRAM_COMMIT"))
     parser.add_argument("--mode", default=_env("WAYSGRAM_MODE", "auto"),
-                        choices=("auto", "api", "archive", "local"))
+                        choices=("auto", "api", "archive"))
     args = parser.parse_args()
 
     token = _env("AUTHBOT_GITHUB_TOKEN")
