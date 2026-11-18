@@ -191,7 +191,8 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert sold_out.status_code == 409
             assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 5000 - 80
             gone = (await client.get("/api/telegram/gifts", headers=headers(101))).json()
-            assert gone["count"] == 0
+            assert gone["count"] == 1
+            assert gone["gifts"][0]["id"] == messenger_api.PLUSH_PEPE_GIFT_ID
 
     run(scenario())
 
