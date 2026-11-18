@@ -43,8 +43,6 @@ AuthBot может быть каналом доставки OTP для отде�
 
 ### Docker Compose
 
-### Docker Compose
-
 В репозитории есть `Dockerfile`, `docker-compose.yml` и безопасный шаблон `.env.example`. Для размещения на сервере:
 
 1. Клонировать репозиторий на Docker-хост.
