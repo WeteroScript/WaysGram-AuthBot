@@ -63,13 +63,17 @@ def test_gifts_are_hidden_until_admin_sets_price_and_supply(env) -> None:
     async def scenario() -> None:
         async with await client_for(app) as client:
             hidden = (await client.get("/api/telegram/gifts", headers=headers(101))).json()
-            assert hidden["count"] == 0
+            assert hidden["count"] == 1
+            assert hidden["gifts"][0]["id"] == messenger_api.PLUSH_PEPE_GIFT_ID
+            assert hidden["gifts"][0]["title"] == "Plush Pepe"
+            assert hidden["gifts"][0]["for_sale"] is True
+            assert hidden["gifts"][0]["unlimited_supply"] is True
             # The app storefront never exposes unlisted catalog entries, even via all=1
             # or when the authenticated WaysGram account is also an AuthBot administrator.
             full = (await client.get("/api/telegram/gifts?all=1", headers=headers(101))).json()
-            assert full["count"] == 0
+            assert full["count"] == 1
             everything = (await client.get("/api/telegram/gifts?all=1", headers=headers(ADMIN))).json()
-            assert everything["count"] == 0
+            assert everything["count"] == 1
 
             # Price and stock are managed only through the AuthBot Telegram admin panel,
             # not through authenticated app REST sessions, even for the admin account.
@@ -80,8 +84,11 @@ def test_gifts_are_hidden_until_admin_sets_price_and_supply(env) -> None:
             await bot_module.set_telegram_gift_values("g1", price=40, supply=2)
 
             shown = (await client.get("/api/telegram/gifts", headers=headers(101))).json()
-            assert [g["id"] for g in shown["gifts"]] == ["g1"]
-            assert shown["gifts"][0]["price_stars"] == 40 and shown["gifts"][0]["remaining"] == 2
+            shown_by_id = {gift["id"]: gift for gift in shown["gifts"]}
+            assert set(shown_by_id) == {"g1", messenger_api.PLUSH_PEPE_GIFT_ID}
+            assert shown_by_id["g1"]["price_stars"] == 40 and shown_by_id["g1"]["remaining"] == 2
+            assert shown_by_id[messenger_api.PLUSH_PEPE_GIFT_ID]["for_sale"] is True
+            assert shown_by_id[messenger_api.PLUSH_PEPE_GIFT_ID]["unlimited_supply"] is True
             assert (await client.patch("/api/admin/telegram-gifts/g1", headers=headers(ADMIN), json={"price_stars": -1})).status_code in (404, 405)
 
     run(scenario())
@@ -137,7 +144,7 @@ def test_buying_a_gift_charges_stars_and_reduces_stock(env) -> None:
             assert json.loads(stored_snapshot[1])["emoji"] == "🎁"
             assert mine[0]["telegram_gift"]["catalog_source"] == "telegram_gift_catalog"
             assert mine[0]["telegram_gift"]["emoji"] == "🎁"
-            assert mine[0]["telegram_gift"]["upgrade_star_count"] == 10
+            assert mine[0]["telegram_gift"]["upgrade_star_count"] == 25
             assert mine[0]["can_upgrade"] is True
 
             public_profile = await client.get("/api/users/101", headers=headers(102))
@@ -824,6 +831,180 @@ def test_collectible_gift_auction_can_be_cancelled_before_first_bid(env) -> None
     run(scenario())
 
 
+def test_gift_resale_refunds_half_and_is_idempotent(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=40, supply=5)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase", headers=headers(101), json={}
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute(
+                    "UPDATE user_gifts SET acquired_at=? WHERE serial_number=?",
+                    (int(time.time()) - 86400, serial),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()
+            assert inventory["total"] == 1
+            assert inventory["gifts"][0]["purchase_price_stars"] == 40
+            assert inventory["gifts"][0]["sell_refund"] == 20
+            assert inventory["gifts"][0]["sellable"] is True
+
+            sale_headers = {**headers(101), "Idempotency-Key": "wg-gift-sale-test-0001"}
+            sold = await client.post(f"/api/gifts/{serial}/sell", headers=sale_headers)
+            replayed = await client.post(f"/api/gifts/{serial}/sell", headers=sale_headers)
+            assert sold.status_code == 200
+            assert sold.json() == {
+                "status": "sold", "serial_number": serial, "refund": 20, "asset": "stars"
+            }
+            assert replayed.status_code == 200 and replayed.json() == sold.json()
+            assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 4980
+            remaining = (await client.get("/api/me/gifts", headers=headers(101))).json()
+            assert remaining["total"] == 0 and remaining["gifts"] == []
+
+        connection = db_split.sqlite_connect(path)
+        try:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM economy_transactions WHERE telegram_id=101 AND reason='gift_sale:g1' AND amount=20"
+            ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT event_type FROM gift_transactions WHERE serial_number=? ORDER BY id DESC LIMIT 1",
+                (serial,),
+            ).fetchone() == ("sell",)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM user_gifts WHERE serial_number=?", (serial,)
+            ).fetchone() == (0,)
+        finally:
+            connection.close()
+
+    run(scenario())
+
+
+def test_gift_resale_rejects_old_listed_auctioned_and_foreign_gifts(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=40, supply=10)
+        async with await client_for(app) as client:
+            serials = []
+            for _ in range(4):
+                bought = await client.post(
+                    "/api/telegram/gifts/g1/purchase", headers=headers(101), json={}
+                )
+                assert bought.status_code == 201
+                serials.append(bought.json()["gift"]["serial_number"])
+            foreign = await client.post(
+                "/api/telegram/gifts/g1/purchase",
+                headers=headers(101), json={"recipient_id": 102},
+            )
+            assert foreign.status_code == 201
+            foreign_serial = foreign.json()["gift"]["serial_number"]
+
+            connection = db_split.sqlite_connect(path)
+            try:
+                now = int(time.time())
+                connection.execute(
+                    "UPDATE user_gifts SET acquired_at=? WHERE serial_number=?",
+                    (now - 8 * 86400, serials[0]),
+                )
+                connection.execute(
+                    """INSERT INTO gift_market_listings
+                       (serial_number,seller_telegram_id,price_grams,status,created_at)
+                       VALUES(?,101,5,'active',?)""",
+                    (serials[1], now),
+                )
+                connection.execute(
+                    """INSERT INTO gift_collectible_auctions
+                       (serial_number,seller_telegram_id,starting_price_grams,current_bid_grams,
+                        status,starts_at,ends_at,created_at)
+                       VALUES(?,101,5,0,'active',?,?,?)""",
+                    (serials[2], now, now + 3600, now),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            too_old = await client.post(f"/api/gifts/{serials[0]}/sell", headers=headers(101))
+            listed = await client.post(f"/api/gifts/{serials[1]}/sell", headers=headers(101))
+            auctioned = await client.post(f"/api/gifts/{serials[2]}/sell", headers=headers(101))
+            foreign_attempt = await client.post(f"/api/gifts/{foreign_serial}/sell", headers=headers(101))
+            assert too_old.status_code == 409
+            assert too_old.json()["detail"] == "Продать можно только подарок младше 7 дней"
+            assert listed.status_code == 409 and listed.json()["detail"] == "Снимите подарок с продажи"
+            assert auctioned.status_code == 409 and auctioned.json()["detail"] == "Снимите подарок с аукциона"
+            assert foreign_attempt.status_code == 404
+
+    run(scenario())
+
+
+def test_legacy_gift_resale_refunds_grams(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        connection = db_split.sqlite_connect(path)
+        try:
+            connection.execute("UPDATE accounts SET grams=1000 WHERE telegram_id=101")
+            cur = connection.execute(
+                "INSERT INTO gift_catalog(name,price_grams,supply,created_at) VALUES(?,?,?,?)",
+                ("Legacy sale gift", 40, 1, int(time.time())),
+            )
+            gift_id = int(cur.lastrowid)
+            connection.commit()
+        finally:
+            connection.close()
+
+        async with await client_for(app) as client:
+            bought = await client.post(
+                f"/api/gifts/{gift_id}/purchase", headers=headers(101), json={}
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert inventory[0]["purchase_price_stars"] == 40
+            assert inventory[0]["purchase_asset"] == "grams"
+            sold = await client.post(f"/api/gifts/{serial}/sell", headers=headers(101))
+            assert sold.status_code == 200
+            assert sold.json()["refund"] == 20 and sold.json()["asset"] == "grams"
+            assert (await client.get("/api/me", headers=headers(101))).json()["grams"] == 980
+
+    run(scenario())
+
+
+def test_upgrade_cost_is_fixed_at_25_and_low_balance_returns_402(env) -> None:
+    path, app = env
+
+    async def scenario() -> None:
+        await bot_module.set_telegram_gift_values("g1", price=10, supply=2)
+        async with await client_for(app) as client:
+            bought = await client.post(
+                "/api/telegram/gifts/g1/purchase", headers=headers(101), json={}
+            )
+            assert bought.status_code == 201
+            serial = bought.json()["gift"]["serial_number"]
+            connection = db_split.sqlite_connect(path)
+            try:
+                connection.execute("UPDATE accounts SET stars=10 WHERE telegram_id=101")
+                connection.commit()
+            finally:
+                connection.close()
+            rejected = await client.post(f"/api/gifts/{serial}/upgrade", headers=headers(101))
+            assert rejected.status_code == 402
+            assert rejected.json()["detail"] == "Недостаточно Stars"
+            assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 10
+            inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
+            assert inventory[0]["upgrade_level"] == 0
+
+    run(scenario())
+
+
 def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> None:
     path, app = env
 
@@ -838,8 +1019,8 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
             )
             assert upgraded.status_code == 200
             assert upgraded.json()["upgrade_level"] == 1
-            assert upgraded.json()["price_stars"] == 10
-            assert upgraded.json()["stars_balance"] == 4970
+            assert upgraded.json()["price_stars"] == 25
+            assert upgraded.json()["stars_balance"] == 4955
 
             # Replaying a successful upgrade request must not debit Stars twice.
             replayed = await client.post(
@@ -847,7 +1028,7 @@ def test_telegram_gift_upgrade_uses_internal_stars_and_records_level(env) -> Non
             )
             assert replayed.status_code == 200
             assert replayed.json() == upgraded.json()
-            assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 4970
+            assert (await client.get("/api/me", headers=headers(101))).json()["stars"] == 4955
             traits = upgraded.json()["attributes"]["collectible_traits"]
             assert traits["version"] == 1
             assert traits["rarity"] in {"Обычная", "Необычная", "Редкая", "Эпическая", "Легендарная"}
@@ -1385,7 +1566,10 @@ def test_messenger_storage_repairs_missing_gift_inventory_columns(env) -> None:
     path, _ = env
     connection = db_split.sqlite_connect(path)
     try:
-        for column in ("telegram_gift_id", "gift_emoji", "telegram_gift_metadata_json"):
+        for column in (
+            "telegram_gift_id", "gift_emoji", "telegram_gift_metadata_json",
+            "purchase_price_stars", "purchase_asset",
+        ):
             connection.execute(f"ALTER TABLE messenger.user_gifts DROP COLUMN {column}")
         connection.execute(
             "ALTER TABLE messenger.telegram_gift_catalog DROP COLUMN sticker_thumbnail_file_id"
@@ -1407,7 +1591,10 @@ def test_messenger_storage_repairs_missing_gift_inventory_columns(env) -> None:
     finally:
         connection.close()
 
-    assert {"telegram_gift_id", "gift_emoji", "telegram_gift_metadata_json"} <= user_gift_columns
+    assert {
+        "telegram_gift_id", "gift_emoji", "telegram_gift_metadata_json",
+        "purchase_price_stars", "purchase_asset",
+    } <= user_gift_columns
     assert "sticker_thumbnail_file_id" in catalog_columns
 
 
