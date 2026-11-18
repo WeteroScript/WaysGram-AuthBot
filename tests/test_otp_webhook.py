@@ -16,7 +16,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import bot_standalone as bot_module
+import bot as bot_module
 from otp_webhook import OtpWebhookError, parse_telesrv_delivery
 
 
