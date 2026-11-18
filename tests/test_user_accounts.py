@@ -5,7 +5,7 @@ import aiosqlite
 import pytest
 from cryptography.fernet import Fernet
 
-import bot as bot_module
+import bot_standalone as bot_module
 import db_split
 from messenger_api import init_messenger_storage
 
