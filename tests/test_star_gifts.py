@@ -87,6 +87,8 @@ def test_gifts_are_hidden_until_admin_sets_price_and_supply(env) -> None:
             shown_by_id = {gift["id"]: gift for gift in shown["gifts"]}
             assert set(shown_by_id) == {"g1", messenger_api.PLUSH_PEPE_GIFT_ID}
             assert shown_by_id["g1"]["price_stars"] == 40 and shown_by_id["g1"]["remaining"] == 2
+            assert shown_by_id["g1"]["upgrade_star_count"] == 25
+            assert shown_by_id["g1"]["can_upgrade"] is True
             assert shown_by_id[messenger_api.PLUSH_PEPE_GIFT_ID]["for_sale"] is True
             assert shown_by_id[messenger_api.PLUSH_PEPE_GIFT_ID]["unlimited_supply"] is True
             assert (await client.patch("/api/admin/telegram-gifts/g1", headers=headers(ADMIN), json={"price_stars": -1})).status_code in (404, 405)
@@ -935,11 +937,13 @@ def test_gift_resale_rejects_old_listed_auctioned_and_foreign_gifts(env) -> None
             too_old = await client.post(f"/api/gifts/{serials[0]}/sell", headers=headers(101))
             listed = await client.post(f"/api/gifts/{serials[1]}/sell", headers=headers(101))
             auctioned = await client.post(f"/api/gifts/{serials[2]}/sell", headers=headers(101))
+            upgrade_auctioned = await client.post(f"/api/gifts/{serials[2]}/upgrade", headers=headers(101))
             foreign_attempt = await client.post(f"/api/gifts/{foreign_serial}/sell", headers=headers(101))
             assert too_old.status_code == 409
             assert too_old.json()["detail"] == "Продать можно только подарок младше 7 дней"
             assert listed.status_code == 409 and listed.json()["detail"] == "Снимите подарок с продажи"
             assert auctioned.status_code == 409 and auctioned.json()["detail"] == "Снимите подарок с аукциона"
+            assert upgrade_auctioned.status_code == 409
             assert foreign_attempt.status_code == 404
 
     run(scenario())
