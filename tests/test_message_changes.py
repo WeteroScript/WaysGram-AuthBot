@@ -212,7 +212,7 @@ def test_existing_messages_count_as_read_after_the_upgrade(tmp_path, monkeypatch
     import db_split
     from cryptography.fernet import Fernet
 
-    import bot_standalone as bot_module
+    import bot as bot_module
     from messenger_api import init_messenger_storage
 
     path = tmp_path / "w.sqlite3"
