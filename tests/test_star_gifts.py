@@ -396,7 +396,7 @@ def test_removed_telegram_gift_cannot_be_purchased(env, monkeypatch: pytest.Monk
             inventory = (await client.get("/api/me/gifts", headers=headers(101))).json()["gifts"]
             assert len(inventory) == 1 and inventory[0]["telegram_gift_id"] == "g1"
             archived_admin_rows = await bot_module.telegram_gift_rows()
-            assert {str(row["id"]) for row in archived_admin_rows} == {"g1", "g2"}
+            assert {str(row["id"]) for row in archived_admin_rows} == {"g1", "g2", messenger_api.PLUSH_PEPE_GIFT_ID}
 
         connection = db_split.sqlite_connect(path)
         try:
