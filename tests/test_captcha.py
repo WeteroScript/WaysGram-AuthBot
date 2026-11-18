@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from cryptography.fernet import Fernet
 
-import bot_standalone as bot_module
+import bot as bot_module
 
 
 def run(coro):
