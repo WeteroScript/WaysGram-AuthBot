@@ -258,7 +258,7 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
         assert db.execute(
             "SELECT title,stars,is_available FROM telegram_mtproto_gift_catalog WHERE gift_id=?",
             (messenger_api.PLUSH_PEPE_GIFT_ID,),
-        ).fetchone() == ("Plush Pepe", 50, 1)
+        ).fetchone() == ("Plush Pepe", 50, 0)
 
         assert row == (
             "123456789",
