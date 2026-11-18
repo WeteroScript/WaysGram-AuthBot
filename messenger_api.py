@@ -4734,6 +4734,7 @@ def build_messenger_router(
                             raise
                         # MTProto has no still thumbnail for this motion gift.
                         # Continue to the next source, but only accept an actual image preview.
+                        continue
                 else:
                     bot = bot_provider()
                     if bot is None:
