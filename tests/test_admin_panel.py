@@ -217,7 +217,7 @@ def test_admin_edits_telegram_gift_prices_from_the_bot(panel) -> None:
     run(messenger_api.store_telegram_gifts(path, gifts, int(time.time())))
 
     listing = press("wgadm:tggifts")
-    assert "всего 2" in listing.sent[0][0]
+    assert "всего 3" in listing.sent[0][0]
     assert "⛔" in str(listing.sent[0][1])  # nothing is for sale yet
 
     press("wgadm:tggift:g1")
@@ -391,12 +391,17 @@ def test_admin_bulk_gift_import_and_hide_preserve_inventory(panel, monkeypatch: 
         conn.close()
 
     added = press("wgadm:dbgiftaddall")
-    assert "Добавлено/обновлено подарков: 2" in added.sent[0][0]
+    assert "Добавлено/обновлено подарков: 3" in added.sent[0][0]
     assert query(path, "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id='limited'") == [(25, 7, 3)]
     assert query(path, "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id='unlimited'") == [
         (50, bot_module.UNLIMITED_GIFT_SUPPLY, 0)
     ]
+    assert query(
+        path,
+        "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id=?",
+        (messenger_api.PLUSH_PEPE_GIFT_ID,),
+    ) == [(50, 2_000_000_000)]
 
     press("wgadm:dbgifthideall")
-    assert query(path, "SELECT COUNT(*) FROM telegram_gift_prices WHERE price_stars=0 AND supply=0")[0][0] == 2
+    assert query(path, "SELECT COUNT(*) FROM telegram_gift_prices WHERE price_stars=0 AND supply=0")[0][0] == 3
     assert query(path, "SELECT COUNT(*) FROM user_gifts WHERE serial_number='WG-KEEP'")[0][0] == 1

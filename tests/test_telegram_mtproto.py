@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import db_split
+import messenger_api
 
 import aiosqlite
 from pathlib import Path
@@ -244,7 +245,7 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
                           limited_per_user,auction,availability_remains,availability_total,
                           upgrade_stars,auction_slug,gifts_per_round,sticker_emoji,
                           sticker_document_id,sticker_mime_type
-                   FROM telegram_mtproto_gift_catalog"""
+                   FROM telegram_mtproto_gift_catalog WHERE gift_id='123456789'"""
             ).fetchone()
             sync_state = db.execute(
                 "SELECT source,gift_count FROM telegram_gift_sync_state WHERE id=1"
@@ -253,6 +254,11 @@ def test_mtproto_gift_catalog_persists_flags_and_downloads_sticker(tmp_path: Pat
                 """SELECT gift_id,title,auction_slug,auction_start_date,gifts_per_round
                    FROM telegram_auction_gift_registry"""
             ).fetchone()
+
+        assert db.execute(
+            "SELECT title,stars,is_available FROM telegram_mtproto_gift_catalog WHERE gift_id=?",
+            (messenger_api.PLUSH_PEPE_GIFT_ID,),
+        ).fetchone() == ("Plush Pepe", 50, 0)
 
         assert row == (
             "123456789",

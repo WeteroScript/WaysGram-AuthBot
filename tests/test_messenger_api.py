@@ -2880,12 +2880,15 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
             assert payload["source"] == "telegram_bot_api"
             assert payload["scope"] == "gifts_available_to_authbot"
             assert payload["currency"] == "stars"
-            # The app storefront only lists offers after AuthBot configures price and stock.
-            assert payload["count"] == 0
+            # Plush Pepe is the permanently seeded unlimited storefront offer.
+            assert payload["count"] == 1
+            assert payload["gifts"][0]["id"] == messenger_api.PLUSH_PEPE_GIFT_ID
+            assert payload["gifts"][0]["for_sale"] is True
+            assert payload["gifts"][0]["unlimited_supply"] is True
             # The legacy all=1 switch is ignored; private admin inventory remains in AuthBot only.
             full_catalog = await client.get("/api/telegram/gifts?all=1", headers=auth)
             assert full_catalog.status_code == 200
-            assert full_catalog.json()["count"] == 0
+            assert full_catalog.json()["count"] == 1
             edit_attempt = await client.patch(
                 "/api/telegram/gifts/gift_123",
                 headers=auth,
@@ -2899,16 +2902,17 @@ def test_telegram_gift_catalog_sync_and_sticker_proxy(api_env, monkeypatch) -> N
 
             catalog = await client.get("/api/telegram/gifts", headers=auth)
             payload = catalog.json()
-            assert payload["count"] == 1
+            assert payload["count"] == 2
 
-            gift = payload["gifts"][0]
+            gift = next(item for item in payload["gifts"] if item["id"] == "gift_123")
             assert gift["price_stars"] == 40
             assert gift["remaining"] == 3
             assert gift["telegram_star_count"] == 25
             assert gift["id"] == "gift_123"
             assert gift["title"] == "Подарок Telegram"
             assert gift["star_count"] == 25
-            assert gift["upgrade_star_count"] == 100
+            assert gift["upgrade_star_count"] == 25
+            assert gift["can_upgrade"] is True
             assert gift["is_premium"] is True
             assert gift["is_limited"] is True
             assert gift["remaining_count"] == 4500
@@ -3030,18 +3034,21 @@ def test_mtproto_gift_catalog_api_and_sticker_proxy(api_env) -> None:
             assert payload["source"] == "telegram_mtproto"
             assert payload["scope"] == "telegram_full_mtproto_catalog"
             assert payload["currency"] == "stars"
-            assert payload["count"] == 0  # hidden until the administrator prices it
+            assert payload["count"] == 1  # Plush Pepe remains available by default
+            assert payload["gifts"][0]["id"] == messenger_api.PLUSH_PEPE_GIFT_ID
             with db_split.sqlite_connect(path) as db:
                 db.execute(
                     "INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at) VALUES('987654321',60,5,0,1)"
                 )
             payload = (await client.get("/api/telegram/gifts", headers=auth)).json()
-            assert payload["count"] == 1
+            assert payload["count"] == 2
 
-            gift = payload["gifts"][0]
+            gift = next(item for item in payload["gifts"] if item["id"] == "987654321")
             assert gift["id"] == "987654321"
             assert gift["title"] == "MTProto Gift"
             assert gift["star_count"] == 42
+            assert gift["upgrade_star_count"] == 25
+            assert gift["can_upgrade"] is True
             assert gift["auction"] is True
             assert gift["sold_out"] is False
             assert gift["require_premium"] is True
@@ -5607,7 +5614,49 @@ def test_mtproto_sticker_proxy_falls_back_without_catalog_row(api_env) -> None:
 
     run(scenario())
 
-def test_video_gift_preview_prefers_mtproto_over_bot_api_thumbnail(api_env, monkeypatch) -> None:
+def test_plush_pepe_art_endpoint_uses_local_catalog_art_fallback(api_env, monkeypatch) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88122, "plush_pepe_art_user")
+    add_session(path, 88122, "plush-pepe-art-session")
+    preview_png = test_preview_png()
+    animated_tgs = b"\\x1f\\x8b" + b"plush-pepe-tgs"
+    requested: list[bool] = []
+
+    async def fake_fetch_asset(animated: bool):
+        requested.append(animated)
+        return (
+            (animated_tgs, "application/x-tgsticker")
+            if animated
+            else (preview_png, "image/png")
+        )
+
+    monkeypatch.setattr(messenger_api, "_fetch_plush_pepe_sticker_asset", fake_fetch_asset)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = {"Authorization": "Bearer plush-pepe-art-session"}
+            preview = await client.get(
+                f"/api/telegram/gifts/{messenger_api.PLUSH_PEPE_GIFT_ID}/sticker",
+                headers=auth,
+            )
+            assert preview.status_code == 200
+            assert preview.headers["content-type"].startswith("image/png")
+            assert preview.content == preview_png
+
+            animated = await client.get(
+                f"/api/telegram/gifts/{messenger_api.PLUSH_PEPE_GIFT_ID}/sticker?animated=1",
+                headers=auth,
+            )
+            assert animated.status_code == 200
+            assert animated.headers["content-type"].startswith("application/x-tgsticker")
+            assert animated.content == animated_tgs
+
+        assert requested == [False, True]
+
+    run(scenario())
+
+
+def test_video_gift_static_preview_uses_bot_api_thumbnail_when_mtproto_has_no_still(api_env, monkeypatch) -> None:
     path, auth_store, fake_bot, _old_app = api_env
     gift_id = "5936013938331222567"
     add_account(api_env, 88121, "plush_pepe_preview_user")
@@ -5684,9 +5733,17 @@ def test_video_gift_preview_prefers_mtproto_over_bot_api_thumbnail(api_env, monk
                 headers={"Authorization": "Bearer plush-pepe-preview-session"},
             )
             assert response.status_code == 200
-            assert response.headers["content-type"].startswith("video/webm")
-            assert response.content == expected_webm
-            assert bot_fetch_calls == []
+            assert response.headers["content-type"].startswith("image/png")
+            assert response.content == wrong_bot_thumbnail
+            assert bot_fetch_calls == ["stale-bot-thumbnail"]
+
+            animated = await client.get(
+                f"/api/telegram/gifts/{gift_id}/sticker?animated=1",
+                headers={"Authorization": "Bearer plush-pepe-preview-session"},
+            )
+            assert animated.status_code == 200
+            assert animated.headers["content-type"].startswith("video/webm")
+            assert animated.content == expected_webm
 
     run(scenario())
 

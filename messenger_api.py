@@ -42,7 +42,49 @@ MAX_USER_MEDIA_BYTES = 100 * 1024 * 1024
 MAX_USER_IMAGE_UPLOADS_PER_HOUR = 30
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 GIFT_SERIAL_RE = re.compile(r"^WG-[A-F0-9]{12}$")
+PLUSH_PEPE_GIFT_ID = "5936013938331222567"
+GIFT_SELL_WINDOW_SECONDS = 7 * 86400
+PLUSH_PEPE_ASSET_MAX_BYTES = 5 * 1024 * 1024
+_PLUSH_PEPE_STICKER_CACHE: dict[bool, tuple[bytes, str]] = {}
 LOGGER = logging.getLogger(__name__)
+
+
+async def _fetch_plush_pepe_sticker_asset(animated: bool) -> tuple[bytes, str] | None:
+    """Fetch a vetted static/animated fallback when Telegram has no catalog document."""
+    cache_key = bool(animated)
+    cached = _PLUSH_PEPE_STICKER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    asset_path = (
+        "tgs/by_name/plush_pepe.tgs"
+        if animated
+        else "webp/by_name/plush_pepe.webp"
+    )
+    asset_url = (
+        "https://raw.githubusercontent.com/ssamy2/TelegramGiftsAssests/main/"
+        + asset_path
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            response = await client.get(asset_url)
+            response.raise_for_status()
+        payload = response.content
+        if not payload or len(payload) > PLUSH_PEPE_ASSET_MAX_BYTES:
+            return None
+        if animated:
+            # Telegram's TGS format is gzip-compressed JSON.
+            if not payload.startswith(b"\\x1f\\x8b"):
+                return None
+            media_type = "application/x-tgsticker"
+        else:
+            payload, media_type = _normalize_gift_preview(payload)
+            if not media_type.startswith("image/"):
+                return None
+        cached = (payload, media_type)
+        _PLUSH_PEPE_STICKER_CACHE[cache_key] = cached
+        return cached
+    except (httpx.HTTPError, OSError, ValueError, UnidentifiedImageError):
+        return None
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 FCM_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
@@ -1002,6 +1044,28 @@ async def init_messenger_storage(database_path: Path) -> None:
                  AND COALESCE(gifts_per_round,0)>0""",
             (int(time.time()),)
         )
+        # Keep Plush Pepe available as a WaysGram storefront item even when it
+        # is absent from the synchronized Telegram catalog.
+        plush_now = int(time.time())
+        await db.execute(
+            """INSERT INTO telegram_gift_prices(gift_id,price_stars,supply,sold,updated_at)
+               VALUES(?,50,2000000000,0,?)
+               ON CONFLICT(gift_id) DO UPDATE SET
+                   price_stars=CASE WHEN telegram_gift_prices.price_stars>0
+                                    THEN telegram_gift_prices.price_stars ELSE excluded.price_stars END,
+                   supply=MAX(telegram_gift_prices.supply,excluded.supply),
+                   updated_at=excluded.updated_at""",
+            (PLUSH_PEPE_GIFT_ID, plush_now),
+        )
+        await db.execute(
+            """INSERT OR IGNORE INTO telegram_mtproto_gift_catalog
+               (gift_id,title,sticker_emoji,sticker_set_name,sticker_is_video,
+                sticker_mime_type,stars,source_payload,position,is_available,synced_at)
+               SELECT ?, 'Plush Pepe', '🐸', 'PlushPepe', 1, 'video/webm', 50, '{}', 0, 1, ?
+               WHERE NOT EXISTS (SELECT 1 FROM telegram_gift_catalog WHERE gift_id=?)
+                 AND NOT EXISTS (SELECT 1 FROM telegram_mtproto_gift_catalog WHERE gift_id=?)""",
+            (PLUSH_PEPE_GIFT_ID, plush_now, PLUSH_PEPE_GIFT_ID, PLUSH_PEPE_GIFT_ID),
+        )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(user_gifts)")
         user_gift_columns = {str(row[1]) for row in await cur.fetchall()}
         if "upgrade_level" not in user_gift_columns:
@@ -1020,11 +1084,50 @@ async def init_messenger_storage(database_path: Path) -> None:
             ("telegram_gift_id", "TEXT NOT NULL DEFAULT ''"),
             ("gift_emoji", "TEXT NOT NULL DEFAULT ''"),
             ("telegram_gift_metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("purchase_price_stars", "INTEGER NOT NULL DEFAULT 0"),
+            ("purchase_asset", "TEXT NOT NULL DEFAULT 'stars'"),
         ):
             if column not in user_gift_columns:
                 await db.execute(
                     f"ALTER TABLE {db_split.SCHEMA}.user_gifts ADD COLUMN {column} {definition}"
                 )
+        # The app also initializes isolated messenger-only SQLite files in tests
+        # and repair tooling. Backfill only when the economy ledger is present.
+        economy_table = await db.execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='economy_transactions'"
+        )
+        if await economy_table.fetchone():
+            # Backfill prices only when the original debit can be attributed to
+            # the gift's current owner. Unknown historical prices remain unsellable.
+            await db.execute(
+                """UPDATE user_gifts
+                   SET purchase_price_stars=COALESCE((
+                           SELECT -t.amount FROM economy_transactions t
+                           WHERE t.telegram_id=user_gifts.owner_telegram_id
+                             AND t.asset='grams'
+                             AND t.reason='gift_purchase:' || user_gifts.gift_id
+                           ORDER BY t.created_at DESC LIMIT 1
+                       ),0),
+                       purchase_asset=CASE WHEN EXISTS (
+                           SELECT 1 FROM economy_transactions t
+                           WHERE t.telegram_id=user_gifts.owner_telegram_id
+                             AND t.asset='grams'
+                             AND t.reason='gift_purchase:' || user_gifts.gift_id
+                       ) THEN 'grams' ELSE purchase_asset END
+                   WHERE COALESCE(purchase_price_stars,0)=0 AND gift_id IS NOT NULL"""
+            )
+            await db.execute(
+                """UPDATE user_gifts
+                   SET purchase_price_stars=COALESCE((
+                           SELECT -t.amount FROM economy_transactions t
+                           WHERE t.telegram_id=user_gifts.owner_telegram_id
+                             AND t.asset='stars'
+                             AND t.reason='telegram_gift:' || user_gifts.telegram_gift_id
+                           ORDER BY t.created_at DESC LIMIT 1
+                       ),0)
+                   WHERE COALESCE(purchase_price_stars,0)=0
+                     AND COALESCE(telegram_gift_id,'')<>''"""
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(telegram_gift_catalog)")
         telegram_gift_columns = {str(row[1]) for row in await cur.fetchall()}
         if "sticker_thumbnail_file_id" not in telegram_gift_columns:
@@ -3243,6 +3346,7 @@ def build_messenger_router(
             total = int((await cur.fetchone())[0] or 0)
             query = """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,gift_emoji,
                           telegram_gift_metadata_json,acquired_at,upgrade_level,attributes_json,
+                          purchase_price_stars,purchase_asset,
                           EXISTS(SELECT 1 FROM gift_market_listings l
                                  WHERE l.serial_number=user_gifts.serial_number
                                    AND l.status='active') AS is_listed,
@@ -3281,6 +3385,19 @@ def build_messenger_router(
             gift_db.row_factory = aiosqlite.Row
             for row in rows:
                 item = dict(row)
+                purchase_price = max(0, int(item.get("purchase_price_stars") or 0))
+                purchase_asset = "grams" if str(item.get("purchase_asset") or "").lower() == "grams" else "stars"
+                sell_refund = int(round(purchase_price * 0.5))
+                item["purchase_price_stars"] = purchase_price
+                item["purchase_asset"] = purchase_asset
+                item["sell_refund"] = sell_refund
+                item["sellable"] = (
+                    int(time.time()) - int(item.get("acquired_at") or 0) < GIFT_SELL_WINDOW_SECONDS
+                    and purchase_price > 0
+                    and sell_refund > 0
+                    and not bool(item.get("is_listed"))
+                    and not bool(item.get("is_auctioned"))
+                )
                 raw_attributes = item.pop("attributes_json", "{}")
                 try:
                     attributes = json.loads(raw_attributes or "{}")
@@ -3297,6 +3414,22 @@ def build_messenger_router(
                 if gift_id not in metadata_by_id:
                     metadata_by_id[gift_id] = await _telegram_gift_metadata(gift_db, gift_id)
                 telegram_gift = _merge_telegram_gift_metadata(metadata_by_id[gift_id], snapshot)
+                if gift_id == PLUSH_PEPE_GIFT_ID:
+                    telegram_gift = dict(telegram_gift or {})
+                    telegram_gift.update({
+                        "title": "Plush Pepe",
+                        "emoji": str(telegram_gift.get("emoji") or "🐸"),
+                        "sticker_available": True,
+                    })
+                    sticker = dict(telegram_gift.get("sticker") or {})
+                    sticker.setdefault("type", "video")
+                    sticker.setdefault("set_name", "PlushPepe")
+                    sticker.setdefault("mime_type", "video/webm")
+                    sticker["url"] = f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker"
+                    telegram_gift["sticker"] = sticker
+                if telegram_gift and int(item.get("upgrade_level") or 0) == 0:
+                    telegram_gift["upgrade_star_count"] = 25
+                    telegram_gift["can_upgrade"] = True
                 item["telegram_gift"] = telegram_gift
                 if telegram_gift and str(telegram_gift.get("title") or "").strip():
                     item["gift_name"] = str(telegram_gift["title"]).strip()
@@ -3947,7 +4080,10 @@ def build_messenger_router(
                 "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id=?", (gift_id,)
             )
             priced = await cur.fetchone()
-            if not priced or int(priced["price_stars"]) <= 0 or int(priced["supply"]) - int(priced["sold"]) <= 0:
+            if not priced or int(priced["price_stars"]) <= 0 or (
+                int(priced["supply"]) < 2_000_000_000
+                and int(priced["supply"]) - int(priced["sold"]) <= 0
+            ):
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Подарок недоступен для покупки")
             title = await telegram_gift_title(db, gift_id)
@@ -3983,7 +4119,9 @@ def build_messenger_router(
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Недостаточно Stars")
             cur = await db.execute(
-                "UPDATE telegram_gift_prices SET sold=sold+1 WHERE gift_id=? AND sold<supply", (gift_id,)
+                """UPDATE telegram_gift_prices SET sold=sold+1
+                   WHERE gift_id=? AND (supply>=2000000000 OR sold<supply)""",
+                (gift_id,),
             )
             if cur.rowcount != 1:
                 await db.rollback()
@@ -3992,9 +4130,10 @@ def build_messenger_router(
             await db.execute(
                 """INSERT INTO user_gifts
                    (serial_number,gift_id,telegram_gift_id,gift_name,gift_emoji,
-                    telegram_gift_metadata_json,owner_telegram_id,acquired_at)
-                   VALUES(?,NULL,?,?,?,?,?,?)""",
-                (serial, gift_id, title, gift_emoji, gift_metadata_json, owner, now),
+                    telegram_gift_metadata_json,owner_telegram_id,acquired_at,
+                    purchase_price_stars,purchase_asset)
+                   VALUES(?,NULL,?,?,?,?,?,?,?,'stars')""",
+                (serial, gift_id, title, gift_emoji, gift_metadata_json, owner, now, price),
             )
             balance = int(account["stars"]) - price
             await db.execute(
@@ -4378,8 +4517,8 @@ def build_messenger_router(
                 "id": gift_id,
                 "source": "telegram",
                 "catalog_source": "waysgram_manual",
-                "title": "Подарок Telegram",
-                "emoji": "",
+                "title": "Plush Pepe" if gift_id == PLUSH_PEPE_GIFT_ID else "Подарок Telegram",
+                "emoji": "🐸" if gift_id == PLUSH_PEPE_GIFT_ID else "",
                 "star_count": 0,
                 "currency": "telegram_stars",
                 "upgrade_star_count": None,
@@ -4394,13 +4533,13 @@ def build_messenger_router(
                 "background": None,
                 "publisher_chat": None,
                 "sticker": {
-                    "type": "regular",
-                    "set_name": "",
+                    "type": "video" if gift_id == PLUSH_PEPE_GIFT_ID else "regular",
+                    "set_name": "PlushPepe" if gift_id == PLUSH_PEPE_GIFT_ID else "",
                     "width": None,
                     "height": None,
                     "is_animated": False,
-                    "is_video": False,
-                    "mime_type": "application/octet-stream",
+                    "is_video": gift_id == PLUSH_PEPE_GIFT_ID,
+                    "mime_type": "video/webm" if gift_id == PLUSH_PEPE_GIFT_ID else "application/octet-stream",
                     "url": f"/api/telegram/gifts/{quote(gift_id, safe='')}/sticker",
                 },
                 "synced_at": int(time.time()),
@@ -4409,6 +4548,17 @@ def build_messenger_router(
 
         prices = await gift_prices()
         for gift in gifts:
+            if str(gift.get("id") or "") == PLUSH_PEPE_GIFT_ID:
+                gift["title"] = "Plush Pepe"
+                gift["emoji"] = str(gift.get("emoji") or "🐸")
+                sticker = dict(gift.get("sticker") or {})
+                sticker.setdefault("type", "video")
+                sticker.setdefault("set_name", "PlushPepe")
+                sticker.setdefault("mime_type", "video/webm")
+                sticker["url"] = f"/api/telegram/gifts/{quote(PLUSH_PEPE_GIFT_ID, safe='')}/sticker"
+                gift["sticker"] = sticker
+            gift["upgrade_star_count"] = 25
+            gift["can_upgrade"] = True
             priced = prices.get(str(gift["id"]), {"price_stars": 0, "supply": 0, "sold": 0})
             gift["telegram_star_count"] = gift["star_count"]
             gift["price_stars"] = priced["price_stars"]
@@ -4490,8 +4640,6 @@ def build_messenger_router(
 
                 candidates.sort(key=preview_priority)
 
-        motion_preview_fallback: tuple[bytes, str] | None = None
-
         async def purchase_snapshot_fallback() -> Response | None:
             # A gift can remain in a user's inventory after its row has disappeared
             # from the current and historical catalogue tables. Its purchase-time
@@ -4531,11 +4679,7 @@ def build_messenger_router(
                     content, media_type = await provider.download_sticker(gift_id)
                 else:
                     content, media_type = await provider.download_sticker_preview(gift_id)
-                    try:
-                        content, media_type = _normalize_gift_preview(content)
-                    except ValueError:
-                        # Keep the original only as a last-resort compatibility fallback.
-                        pass
+                    content, media_type = _normalize_gift_preview(content)
                 return Response(
                     content=content,
                     media_type=media_type,
@@ -4553,12 +4697,7 @@ def build_messenger_router(
                     content, media_type = await provider.download_sticker(gift_id)
                 else:
                     content, media_type = await provider.download_sticker_preview(gift_id)
-                    try:
-                        content, media_type = _normalize_gift_preview(content)
-                    except ValueError:
-                        # Some video gifts have no separate still thumbnail.
-                        # Preserve the original WebM for the Android sticker decoder.
-                        pass
+                    content, media_type = _normalize_gift_preview(content)
                 return Response(
                     content=content,
                     media_type=media_type,
@@ -4566,6 +4705,19 @@ def build_messenger_router(
                 )
             except Exception:
                 return None
+
+        async def plush_pepe_asset_fallback() -> Response | None:
+            if gift_id != PLUSH_PEPE_GIFT_ID:
+                return None
+            asset = await _fetch_plush_pepe_sticker_asset(bool(animated))
+            if asset is None:
+                return None
+            content, media_type = asset
+            return Response(
+                content=content,
+                media_type=media_type,
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
 
         if not candidates:
             # Prefer the exact purchase-time snapshot when present; it preserves
@@ -4576,6 +4728,9 @@ def build_messenger_router(
             provider_response = await mtproto_sticker_fallback()
             if provider_response is not None:
                 return provider_response
+            asset_response = await plush_pepe_asset_fallback()
+            if asset_response is not None:
+                return asset_response
             raise HTTPException(status_code=404, detail="Подарок не найден в текущем или историческом каталоге")
 
         if animated:
@@ -4613,6 +4768,9 @@ def build_messenger_router(
                     )
                 except Exception:
                     continue
+            asset_response = await plush_pepe_asset_fallback()
+            if asset_response is not None:
+                return asset_response
             raise HTTPException(status_code=502, detail="Не удалось загрузить исходную анимацию подарка")
 
         for catalog_source, sticker_row in candidates:
@@ -4633,10 +4791,9 @@ def build_messenger_router(
                         )
                         if not is_motion:
                             raise
-                        motion_preview_fallback = (content, media_type)
-                        # MTProto is the selected authoritative catalogue here;
-                        # don't replace its motion asset with a potentially stale Bot API row.
-                        break
+                        # MTProto has no still thumbnail for this motion gift.
+                        # Continue to the next source, but only accept an actual image preview.
+                        continue
                 else:
                     bot = bot_provider()
                     if bot is None:
@@ -4677,7 +4834,6 @@ def build_messenger_router(
                     if normalized_preview is not None:
                         content, media_type = normalized_preview
                     elif raw_motion_preview is not None:
-                        motion_preview_fallback = raw_motion_preview
                         continue
                     else:
                         continue
@@ -4694,18 +4850,10 @@ def build_messenger_router(
         snapshot_response = await purchase_snapshot_fallback()
         if snapshot_response is not None and str(snapshot_response.media_type or "").lower().startswith("image/"):
             return snapshot_response
-        if provider_response is not None:
-            return provider_response
-        if snapshot_response is not None:
-            return snapshot_response
-        if motion_preview_fallback is not None:
-            content, media_type = motion_preview_fallback
-            return Response(
-                content=content,
-                media_type=media_type,
-                headers={"Cache-Control": "private, max-age=3600"},
-            )
-        raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram из доступных источников")
+        asset_response = await plush_pepe_asset_fallback()
+        if asset_response is not None:
+            return asset_response
+        raise HTTPException(status_code=502, detail="Не удалось загрузить статичное превью подарка Telegram")
 
     @router.get("/api/gifts")
     async def gift_catalog(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -4791,9 +4939,10 @@ def build_messenger_router(
             serial = "WG-" + secrets.token_hex(6).upper()
             cur = await db.execute(
                 """INSERT INTO user_gifts
-                   (serial_number,gift_id,gift_name,owner_telegram_id,acquired_at)
-                   VALUES(?,?,?,?,?)""",
-                (serial, gift_id, str(gift["name"]), uid, now),
+                   (serial_number,gift_id,gift_name,owner_telegram_id,acquired_at,
+                    purchase_price_stars,purchase_asset)
+                   VALUES(?,?,?,?,?,?,'grams')""",
+                (serial, gift_id, str(gift["name"]), uid, now, price),
             )
             gift_instance_id = int(cur.lastrowid)
             balance = int(account["grams"]) - price
@@ -4863,6 +5012,100 @@ def build_messenger_router(
                        VALUES(?,'gift_purchase',?,?,?,?)""",
                     (uid, key, request_hash, json.dumps(result, ensure_ascii=False, separators=(",", ":")), now),
                 )
+            await db.commit()
+        return result
+
+    @router.post("/api/gifts/{serial_number}/sell")
+    async def sell_gift(
+        serial_number: str,
+        authorization: str | None = Header(default=None),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        user = await current_user(authorization)
+        uid = int(user["telegram_id"])
+        serial = serial_number.strip().upper()
+        if not GIFT_SERIAL_RE.fullmatch(serial):
+            raise HTTPException(status_code=400, detail="Некорректный серийный номер подарка")
+        now = int(time.time())
+        scope = "/api/gifts/sell"
+        descriptor = idempotency_descriptor(scope, {"serial_number": serial}, idempotency_key)
+        async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            previous = await idempotency_lookup(db, uid, scope, descriptor, now)
+            if previous is not None:
+                await db.rollback()
+                return previous
+            cur = await db.execute(
+                """SELECT id,gift_id,telegram_gift_id,gift_name,acquired_at,
+                          purchase_price_stars,purchase_asset
+                   FROM user_gifts WHERE serial_number=? AND owner_telegram_id=?""",
+                (serial, uid),
+            )
+            gift = await cur.fetchone()
+            if gift is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Подарок не найден")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_market_listings WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Снимите подарок с продажи")
+            cur = await db.execute(
+                "SELECT 1 FROM gift_collectible_auctions WHERE serial_number=? AND status='active'",
+                (serial,),
+            )
+            if await cur.fetchone():
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Снимите подарок с аукциона")
+            if now - int(gift["acquired_at"]) > GIFT_SELL_WINDOW_SECONDS:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Продать можно только подарок младше 7 дней")
+            purchase_price = max(0, int(gift["purchase_price_stars"] or 0))
+            if purchase_price == 0:
+                await db.rollback()
+                raise HTTPException(status_code=409, detail="Стоимость подарка неизвестна, продажа недоступна")
+            refund = int(round(purchase_price * 0.5))
+            asset = "grams" if str(gift["purchase_asset"] or "").lower() == "grams" else "stars"
+            cur = await db.execute(
+                "SELECT stars,grams,is_banned FROM accounts WHERE telegram_id=?",
+                (uid,),
+            )
+            account = await cur.fetchone()
+            if account is None or account["is_banned"]:
+                await db.rollback()
+                raise HTTPException(status_code=403, detail="Аккаунт недоступен")
+            new_balance = int(account[asset]) + refund
+            await db.execute(
+                f"UPDATE accounts SET {asset}=?,updated_at=? WHERE telegram_id=?",
+                (new_balance, now, uid),
+            )
+            gift_id = str(gift["telegram_gift_id"] or gift["gift_id"] or "")
+            await db.execute(
+                """INSERT INTO economy_transactions
+                   (telegram_id,asset,amount,balance_after,reason,admin_id,created_at)
+                   VALUES(?,?,?,?,?,NULL,?)""",
+                (uid, asset, refund, new_balance, f"gift_sale:{gift_id}", now),
+            )
+            await db.execute(
+                """INSERT INTO gift_transactions
+                   (event_type,serial_number,gift_name,from_telegram_id,to_telegram_id,created_at)
+                   VALUES('sell',?,?,?,?,?)""",
+                (serial, str(gift["gift_name"]), uid, uid, now),
+            )
+            await db.execute(
+                "DELETE FROM user_gifts WHERE id=? AND owner_telegram_id=?",
+                (int(gift["id"]), uid),
+            )
+            result = {
+                "status": "sold",
+                "serial_number": serial,
+                "refund": refund,
+                "asset": asset,
+            }
+            await idempotency_store(db, uid, scope, descriptor, result, now)
             await db.commit()
         return result
 
@@ -5724,24 +5967,9 @@ def build_messenger_router(
             if not str(gift["telegram_gift_id"] or ""):
                 await db.rollback()
                 raise HTTPException(status_code=409, detail="Этот подарок нельзя улучшить")
-            cur = await db.execute("SELECT source FROM telegram_gift_sync_state WHERE id=1")
-            state = await cur.fetchone()
-            source = str(state[0]) if state else "telegram_bot_api"
-            if source == "telegram_mtproto":
-                cur = await db.execute(
-                    "SELECT upgrade_stars FROM telegram_mtproto_gift_catalog WHERE gift_id=? AND is_available=1",
-                    (str(gift["telegram_gift_id"]),),
-                )
-            else:
-                cur = await db.execute(
-                    "SELECT upgrade_star_count FROM telegram_gift_catalog WHERE gift_id=? AND is_available=1",
-                    (str(gift["telegram_gift_id"]),),
-                )
-            catalog = await cur.fetchone()
-            if catalog is None or catalog[0] is None or int(catalog[0]) <= 0:
-                await db.rollback()
-                raise HTTPException(status_code=409, detail="Для этого подарка нет доступного улучшения")
-            price = int(catalog[0])
+            # WaysGram upgrades always cost 25 internal Stars; Telegram metadata
+            # is not the source of truth for this in-app purchase.
+            price = 25
             cur = await db.execute(
                 "SELECT stars,is_banned FROM accounts WHERE telegram_id=?",
                 (uid,),
@@ -5752,7 +5980,7 @@ def build_messenger_router(
                 raise HTTPException(status_code=403, detail="Аккаунт недоступен")
             if int(account["stars"]) < price:
                 await db.rollback()
-                raise HTTPException(status_code=409, detail="Недостаточно Stars")
+                raise HTTPException(status_code=402, detail="Недостаточно Stars")
             new_balance = int(account["stars"]) - price
             new_level = int(gift["upgrade_level"]) + 1
             try:
