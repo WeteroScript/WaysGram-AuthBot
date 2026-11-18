@@ -1639,6 +1639,10 @@ def _normalize_gift_preview(content: bytes) -> tuple[bytes, str]:
     try:
         with Image.open(BytesIO(content)) as source:
             source.seek(0)
+            source.load()
+            if source.format == "PNG" and int(getattr(source, "n_frames", 1)) == 1:
+                # Preserve an already-static PNG byte-for-byte for existing clients/cache keys.
+                return content, "image/png"
             preview = ImageOps.exif_transpose(source).convert("RGBA")
             preview.thumbnail((512, 512), Image.Resampling.LANCZOS)
             output = BytesIO()
@@ -4630,7 +4634,9 @@ def build_messenger_router(
                         if not is_motion:
                             raise
                         motion_preview_fallback = (content, media_type)
-                        continue
+                        # MTProto is the selected authoritative catalogue here;
+                        # don't replace its motion asset with a potentially stale Bot API row.
+                        break
                 else:
                     bot = bot_provider()
                     if bot is None:
