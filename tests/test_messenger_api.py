@@ -5614,6 +5614,48 @@ def test_mtproto_sticker_proxy_falls_back_without_catalog_row(api_env) -> None:
 
     run(scenario())
 
+def test_plush_pepe_art_endpoint_uses_local_catalog_art_fallback(api_env, monkeypatch) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 88122, "plush_pepe_art_user")
+    add_session(path, 88122, "plush-pepe-art-session")
+    preview_png = test_preview_png()
+    animated_tgs = b"\\x1f\\x8b" + b"plush-pepe-tgs"
+    requested: list[bool] = []
+
+    async def fake_fetch_asset(animated: bool):
+        requested.append(animated)
+        return (
+            (animated_tgs, "application/x-tgsticker")
+            if animated
+            else (preview_png, "image/png")
+        )
+
+    monkeypatch.setattr(messenger_api, "_fetch_plush_pepe_sticker_asset", fake_fetch_asset)
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            auth = {"Authorization": "Bearer plush-pepe-art-session"}
+            preview = await client.get(
+                f"/api/telegram/gifts/{messenger_api.PLUSH_PEPE_GIFT_ID}/sticker",
+                headers=auth,
+            )
+            assert preview.status_code == 200
+            assert preview.headers["content-type"].startswith("image/png")
+            assert preview.content == preview_png
+
+            animated = await client.get(
+                f"/api/telegram/gifts/{messenger_api.PLUSH_PEPE_GIFT_ID}/sticker?animated=1",
+                headers=auth,
+            )
+            assert animated.status_code == 200
+            assert animated.headers["content-type"].startswith("application/x-tgsticker")
+            assert animated.content == animated_tgs
+
+        assert requested == [False, True]
+
+    run(scenario())
+
+
 def test_video_gift_static_preview_uses_bot_api_thumbnail_when_mtproto_has_no_still(api_env, monkeypatch) -> None:
     path, auth_store, fake_bot, _old_app = api_env
     gift_id = "5936013938331222567"
