@@ -16,7 +16,7 @@ How the folder is fetched:
 Environment variables (all optional):
 
     WAYSGRAM_REPO         default WeteroScript/WaysGram-New
-    WAYSGRAM_REF          branch or tag, default main
+    WAYSGRAM_REF          branch or tag, default arena/00b4c974-waysgram-new
     WAYSGRAM_COMMIT       pin an exact commit (skips update checks)
     WAYSGRAM_SUBDIR       folder with the bot code, default authbot
     WAYSGRAM_HOME         cache directory, default /data/waysgram-new, else ./.waysgram-src
