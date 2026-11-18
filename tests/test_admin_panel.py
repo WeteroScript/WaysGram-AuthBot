@@ -396,6 +396,11 @@ def test_admin_bulk_gift_import_and_hide_preserve_inventory(panel, monkeypatch: 
     assert query(path, "SELECT price_stars,supply,sold FROM telegram_gift_prices WHERE gift_id='unlimited'") == [
         (50, bot_module.UNLIMITED_GIFT_SUPPLY, 0)
     ]
+    assert query(
+        path,
+        "SELECT price_stars,supply FROM telegram_gift_prices WHERE gift_id=?",
+        (messenger_api.PLUSH_PEPE_GIFT_ID,),
+    ) == [(50, 2_000_000_000)]
 
     press("wgadm:dbgifthideall")
     assert query(path, "SELECT COUNT(*) FROM telegram_gift_prices WHERE price_stars=0 AND supply=0")[0][0] == 3
