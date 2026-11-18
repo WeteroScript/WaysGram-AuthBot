@@ -1051,37 +1051,43 @@ async def init_messenger_storage(database_path: Path) -> None:
                 await db.execute(
                     f"ALTER TABLE {db_split.SCHEMA}.user_gifts ADD COLUMN {column} {definition}"
                 )
-        # Backfill prices only when the original debit can be attributed to
-        # the gift's current owner. Unknown historical prices remain unsellable.
-        await db.execute(
-            """UPDATE user_gifts
-               SET purchase_price_stars=COALESCE((
-                       SELECT -t.amount FROM economy_transactions t
-                       WHERE t.telegram_id=user_gifts.owner_telegram_id
-                         AND t.asset='grams'
-                         AND t.reason='gift_purchase:' || user_gifts.gift_id
-                       ORDER BY t.created_at DESC LIMIT 1
-                   ),0),
-                   purchase_asset=CASE WHEN EXISTS (
-                       SELECT 1 FROM economy_transactions t
-                       WHERE t.telegram_id=user_gifts.owner_telegram_id
-                         AND t.asset='grams'
-                         AND t.reason='gift_purchase:' || user_gifts.gift_id
-                   ) THEN 'grams' ELSE purchase_asset END
-               WHERE COALESCE(purchase_price_stars,0)=0 AND gift_id IS NOT NULL"""
+        # The app also initializes isolated messenger-only SQLite files in tests
+        # and repair tooling. Backfill only when the economy ledger is present.
+        economy_table = await db.execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='economy_transactions'"
         )
-        await db.execute(
-            """UPDATE user_gifts
-               SET purchase_price_stars=COALESCE((
-                       SELECT -t.amount FROM economy_transactions t
-                       WHERE t.telegram_id=user_gifts.owner_telegram_id
-                         AND t.asset='stars'
-                         AND t.reason='telegram_gift:' || user_gifts.telegram_gift_id
-                       ORDER BY t.created_at DESC LIMIT 1
-                   ),0)
-               WHERE COALESCE(purchase_price_stars,0)=0
-                 AND COALESCE(telegram_gift_id,'')<>''"""
-        )
+        if await economy_table.fetchone():
+            # Backfill prices only when the original debit can be attributed to
+            # the gift's current owner. Unknown historical prices remain unsellable.
+            await db.execute(
+                """UPDATE user_gifts
+                   SET purchase_price_stars=COALESCE((
+                           SELECT -t.amount FROM economy_transactions t
+                           WHERE t.telegram_id=user_gifts.owner_telegram_id
+                             AND t.asset='grams'
+                             AND t.reason='gift_purchase:' || user_gifts.gift_id
+                           ORDER BY t.created_at DESC LIMIT 1
+                       ),0),
+                       purchase_asset=CASE WHEN EXISTS (
+                           SELECT 1 FROM economy_transactions t
+                           WHERE t.telegram_id=user_gifts.owner_telegram_id
+                             AND t.asset='grams'
+                             AND t.reason='gift_purchase:' || user_gifts.gift_id
+                       ) THEN 'grams' ELSE purchase_asset END
+                   WHERE COALESCE(purchase_price_stars,0)=0 AND gift_id IS NOT NULL"""
+            )
+            await db.execute(
+                """UPDATE user_gifts
+                   SET purchase_price_stars=COALESCE((
+                           SELECT -t.amount FROM economy_transactions t
+                           WHERE t.telegram_id=user_gifts.owner_telegram_id
+                             AND t.asset='stars'
+                             AND t.reason='telegram_gift:' || user_gifts.telegram_gift_id
+                           ORDER BY t.created_at DESC LIMIT 1
+                       ),0)
+                   WHERE COALESCE(purchase_price_stars,0)=0
+                     AND COALESCE(telegram_gift_id,'')<>''"""
+            )
         cur = await db.execute(f"PRAGMA {db_split.SCHEMA}.table_info(telegram_gift_catalog)")
         telegram_gift_columns = {str(row[1]) for row in await cur.fetchall()}
         if "sticker_thumbnail_file_id" not in telegram_gift_columns:
