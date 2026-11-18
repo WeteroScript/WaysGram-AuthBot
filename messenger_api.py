@@ -4706,6 +4706,19 @@ def build_messenger_router(
             except Exception:
                 return None
 
+        async def plush_pepe_asset_fallback() -> Response | None:
+            if gift_id != PLUSH_PEPE_GIFT_ID:
+                return None
+            asset = await _fetch_plush_pepe_sticker_asset(bool(animated))
+            if asset is None:
+                return None
+            content, media_type = asset
+            return Response(
+                content=content,
+                media_type=media_type,
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
         if not candidates:
             # Prefer the exact purchase-time snapshot when present; it preserves
             # the media representation already associated with the user's gift.
@@ -4715,6 +4728,9 @@ def build_messenger_router(
             provider_response = await mtproto_sticker_fallback()
             if provider_response is not None:
                 return provider_response
+            asset_response = await plush_pepe_asset_fallback()
+            if asset_response is not None:
+                return asset_response
             raise HTTPException(status_code=404, detail="Подарок не найден в текущем или историческом каталоге")
 
         if animated:
@@ -4752,6 +4768,9 @@ def build_messenger_router(
                     )
                 except Exception:
                     continue
+            asset_response = await plush_pepe_asset_fallback()
+            if asset_response is not None:
+                return asset_response
             raise HTTPException(status_code=502, detail="Не удалось загрузить исходную анимацию подарка")
 
         for catalog_source, sticker_row in candidates:
@@ -4831,6 +4850,9 @@ def build_messenger_router(
         snapshot_response = await purchase_snapshot_fallback()
         if snapshot_response is not None and str(snapshot_response.media_type or "").lower().startswith("image/"):
             return snapshot_response
+        asset_response = await plush_pepe_asset_fallback()
+        if asset_response is not None:
+            return asset_response
         raise HTTPException(status_code=502, detail="Не удалось загрузить статичное превью подарка Telegram")
 
     @router.get("/api/gifts")
