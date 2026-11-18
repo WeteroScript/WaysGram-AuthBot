@@ -4594,8 +4594,6 @@ def build_messenger_router(
 
                 candidates.sort(key=preview_priority)
 
-        motion_preview_fallback: tuple[bytes, str] | None = None
-
         async def purchase_snapshot_fallback() -> Response | None:
             # A gift can remain in a user's inventory after its row has disappeared
             # from the current and historical catalogue tables. Its purchase-time
