@@ -4732,9 +4732,8 @@ def build_messenger_router(
                         )
                         if not is_motion:
                             raise
-                        # MTProto is the selected authoritative catalogue here;
-                        # don't replace its motion asset with a potentially stale Bot API row.
-                        break
+                        # MTProto has no still thumbnail for this motion gift.
+                        # Continue to the next source, but only accept an actual image preview.
                 else:
                     bot = bot_provider()
                     if bot is None:
