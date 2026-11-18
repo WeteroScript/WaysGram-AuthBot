@@ -170,6 +170,74 @@ def test_authbot_code_login_creates_hashed_api_session(api_env) -> None:
 
 
 
+def test_refresh_accepts_expired_sessions_only_within_grace(api_env) -> None:
+    path, _auth_store, _fake_bot, app = api_env
+    add_account(api_env, 81021, "refresh_grace")
+    tokens = {
+        "one_day": "refresh-one-day-expired",
+        "ten_days": "refresh-ten-days-expired",
+        "active": "refresh-active-session",
+        "untouched": "refresh-untouched-session",
+    }
+    now = int(time.time())
+    for token in tokens.values():
+        add_session(path, 81021, token)
+    original_untouched_expiry = now + 7200
+    with db_split.sqlite_connect(path) as db:
+        db.executemany(
+            "UPDATE api_sessions SET expires_at=? WHERE token_hash=?",
+            [
+                (now - 86400, hashlib.sha256(tokens["one_day"].encode()).hexdigest()),
+                (now - 10 * 86400, hashlib.sha256(tokens["ten_days"].encode()).hexdigest()),
+                (now + 1800, hashlib.sha256(tokens["active"].encode()).hexdigest()),
+                (original_untouched_expiry, hashlib.sha256(tokens["untouched"].encode()).hexdigest()),
+            ],
+        )
+        db.commit()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            one_day_headers = {"Authorization": f"Bearer {tokens['one_day']}"}
+            # Ordinary requests must reject expired sessions without deleting
+            # them during the refresh grace period.
+            denied = await client.get("/api/me", headers=one_day_headers)
+            assert denied.status_code == 401
+
+            recovered = await client.post("/api/auth/refresh", headers=one_day_headers)
+            assert recovered.status_code == 200
+            assert recovered.json()["status"] == "refreshed"
+            assert recovered.json()["expires_at"] >= int(time.time()) + messenger_api.SESSION_TTL - 1
+
+            too_old = await client.post(
+                "/api/auth/refresh",
+                headers={"Authorization": f"Bearer {tokens['ten_days']}"},
+            )
+            assert too_old.status_code == 401
+            assert too_old.json()["detail"] == "Сессия истекла или недействительна"
+
+            active = await client.post(
+                "/api/auth/refresh",
+                headers={"Authorization": f"Bearer {tokens['active']}"},
+            )
+            assert active.status_code == 200
+
+    run(scenario())
+
+    with db_split.sqlite_connect(path) as db:
+        expiries = {
+            row[0]: row[1]
+            for row in db.execute("SELECT token_hash,expires_at FROM api_sessions").fetchall()
+        }
+    assert expiries[hashlib.sha256(tokens["one_day"].encode()).hexdigest()] >= (
+        int(time.time()) + messenger_api.SESSION_TTL - 1
+    )
+    assert expiries[hashlib.sha256(tokens["active"].encode()).hexdigest()] >= (
+        int(time.time()) + messenger_api.SESSION_TTL - 1
+    )
+    assert expiries[hashlib.sha256(tokens["untouched"].encode()).hexdigest()] == original_untouched_expiry
+    assert hashlib.sha256(tokens["ten_days"].encode()).hexdigest() not in expiries
+
+
 def test_public_account_hides_malformed_virtual_phone_placeholders() -> None:
     account = {
         "telegram_id": 81008,
@@ -2726,6 +2794,29 @@ def test_assigned_labels_are_exposed_on_account_and_channel(api_env) -> None:
             channel = await client.get(f"/api/channels/{channel_id}", headers=viewer)
             assert channel.status_code == 200
             assert channel.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+            created_group = await client.post(
+                "/api/groups", headers=viewer, json={"title": "Labelled Group"}
+            )
+            assert created_group.status_code == 201
+            group_id = created_group.json()["id"]
+            with db_split.sqlite_connect(path) as db:
+                db.execute(
+                    """INSERT INTO waysgram_label_assignments
+                       (label_id,target_type,target_id,assigned_by,assigned_at)
+                       VALUES(?,?,?,?,?)""",
+                    (label_id, "group", group_id, 87701, now),
+                )
+                db.commit()
+
+            group = await client.get(f"/api/groups/{group_id}", headers=viewer)
+            assert group.status_code == 200
+            assert group.json()["labels"] == [{"text": "Official", "color": "#1769AA"}]
+
+            groups = await client.get("/api/groups", headers=viewer)
+            assert groups.status_code == 200
+            listed_group = next(item for item in groups.json()["groups"] if item["id"] == group_id)
+            assert listed_group["labels"] == [{"text": "Official", "color": "#1769AA"}]
 
     run(scenario())
 

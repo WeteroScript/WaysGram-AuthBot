@@ -1091,6 +1091,36 @@ def test_my_gifts_pagination_returns_all_items_without_overlap(env) -> None:
     run(scenario())
 
 
+def test_my_gifts_total_is_independent_of_pagination(env) -> None:
+    path, app = env
+    now = int(time.time())
+    with db_split.sqlite_connect(path) as db:
+        db.executemany(
+            """INSERT INTO user_gifts
+               (serial_number,gift_id,gift_name,telegram_gift_id,owner_telegram_id,acquired_at)
+               VALUES(?,NULL,?,'',?,?)""",
+            [
+                ("WG-TOTAL-1", "Gift 1", 101, now),
+                ("WG-TOTAL-2", "Gift 2", 101, now + 1),
+                ("WG-TOTAL-3", "Gift 3", 101, now + 2),
+            ],
+        )
+        db.commit()
+
+    async def scenario() -> None:
+        async with await client_for(app) as client:
+            first = await client.get("/api/me/gifts?limit=2&offset=0", headers=headers(101))
+            second = await client.get("/api/me/gifts?limit=2&offset=2", headers=headers(101))
+            assert first.status_code == second.status_code == 200
+            assert first.json()["total"] == second.json()["total"] == 3
+            assert len(first.json()["gifts"]) == 2
+            assert len(second.json()["gifts"]) == 1
+            assert first.json()["has_more"] is True
+            assert second.json()["has_more"] is False
+
+    run(scenario())
+
+
 def test_ordinary_chat_text_is_not_treated_as_gift_purchase_receipt() -> None:
     assert messenger_api._legacy_gift_purchase_details("Я купил подарок сегодня") is None
     assert messenger_api._legacy_gift_purchase_details("I bought a gift yesterday") is None
@@ -1437,6 +1467,82 @@ def test_animated_gift_preview_uses_static_thumbnail(env, monkeypatch: pytest.Mo
 
     run(scenario())
 
+
+
+def test_motion_only_gift_preview_prefers_provider_static_frame(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, _app = env
+    expected_png = _png()
+    raw_webm = bytes.fromhex("1a45dfa3") + b"motion-only-gift"
+    downloaded_file_ids: list[str] = []
+    preview_calls: list[str] = []
+
+    async def fake_download(bot, file_id: str, preferred_mime: str = ""):
+        downloaded_file_ids.append(file_id)
+        return raw_webm, "video/webm"
+
+    class MotionOnlyProvider:
+        async def download_sticker_preview(self, gift_id: str):
+            preview_calls.append(gift_id)
+            return expected_png, "image/png"
+
+        async def download_sticker(self, gift_id: str):
+            return raw_webm, "video/webm"
+
+    monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_download)
+
+    async def scenario() -> None:
+        await messenger_api.store_telegram_gifts(
+            path,
+            [{
+                "id": "motion-only-gift",
+                "sticker": {
+                    "file_id": "motion-only-file",
+                    "file_unique_id": "motion-only-unique",
+                    "type": "video",
+                    "width": 512,
+                    "height": 512,
+                    "is_animated": False,
+                    "is_video": True,
+                    "emoji": "🎁",
+                    "mime_type": "video/webm",
+                },
+                "star_count": 25,
+            }],
+        )
+        sticker_app = FastAPI()
+        store = bot_module.Store(path)
+        sticker_app.include_router(
+            build_messenger_router(
+                path,
+                store,
+                lambda: FakeBot(),
+                bot_module.account_is_banned,
+                mtproto_gift_provider=lambda: MotionOnlyProvider(),
+                admin_id=ADMIN,
+            )
+        )
+
+        async with await client_for(sticker_app) as client:
+            still = await client.get(
+                "/api/telegram/gifts/motion-only-gift/sticker?animated=0",
+                headers=headers(101),
+            )
+            assert still.status_code == 200
+            assert still.headers["content-type"].startswith("image/")
+            assert not still.content.startswith(bytes.fromhex("1f8b"))
+            assert not still.content.startswith(bytes.fromhex("1a45dfa3"))
+            assert preview_calls == ["motion-only-gift"]
+            assert downloaded_file_ids == ["motion-only-file"]
+
+            animated = await client.get(
+                "/api/telegram/gifts/motion-only-gift/sticker?animated=1",
+                headers=headers(101),
+            )
+            assert animated.status_code == 200
+            assert animated.headers["content-type"].startswith("video/webm")
+            assert animated.content == raw_webm
+
+    run(scenario())
 
 
 def test_legacy_text_gift_receipt_is_hydrated_into_a_structured_gift_event(env) -> None:

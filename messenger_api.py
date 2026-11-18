@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 
 SESSION_TTL = 60 * 60 * 24 * 30
+SESSION_REFRESH_GRACE = 60 * 60 * 24 * 7
 DM_MESSAGES_PER_MINUTE = 30
 CHANNEL_POSTS_PER_MINUTE = 20
 LOGIN_REQUESTS_PER_IP_PER_HOUR = 100
@@ -660,7 +661,7 @@ async def init_messenger_storage(database_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS waysgram_label_assignments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 label_id INTEGER NOT NULL REFERENCES waysgram_labels(id) ON DELETE CASCADE,
-                target_type TEXT NOT NULL CHECK(target_type IN ('account','channel')),
+                target_type TEXT NOT NULL CHECK(target_type IN ('account','channel','group')),
                 target_id INTEGER NOT NULL,
                 assigned_by INTEGER NOT NULL,
                 assigned_at INTEGER NOT NULL,
@@ -946,6 +947,44 @@ async def init_messenger_storage(database_path: Path) -> None:
         # A database from an older version keeps everything in one file: move the messenger tables out first,
         # because a table left in the main file would hide the one in the messenger file.
         await db_split.migrate_legacy_with(db, database_path)
+        # Earlier schemas restricted label targets to accounts and channels.
+        # Rebuild the assignment table once so groups can also receive labels.
+        cur = await db.execute(
+            f"SELECT sql FROM {db_split.SCHEMA}.sqlite_master "
+            "WHERE type='table' AND name='waysgram_label_assignments'"
+        )
+        assignment_schema = await cur.fetchone()
+        assignment_sql = str(assignment_schema[0] or "").lower() if assignment_schema else ""
+        if "check" in assignment_sql and "'group'" not in assignment_sql:
+            await db.execute(
+                f"ALTER TABLE {db_split.SCHEMA}.waysgram_label_assignments "
+                "RENAME TO waysgram_label_assignments_legacy"
+            )
+            await db.execute(
+                f"""CREATE TABLE {db_split.SCHEMA}.waysgram_label_assignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label_id INTEGER NOT NULL REFERENCES waysgram_labels(id) ON DELETE CASCADE,
+                    target_type TEXT NOT NULL CHECK(target_type IN ('account','channel','group')),
+                    target_id INTEGER NOT NULL,
+                    assigned_by INTEGER NOT NULL,
+                    assigned_at INTEGER NOT NULL,
+                    UNIQUE(label_id,target_type,target_id)
+                )"""
+            )
+            await db.execute(
+                f"""INSERT INTO {db_split.SCHEMA}.waysgram_label_assignments
+                    (id,label_id,target_type,target_id,assigned_by,assigned_at)
+                    SELECT id,label_id,target_type,target_id,assigned_by,assigned_at
+                    FROM {db_split.SCHEMA}.waysgram_label_assignments_legacy"""
+            )
+            await db.execute(
+                f"DROP TABLE {db_split.SCHEMA}.waysgram_label_assignments_legacy"
+            )
+            await db.execute(
+                f"CREATE INDEX IF NOT EXISTS {db_split.SCHEMA}.idx_waysgram_label_assignments_target "
+                "ON waysgram_label_assignments(target_type,target_id)"
+            )
+            await db.commit()
         # Snapshot only models that Telegram explicitly marks as auction-issued.
         # Keep this registry append-only; live availability and active auction
         # state are separate from the model's historical distribution method.
@@ -1600,6 +1639,10 @@ def _normalize_gift_preview(content: bytes) -> tuple[bytes, str]:
     try:
         with Image.open(BytesIO(content)) as source:
             source.seek(0)
+            source.load()
+            if source.format == "PNG" and int(getattr(source, "n_frames", 1)) == 1:
+                # Preserve an already-static PNG byte-for-byte for existing clients/cache keys.
+                return content, "image/png"
             preview = ImageOps.exif_transpose(source).convert("RGBA")
             preview.thumbnail((512, 512), Image.Resampling.LANCZOS)
             output = BytesIO()
@@ -1849,7 +1892,10 @@ def build_messenger_router(
             )
             row = await cur.fetchone()
             if row is None:
-                await db.execute("DELETE FROM api_sessions WHERE token_hash=?", (_token_hash(token),))
+                await db.execute(
+                    "DELETE FROM api_sessions WHERE token_hash=? AND expires_at<=?",
+                    (_token_hash(token), now - SESSION_REFRESH_GRACE),
+                )
                 await db.commit()
                 raise HTTPException(status_code=401, detail="Сессия истекла или недействительна")
             user = dict(row)
@@ -3003,13 +3049,38 @@ def build_messenger_router(
 
     @router.post("/api/auth/refresh")
     async def refresh_session(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        user = await current_user(authorization)
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Требуется вход")
         token = authorization[7:].strip()
-        expires_at = int(time.time()) + SESSION_TTL
+        if not token:
+            raise HTTPException(status_code=401, detail="Требуется вход")
+
+        now = int(time.time())
+        token_hash = _token_hash(token)
+        expires_at = now + SESSION_TTL
         async with aiosqlite.connect(db_path()) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT a.* FROM api_sessions s
+                   JOIN accounts a ON a.telegram_id=s.telegram_id
+                   WHERE s.token_hash=? AND s.expires_at>?""",
+                (token_hash, now - SESSION_REFRESH_GRACE),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await db.execute(
+                    "DELETE FROM api_sessions WHERE token_hash=? AND expires_at<=?",
+                    (token_hash, now - SESSION_REFRESH_GRACE),
+                )
+                await db.commit()
+                raise HTTPException(status_code=401, detail="Сессия истекла или недействительна")
+            user = dict(row)
+            if user["is_banned"]:
+                raise HTTPException(status_code=403, detail="Аккаунт заблокирован")
+
             cur = await db.execute(
                 "UPDATE api_sessions SET expires_at=? WHERE token_hash=? AND expires_at>?",
-                (expires_at, _token_hash(token), int(time.time())),
+                (expires_at, token_hash, now - SESSION_REFRESH_GRACE),
             )
             if cur.rowcount != 1:
                 raise HTTPException(status_code=401, detail="Сессия истекла или недействительна")
@@ -3165,6 +3236,11 @@ def build_messenger_router(
         user = await current_user(authorization)
         async with aiosqlite.connect(db_path()) as db:
             db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM user_gifts WHERE owner_telegram_id=?",
+                (int(user["telegram_id"]),),
+            )
+            total = int((await cur.fetchone())[0] or 0)
             query = """SELECT id,serial_number,gift_id,telegram_gift_id,gift_name,gift_emoji,
                           telegram_gift_metadata_json,acquired_at,upgrade_level,attributes_json,
                           EXISTS(SELECT 1 FROM gift_market_listings l
@@ -3248,6 +3324,7 @@ def build_messenger_router(
                 gifts.append(item)
         return {
             "gifts": gifts,
+            "total": total,
             "limit": limit,
             "offset": offset,
             "has_more": has_more,
@@ -4413,6 +4490,8 @@ def build_messenger_router(
 
                 candidates.sort(key=preview_priority)
 
+        motion_preview_fallback: tuple[bytes, str] | None = None
+
         async def purchase_snapshot_fallback() -> Response | None:
             # A gift can remain in a user's inventory after its row has disappeared
             # from the current and historical catalogue tables. Its purchase-time
@@ -4452,6 +4531,11 @@ def build_messenger_router(
                     content, media_type = await provider.download_sticker(gift_id)
                 else:
                     content, media_type = await provider.download_sticker_preview(gift_id)
+                    try:
+                        content, media_type = _normalize_gift_preview(content)
+                    except ValueError:
+                        # Keep the original only as a last-resort compatibility fallback.
+                        pass
                 return Response(
                     content=content,
                     media_type=media_type,
@@ -4549,6 +4633,10 @@ def build_messenger_router(
                         )
                         if not is_motion:
                             raise
+                        motion_preview_fallback = (content, media_type)
+                        # MTProto is the selected authoritative catalogue here;
+                        # don't replace its motion asset with a potentially stale Bot API row.
+                        break
                 else:
                     bot = bot_provider()
                     if bot is None:
@@ -4589,8 +4677,8 @@ def build_messenger_router(
                     if normalized_preview is not None:
                         content, media_type = normalized_preview
                     elif raw_motion_preview is not None:
-                        # WaysGram's Telegram renderer can extract a frame from raw TGS/WebM.
-                        content, media_type = raw_motion_preview
+                        motion_preview_fallback = raw_motion_preview
+                        continue
                     else:
                         continue
                 return Response(
@@ -4601,11 +4689,22 @@ def build_messenger_router(
             except Exception:
                 continue
         provider_response = await mtproto_sticker_fallback()
-        if provider_response is not None:
+        if provider_response is not None and str(provider_response.media_type or "").lower().startswith("image/"):
             return provider_response
         snapshot_response = await purchase_snapshot_fallback()
+        if snapshot_response is not None and str(snapshot_response.media_type or "").lower().startswith("image/"):
+            return snapshot_response
+        if provider_response is not None:
+            return provider_response
         if snapshot_response is not None:
             return snapshot_response
+        if motion_preview_fallback is not None:
+            content, media_type = motion_preview_fallback
+            return Response(
+                content=content,
+                media_type=media_type,
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
         raise HTTPException(status_code=502, detail="Не удалось загрузить стикер Telegram из доступных источников")
 
     @router.get("/api/gifts")
@@ -8892,7 +8991,12 @@ def build_messenger_router(
                 (uid, uid, uid, uid),
             )
             rows = await cur.fetchall()
-        return {"groups": [dict(row) for row in rows]}
+        groups = []
+        for row in rows:
+            item = dict(row)
+            item["labels"] = await entity_labels("group", int(item["id"]))
+            groups.append(item)
+        return {"groups": groups}
 
     @router.post("/api/groups", status_code=201)
     async def create_group(
@@ -8964,6 +9068,7 @@ def build_messenger_router(
             )
             members = await cur.fetchall()
         result = dict(group)
+        result["labels"] = await entity_labels("group", group_id)
         result["my_role"] = membership["role"]
         result["my_telegram_id"] = uid
         result["members"] = []
