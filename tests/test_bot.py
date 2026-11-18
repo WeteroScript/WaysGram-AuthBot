@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 import sys
 sys.path.insert(0, str(ROOT))
 
-import bot as bot_module
+import bot_standalone as bot_module
 from messenger_api import init_messenger_storage
 
 
