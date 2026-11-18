@@ -221,6 +221,8 @@ def test_refresh_accepts_expired_sessions_only_within_grace(api_env) -> None:
             )
             assert active.status_code == 200
 
+    run(scenario())
+
     with db_split.sqlite_connect(path) as db:
         expiries = {
             row[0]: row[1]
