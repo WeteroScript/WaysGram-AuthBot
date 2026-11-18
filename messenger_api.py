@@ -1020,8 +1020,8 @@ async def init_messenger_storage(database_path: Path) -> None:
         await db.execute(
             """INSERT OR IGNORE INTO telegram_mtproto_gift_catalog
                (gift_id,title,sticker_emoji,sticker_set_name,sticker_is_video,
-                sticker_mime_type,source_payload,position,is_available,synced_at)
-               SELECT ?, 'Plush Pepe', '🐸', 'PlushPepe', 1, 'video/webm', '{}', 0, 1, ?
+                sticker_mime_type,stars,source_payload,position,is_available,synced_at)
+               SELECT ?, 'Plush Pepe', '🐸', 'PlushPepe', 1, 'video/webm', 50, '{}', 0, 1, ?
                WHERE NOT EXISTS (SELECT 1 FROM telegram_gift_catalog WHERE gift_id=?)
                  AND NOT EXISTS (SELECT 1 FROM telegram_mtproto_gift_catalog WHERE gift_id=?)""",
             (PLUSH_PEPE_GIFT_ID, plush_now, PLUSH_PEPE_GIFT_ID, PLUSH_PEPE_GIFT_ID),
