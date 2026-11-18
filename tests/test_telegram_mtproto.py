@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import db_split
+import messenger_api
 
 import aiosqlite
 from pathlib import Path
