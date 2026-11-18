@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from cryptography.fernet import Fernet
 
-import bot_standalone as bot_module
+import bot as bot_module
 import db_split
 import messenger_api
 from messenger_api import init_messenger_storage
