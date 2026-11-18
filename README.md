@@ -32,6 +32,17 @@ AuthBot может быть каналом доставки OTP для отде�
 
 ## Запуск
 
+### BotHost (основной деплой)
+
+- BotHost указывает на этот репозиторий `WeteroScript/WaysGram-AuthBot`; главный файл — `bot.py`, зависимости — `requirements.txt`, команда запуска — `python bot.py` (Python 3.12).
+- Код бота здесь больше не хранится: он находится в `WeteroScript/WaysGram-New/authbot` и подтягивается при каждом старте через GitHub API. Загружаются только файлы `authbot/**` (около 1.2 МБ); кэш хранится в `/data/waysgram-new/<commit>`.
+- Источники по порядку: GitHub API → архив при лимите API → локальный кэш → резервный `bot_standalone.py`.
+- Изменения кода делаются в `WaysGram-New`; после рестарта или редеплоя BotHost лаунчер получает актуальный коммит автоматически.
+- Диагностика: `python bot.py --check`. Сообщения лаунчера имеют префикс `[waysgram-launcher]`.
+- Зависимости устанавливаются из `requirements.txt` этого репозитория. При добавлении новых пакетов в боте синхронизируй этот файл или включи `AUTHBOT_SYNC_DEPS=1`.
+
+### Docker Compose
+
 ### Docker Compose
 
 В репозитории есть `Dockerfile`, `docker-compose.yml` и безопасный шаблон `.env.example`. Для размещения на сервере:
@@ -63,11 +74,11 @@ Compose создаёт постоянный named volume `waysgram_data` для 
 
 ### Ручной запуск
 
-Требуется Python 3.11+.
+Требуется Python 3.12.
 
 1. Установить зависимости: `pip install -r requirements.txt`.
 2. Задать `BOT_TOKEN`, `INTERNAL_API_TOKEN` и `OTP_FERNET_KEY` в переменных окружения.
-3. Запустить сервис командой из Procfile: `web: python bot.py`.
+3. Запустить лаунчер: `python bot.py`.
 
 `BOT_TOKEN` не хранится в исходниках. Создать `OTP_FERNET_KEY` можно командой:
 
