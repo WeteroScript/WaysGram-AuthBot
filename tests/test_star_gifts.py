@@ -8,7 +8,7 @@ import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 
-import bot as bot_module
+import bot_standalone as bot_module
 import db_split
 import messenger_api
 from messenger_api import build_messenger_router, init_messenger_storage
