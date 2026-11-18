@@ -21,7 +21,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import bot as bot_module
+import bot_standalone as bot_module
 import messenger_api
 from messenger_api import build_messenger_router, init_messenger_storage
 from telegram_mtproto import TelegramMTProtoGiftCatalog
