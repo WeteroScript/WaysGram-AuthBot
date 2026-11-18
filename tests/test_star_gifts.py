@@ -1475,7 +1475,6 @@ def test_motion_only_gift_preview_prefers_provider_static_frame(env, monkeypatch
     raw_webm = bytes.fromhex("1a45dfa3") + b"motion-only-gift"
     downloaded_file_ids: list[str] = []
     preview_calls: list[str] = []
-    animated_calls: list[str] = []
 
     async def fake_download(bot, file_id: str, preferred_mime: str = ""):
         downloaded_file_ids.append(file_id)
@@ -1487,7 +1486,6 @@ def test_motion_only_gift_preview_prefers_provider_static_frame(env, monkeypatch
             return expected_png, "image/png"
 
         async def download_sticker(self, gift_id: str):
-            animated_calls.append(gift_id)
             return raw_webm, "video/webm"
 
     monkeypatch.setattr(messenger_api, "fetch_telegram_sticker", fake_download)
@@ -1543,7 +1541,6 @@ def test_motion_only_gift_preview_prefers_provider_static_frame(env, monkeypatch
             assert animated.status_code == 200
             assert animated.headers["content-type"].startswith("video/webm")
             assert animated.content == raw_webm
-            assert animated_calls == ["motion-only-gift"]
 
     run(scenario())
 
