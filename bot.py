@@ -41,6 +41,7 @@ import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -91,7 +92,7 @@ def _bytes(url: str, token: str, accept: str = "application/vnd.github+json") ->
 
 def resolve_commit(repo: str, ref: str, token: str) -> str:
     try:
-        return str(_json(f"https://api.github.com/repos/{repo}/commits/{ref}", token)["sha"]).strip()
+        return str(_json(f"https://api.github.com/repos/{repo}/commits/{quote(ref, safe="")}", token)["sha"]).strip()
     except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
         log(f"cannot resolve {repo}@{ref} ({type(error).__name__}); "
             "the archive or the cache will be used")
