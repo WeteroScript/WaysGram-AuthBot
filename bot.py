@@ -92,7 +92,8 @@ def _bytes(url: str, token: str, accept: str = "application/vnd.github+json") ->
 
 def resolve_commit(repo: str, ref: str, token: str) -> str:
     try:
-        return str(_json(f"https://api.github.com/repos/{repo}/commits/{quote(ref, safe="")}", token)["sha"]).strip()
+        encoded_ref = quote(ref, safe="")
+        return str(_json(f"https://api.github.com/repos/{repo}/commits/{encoded_ref}", token)["sha"]).strip()
     except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
         log(f"cannot resolve {repo}@{ref} ({type(error).__name__}); "
             "the archive or the cache will be used")
