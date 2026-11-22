@@ -16,8 +16,7 @@ How the folder is fetched:
 Environment variables (all optional):
 
     WAYSGRAM_REPO         default WeteroScript/WaysGram-New
-    WAYSGRAM_REF          branch or tag, default arena/6503a44d-waysgram-new
-    WAYSGRAM_COMMIT       pin an exact commit (skips update checks)
+    Source branch         fixed to arena/cd470c3c-waysgram-new
     WAYSGRAM_SUBDIR       folder with the bot code, default authbot
     WAYSGRAM_HOME         cache directory, default /data/waysgram-new, else ./.waysgram-src
     WAYSGRAM_MODE         auto | api | archive
@@ -47,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_REPO = "WeteroScript/WaysGram-New"
-DEFAULT_REF = "arena/6503a44d-waysgram-new"
+DEFAULT_REF = "arena/cd470c3c-waysgram-new"
 DEFAULT_SUBDIR = "authbot"
 ENTRY_NAME = "bot.py"
 HTTP_TIMEOUT = 30
@@ -274,9 +273,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="WaysGram bot launcher")
     parser.add_argument("--check", action="store_true", help="pull the code and print where it landed")
     parser.add_argument("--repo", default=_env("WAYSGRAM_REPO", DEFAULT_REPO))
-    parser.add_argument("--ref", default=_env("WAYSGRAM_REF", DEFAULT_REF))
+    parser.add_argument("--ref", default=DEFAULT_REF)
     parser.add_argument("--subdir", default=_env("WAYSGRAM_SUBDIR", DEFAULT_SUBDIR))
-    parser.add_argument("--commit", default=_env("WAYSGRAM_COMMIT"))
+    parser.add_argument("--commit", default="")
     parser.add_argument("--mode", default=_env("WAYSGRAM_MODE", "auto"),
                         choices=("auto", "api", "archive"))
     args = parser.parse_args()
