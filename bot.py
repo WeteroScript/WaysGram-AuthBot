@@ -16,7 +16,7 @@ How the folder is fetched:
 Environment variables (all optional):
 
     WAYSGRAM_REPO         default WeteroScript/WaysGram-New
-    Source branch         fixed to arena/cd470c3c-waysgram-new
+    Source branch         fixed to arena/bc5abc5d-waysgram-new
     WAYSGRAM_SUBDIR       folder with the bot code, default authbot
     WAYSGRAM_HOME         cache directory, default /data/waysgram-new, else ./.waysgram-src
     WAYSGRAM_MODE         auto | api | archive
@@ -46,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_REPO = "WeteroScript/WaysGram-New"
-DEFAULT_REF = "arena/cd470c3c-waysgram-new"
+DEFAULT_REF = "arena/bc5abc5d-waysgram-new"
 DEFAULT_SUBDIR = "authbot"
 ENTRY_NAME = "bot.py"
 HTTP_TIMEOUT = 30
